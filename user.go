@@ -520,6 +520,11 @@ func (user *User) Logout(isOverwriting bool) {
 	user.reconstructRelationships(nil)
 	user.DiscordToken = ""
 	user.ReadStateVersion = 0
+	user.presenceLock.Lock()
+	user.lastDiscordStatusText = ""
+	user.lastMatrixStatusText = ""
+	user.matrixStatusEverSet = false
+	user.presenceLock.Unlock()
 	if !isOverwriting {
 		user.bridge.usersLock.Lock()
 		if user.bridge.usersByID[user.DiscordID] == user {
@@ -1473,6 +1478,14 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 	for _, p := range presences {
 		if p.User == nil {
 			continue
+		}
+		// Seed the Discord status cache for the bridge user's own presence so
+		// that the first Matrix→Discord sync after a reconnect doesn't clobber
+		// a pre-existing Discord custom status with an empty fallback.
+		if p.User.ID == user.DiscordID {
+			user.presenceLock.Lock()
+			user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
+			user.presenceLock.Unlock()
 		}
 		user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 	}

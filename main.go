@@ -148,7 +148,10 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 
 	// Check for the Charm client DND prefix and strip it if present.
 	// Handles both "[dnd]" (no custom text) and "[dnd] <text>" forms.
-	if rest, ok := strings.CutPrefix(statusText, charmDNDPrefix); ok {
+	// Only override to DND when the Matrix presence is not offline — if the
+	// client goes offline while retaining a [dnd] status_msg we should respect
+	// the offline→invisible mapping rather than keeping the account visible as DND.
+	if rest, ok := strings.CutPrefix(statusText, charmDNDPrefix); ok && content.Presence != event.PresenceOffline {
 		statusText = strings.TrimPrefix(rest, " ")
 		discordStatus = string(discordgo.StatusDoNotDisturb)
 	}
@@ -156,25 +159,25 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	// Determine the status text to send to Discord using last-writer-wins
 	// with intentional-clear detection:
 	//
-	//  - rawStatusText != "": Matrix is explicitly setting a status — cache it
-	//    and use it.
-	//  - rawStatusText == "" && matrixStatusEverSet: Matrix previously had a
-	//    value and is now clearing it — treat as intentional clear, wipe both
-	//    cached values and send empty.
-	//  - rawStatusText == "" && !matrixStatusEverSet: Matrix has never sent a
-	//    status in this session — fall back to the last Discord-side status so
-	//    we don't clobber it.
+	//  - statusText != "": Matrix set a non-empty text (after prefix stripping) —
+	//    cache it and use it.
+	//  - statusText == "" && rawStatusText == "" && matrixStatusEverSet: Matrix
+	//    previously had a status and now explicitly sends empty — intentional clear.
+	//  - otherwise (never set, or raw had content that stripped to empty e.g. bare
+	//    "[dnd]"): fall back to the last Discord-side status so we don't clobber it.
 	user.presenceLock.Lock()
 	var textToSend string
-	if rawStatusText != "" {
+	if statusText != "" {
 		user.lastMatrixStatusText = statusText
 		user.matrixStatusEverSet = true
 		textToSend = statusText
-	} else if user.matrixStatusEverSet {
+	} else if rawStatusText == "" && user.matrixStatusEverSet {
+		// Intentional clear: truly empty status_msg after Matrix previously set one.
 		user.lastMatrixStatusText = ""
 		user.lastDiscordStatusText = ""
 		textToSend = ""
 	} else {
+		// Never set, or raw was a bare DND prefix with no custom text — preserve Discord's status.
 		textToSend = user.lastDiscordStatusText
 	}
 	user.presenceLock.Unlock()
