@@ -133,10 +133,10 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	if !ok {
 		return
 	}
-	// GetUserByMXID already returns nil for ghost/puppet MXIDs and loads from
-	// the DB if the user isn't in the in-memory cache, preventing presence events
-	// from being silently dropped during the startup window after a bridge restart.
-	user := br.GetUserByMXID(evt.Sender)
+	// GetUserByMXIDIfExists checks the cache then the DB without creating a new
+	// row, preventing phantom bridge-user rows for unrelated Matrix users who
+	// share rooms with bridge users and whose presence EDUs the appservice receives.
+	user := br.GetUserByMXIDIfExists(evt.Sender)
 	if user == nil {
 		return
 	}

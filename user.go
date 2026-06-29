@@ -187,6 +187,25 @@ func (br *DiscordBridge) loadUser(dbUser *database.User, mxid *id.UserID) *User 
 	return user
 }
 
+// GetUserByMXIDIfExists returns the bridge user for a Matrix user ID if one
+// already exists in the in-memory cache or the database, without creating a
+// new row. Returns nil when no bridge user has ever been created for this MXID.
+func (br *DiscordBridge) GetUserByMXIDIfExists(userID id.UserID) *User {
+	if userID == br.Bot.UserID || br.IsGhost(userID) {
+		return nil
+	}
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+
+	user, ok := br.usersByMXID[userID]
+	if !ok {
+		// Pass nil for the mxid parameter so loadUser does not insert a new row
+		// when the DB returns nil.
+		return br.loadUser(br.DB.User.GetByMXID(userID), nil)
+	}
+	return user
+}
+
 func (br *DiscordBridge) GetUserByMXID(userID id.UserID) *User {
 	if userID == br.Bot.UserID || br.IsGhost(userID) {
 		return nil
@@ -1420,7 +1439,11 @@ func discordStatusToMatrix(status discordgo.Status) event.Presence {
 		return event.PresenceOnline
 	case discordgo.StatusIdle:
 		return event.PresenceUnavailable
-	case discordgo.StatusDoNotDisturb, discordgo.StatusInvisible, discordgo.StatusOffline:
+	case discordgo.StatusDoNotDisturb:
+		// DND is a visible, connected state — map to unavailable rather than offline
+		// so Matrix clients retain the fact that the user is currently present.
+		return event.PresenceUnavailable
+	case discordgo.StatusInvisible, discordgo.StatusOffline:
 		return event.PresenceOffline
 	default:
 		return event.PresenceOffline
@@ -1469,6 +1492,16 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			Str("status_text", customStatusText).
 			Msg("Bridged Discord presence to Matrix")
 	}
+	// When double puppeting is active, also update the real Matrix account so
+	// clients see the correct presence on the user's own identity, not just on
+	// the bridge ghost which may not be present in all rooms.
+	if customIntent := puppet.CustomIntent(); customIntent != nil {
+		if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
+			user.log.Warn().Err(err).
+				Str("discord_user_id", userID).
+				Msg("Failed to set Matrix presence for double-puppeted user")
+		}
+	}
 }
 
 // seedPresences applies presence for a batch of Presence entries received in
@@ -1513,10 +1546,15 @@ func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	if p.User == nil {
 		return
 	}
+	// Snapshot DiscordID under the user lock to avoid a data race with Logout(),
+	// which holds user.Lock() while writing user.DiscordID = "".
+	user.Lock()
+	ownID := user.DiscordID
+	user.Unlock()
 	// If this is a presence update for the bridge user themselves, cache the
 	// Discord-side custom status text for fallback in HandleMatrixPresence, then
 	// fall through to applyPresence so their Matrix puppet also reflects the change.
-	if p.User.ID == user.DiscordID {
+	if p.User.ID == ownID {
 		user.presenceLock.Lock()
 		user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
 		user.presenceLock.Unlock()
