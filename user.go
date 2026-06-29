@@ -261,9 +261,10 @@ type presenceCacheEntry struct {
 }
 
 // presenceKeepaliveInterval is how often the keepalive goroutine re-sends
-// presence for non-offline ghost users. Synapse's default presence timeout
-// is 60s; 30s keeps us safely below it.
-const presenceKeepaliveInterval = 30 * time.Second
+// presence for non-offline ghost users. Synapse's presence sweeper runs every
+// ~5s and can override an explicitly-set presence if the virtual user's
+// last_user_sync_ts is very old; 10s re-asserts before a second sweep fires.
+const presenceKeepaliveInterval = 10 * time.Second
 
 func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 	user := &User{
@@ -787,6 +788,15 @@ func (user *User) eventHandler(rawEvt any) {
 		if len(evt.Presences) > 0 {
 			go user.seedPresences(evt.Presences)
 		}
+	case *discordgo.PresencesReplace:
+		// PRESENCES_REPLACE is sent by Discord to user-token sessions shortly
+		// after READY to deliver an authoritative snapshot of all friend/DM
+		// presences. Seeding from it ensures we don't miss updates that
+		// arrived in the gap between the READY payload and now.
+		presences := []*discordgo.Presence(*evt)
+		if len(presences) > 0 {
+			go user.seedPresences(presences)
+		}
 	case *discordgo.InteractionSuccess:
 		user.interactionSuccessHandler(evt)
 	case *discordgo.ThreadListSync:
@@ -909,14 +919,16 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 
 	go user.subscribeGuilds(2 * time.Second)
 
+	// Clear the stale presence cache and start the keepalive BEFORE launching
+	// seedPresences. startPresenceKeepalive calls clear(presenceCache), so if
+	// it ran after the goroutine below, any entries seeded before the clear
+	// would be lost from the keepalive's view and never re-sent.
+	user.startPresenceKeepalive()
+
 	// Seed Matrix presence from the presence snapshots delivered in READY so
 	// that users who are already online are reflected immediately rather than
 	// waiting for a future PresenceUpdate event.
 	go user.seedPresences(r.Presences)
-
-	// Start the keepalive goroutine that periodically re-sends non-offline
-	// presence so Synapse does not expire ghost users (ghosts never /sync).
-	user.startPresenceKeepalive()
 
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
@@ -1683,6 +1695,13 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 			continue
 		}
 		seen[p.User.ID] = struct{}{}
+		// Skip entries with no status — GUILD_CREATE can include partial
+		// member records with Status == "" that map to PresenceOffline in
+		// discordStatusToMatrix, which would actively clear a presence that
+		// was just set. presenceUpdateHandler has the same guard.
+		if p.Status == "" {
+			continue
+		}
 		// Seed the Discord status cache for the bridge user's own presence so
 		// that the first Matrix→Discord sync after a reconnect doesn't clobber
 		// a pre-existing Discord custom status with an empty fallback.
