@@ -211,9 +211,12 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			Type:  discordgo.ActivityTypeCustom,
 			State: textToSend,
 		}}
-	} else {
-		activities = make([]*discordgo.Activity, 0)
 	}
+	// When there is no custom status text to set, leave activities as nil so
+	// Discord serializes it as JSON null ("don't change activities") rather than
+	// an empty array ("clear all activities"). Sending [] would erase the user's
+	// active game, rich presence, or Spotify session whenever they change their
+	// Matrix online/idle/offline state without a custom status text.
 
 	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
 		Status:     discordStatus,
