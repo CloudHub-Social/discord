@@ -98,6 +98,25 @@ func (br *DiscordBridge) GetPuppetByID(id string) *Puppet {
 	return puppet
 }
 
+// GetPuppetByIDIfExists returns the puppet for a Discord user ID if one already
+// exists in the in-memory cache or the database, without creating a new row.
+// Returns nil when no puppet has ever been created for this user.
+func (br *DiscordBridge) GetPuppetByIDIfExists(id string) *Puppet {
+	br.puppetsLock.Lock()
+	defer br.puppetsLock.Unlock()
+
+	puppet, ok := br.puppets[id]
+	if !ok {
+		dbPuppet := br.DB.Puppet.Get(id)
+		if dbPuppet == nil {
+			return nil
+		}
+		puppet = br.NewPuppet(dbPuppet)
+		br.puppets[puppet.ID] = puppet
+	}
+	return puppet
+}
+
 func (br *DiscordBridge) GetPuppetByCustomMXID(mxid id.UserID) *Puppet {
 	br.puppetsLock.Lock()
 	defer br.puppetsLock.Unlock()

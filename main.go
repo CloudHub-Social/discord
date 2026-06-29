@@ -164,6 +164,7 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	//  - rawStatusText == "" && !matrixStatusEverSet: Matrix has never sent a
 	//    status in this session — fall back to the last Discord-side status so
 	//    we don't clobber it.
+	user.presenceLock.Lock()
 	var textToSend string
 	if rawStatusText != "" {
 		user.lastMatrixStatusText = statusText
@@ -176,6 +177,7 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	} else {
 		textToSend = user.lastDiscordStatusText
 	}
+	user.presenceLock.Unlock()
 
 	var activities []*discordgo.Activity
 	if textToSend != "" {

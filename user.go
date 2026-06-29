@@ -75,6 +75,11 @@ type User struct {
 	relationshipsReady bool
 	relationshipLock   sync.RWMutex
 
+	// presenceLock protects the three status-sync fields below, which are
+	// accessed concurrently from the discordgo event goroutine and the
+	// appservice EventProcessor goroutine.
+	presenceLock sync.Mutex
+
 	// Status text sync state. lastMatrixStatusText is the last non-empty
 	// status_msg received from Matrix. lastDiscordStatusText is the last
 	// custom status text seen from Discord. matrixStatusEverSet tracks
@@ -1439,10 +1444,8 @@ func setMatrixPresence(intent *appservice.IntentAPI, presence event.Presence, st
 // never sent a bridged message are skipped to avoid unbounded puppet-table
 // churn in large guilds.
 func (user *User) applyPresence(userID string, status discordgo.Status, customStatusText string) {
-	user.bridge.puppetsLock.Lock()
-	puppet, ok := user.bridge.puppets[userID]
-	user.bridge.puppetsLock.Unlock()
-	if !ok {
+	puppet := user.bridge.GetPuppetByIDIfExists(userID)
+	if puppet == nil {
 		// No puppet exists yet; skip to avoid creating phantom DB rows.
 		return
 	}
@@ -1491,12 +1494,13 @@ func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	if p.User == nil {
 		return
 	}
-	// If this is a presence update for the bridge user themselves, update the
-	// cached Discord-side custom status text so that HandleMatrixPresence can
-	// fall back to it when Matrix has never set a status this session.
+	// If this is a presence update for the bridge user themselves, cache the
+	// Discord-side custom status text for fallback in HandleMatrixPresence, then
+	// fall through to applyPresence so their Matrix puppet also reflects the change.
 	if p.User.ID == user.DiscordID {
+		user.presenceLock.Lock()
 		user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
-		return
+		user.presenceLock.Unlock()
 	}
 	user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 }
