@@ -129,14 +129,14 @@ func matrixPresenceToDiscord(presence event.Presence) string {
 const charmDNDPrefix = "[dnd]"
 
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
-	if br.IsGhost(evt.Sender) {
-		return
-	}
 	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
 	if !ok {
 		return
 	}
-	user := br.GetCachedUserByMXID(evt.Sender)
+	// GetUserByMXID already returns nil for ghost/puppet MXIDs and loads from
+	// the DB if the user isn't in the in-memory cache, preventing presence events
+	// from being silently dropped during the startup window after a bridge restart.
+	user := br.GetUserByMXID(evt.Sender)
 	if user == nil || user.Session == nil {
 		return
 	}
