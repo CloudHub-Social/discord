@@ -1555,7 +1555,13 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 	// This applies to both the observing user's own account and any other
 	// logged-in user whose Discord presence is being observed.
 	if customIntent := puppet.CustomIntent(); customIntent != nil {
-		customUser := user.bridge.GetCachedUserByMXID(puppet.CustomMXID)
+		// Use GetUserByMXIDIfExists (cache + DB fallback) rather than
+		// GetCachedUserByMXID (cache only) so that a user who is stored in the
+		// DB but not yet loaded into the in-memory map still triggers the echo-
+		// suppression guard. Session is an in-memory field only — a DB-loaded
+		// user without an active session will still have Session == nil, so the
+		// Session check below remains the authoritative gate.
+		customUser := user.bridge.GetUserByMXIDIfExists(puppet.CustomMXID)
 		if customUser == nil || customUser.Session == nil {
 			if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
 				user.log.Warn().Err(err).
@@ -1610,7 +1616,7 @@ func (user *User) runPresenceKeepalive(ctx context.Context) {
 					user.log.Warn().Err(err).Str("discord_user_id", discordID).Msg("Failed to refresh Matrix presence keepalive")
 				}
 				if customIntent := puppet.CustomIntent(); customIntent != nil {
-					customUser := user.bridge.GetCachedUserByMXID(puppet.CustomMXID)
+					customUser := user.bridge.GetUserByMXIDIfExists(puppet.CustomMXID)
 					if customUser == nil || customUser.Session == nil {
 						_ = setMatrixPresence(customIntent, entry.presence, entry.statusMsg)
 					}
