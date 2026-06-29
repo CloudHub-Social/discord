@@ -817,21 +817,24 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.bridgeStateLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
-		user.bridge.usersLock.Lock()
-		// Hold user.Lock() while writing DiscordID so that presenceUpdateHandler
-		// and seedPresences (which read it under user.Lock()) see a consistent value.
-		// Lock ordering: usersLock (outer) → user.Lock() (inner).
+		// Write DiscordID under user.Lock BEFORE taking usersLock. Logout() holds
+		// user.Lock for its full duration and later acquires usersLock, so holding
+		// usersLock while waiting for user.Lock would be an AB/BA deadlock.
+		// Use a local to carry the new value into the usersLock block below.
 		user.Lock()
-		user.DiscordID = r.User.ID
+		newDiscordID := r.User.ID
+		user.DiscordID = newDiscordID
 		user.Unlock()
-		if previousUser, ok := user.bridge.usersByID[user.DiscordID]; ok && previousUser != user {
+
+		user.bridge.usersLock.Lock()
+		if previousUser, ok := user.bridge.usersByID[newDiscordID]; ok && previousUser != user {
 			user.log.Warn().
 				Str("previous_user_id", previousUser.MXID.String()).
 				Msg("Another user is logged in with same Discord ID, logging them out")
 			// TODO send notice?
 			previousUser.Logout(true)
 		}
-		user.bridge.usersByID[user.DiscordID] = user
+		user.bridge.usersByID[newDiscordID] = user
 		user.bridge.usersLock.Unlock()
 		user.Update()
 	}
@@ -1500,15 +1503,15 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 	// When double puppeting is active, also update the real Matrix account so
 	// clients see the correct presence on the user's own identity, not just on
 	// the bridge ghost which may not be present in all rooms.
-	// Skip the bridge user's own account: the appservice would receive the
-	// resulting m.presence echo via ephemeral_events and HandleMatrixPresence
-	// would treat it as a Matrix-side change, immediately clobbering the Discord
-	// status (e.g. DND → unavailable → echoed back → idle).
+	// Skip any puppet whose CustomMXID belongs to a logged-in bridge user: the
+	// appservice receives the resulting m.presence echo via ephemeral_events and
+	// HandleMatrixPresence would treat it as a Matrix-side change, immediately
+	// clobbering the Discord status (e.g. DND → unavailable → echoed back → idle).
+	// This applies to both the observing user's own account and any other
+	// logged-in user whose Discord presence is being observed.
 	if customIntent := puppet.CustomIntent(); customIntent != nil {
-		user.Lock()
-		isOwnAccount := userID == user.DiscordID
-		user.Unlock()
-		if !isOwnAccount {
+		customUser := user.bridge.GetCachedUserByMXID(puppet.CustomMXID)
+		if customUser == nil || customUser.Session == nil {
 			if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
 				user.log.Warn().Err(err).
 					Str("discord_user_id", userID).
@@ -1528,10 +1531,19 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 	ownID := user.DiscordID
 	user.Unlock()
 
+	// Deduplicate by Discord user ID: READY/GUILD_CREATE presences are guild-scoped
+	// so the same user appears once per mutual guild. Without deduplication, a user
+	// shared across many guilds would trigger many concurrent Matrix presence PUTs
+	// against the same puppet, hitting rate limits and leaving statuses stale.
+	seen := make(map[string]struct{}, len(presences))
 	for _, p := range presences {
 		if p.User == nil {
 			continue
 		}
+		if _, ok := seen[p.User.ID]; ok {
+			continue
+		}
+		seen[p.User.ID] = struct{}{}
 		// Seed the Discord status cache for the bridge user's own presence so
 		// that the first Matrix→Discord sync after a reconnect doesn't clobber
 		// a pre-existing Discord custom status with an empty fallback.
@@ -1565,6 +1577,13 @@ func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	user.Lock()
 	ownID := user.DiscordID
 	user.Unlock()
+	// Discord PRESENCE_UPDATE can be partial — any combination of fields may be
+	// absent. An empty Status means only non-presence fields (e.g. username)
+	// changed; skip to avoid mapping "" to offline and incorrectly marking the
+	// puppet as offline when only unrelated user data was updated.
+	if p.Status == "" {
+		return
+	}
 	// If this is a presence update for the bridge user themselves, cache the
 	// Discord-side custom status text for fallback in HandleMatrixPresence, then
 	// fall through to applyPresence so their Matrix puppet also reflects the change.
