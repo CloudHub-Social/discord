@@ -123,7 +123,10 @@ func matrixPresenceToDiscord(presence event.Presence) string {
 // charmDNDPrefix is the status_msg prefix used by the Charm Matrix client to
 // indicate do-not-disturb. When present, it is stripped before forwarding the
 // text to Discord and the Discord status is overridden to "dnd".
-const charmDNDPrefix = "[dnd] "
+// charmDNDPrefix is the status_msg prefix used by the Charm Matrix client to
+// indicate do-not-disturb. Charm sets status_msg to "[dnd]" (no custom text)
+// or "[dnd] <text>" (with custom text). Both forms are detected and stripped.
+const charmDNDPrefix = "[dnd]"
 
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
@@ -138,8 +141,9 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	statusText := content.StatusMessage
 
 	// Check for the Charm client DND prefix and strip it if present.
-	if strings.HasPrefix(statusText, charmDNDPrefix) {
-		statusText = strings.TrimPrefix(statusText, charmDNDPrefix)
+	// Handles both "[dnd]" (no custom text) and "[dnd] <text>" forms.
+	if rest, ok := strings.CutPrefix(statusText, charmDNDPrefix); ok {
+		statusText = strings.TrimPrefix(rest, " ")
 		discordStatus = string(discordgo.StatusDoNotDisturb)
 	}
 
