@@ -242,6 +242,12 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			Str("matrix_presence", string(content.Presence)).
 			Msg("Failed to update Discord status from Matrix presence")
 	} else {
+		// Record when we last successfully forwarded a Matrix presence to
+		// Discord so applyPresence can detect and suppress the resulting
+		// Discord gateway echo within its 2-second window.
+		user.presenceLock.Lock()
+		user.matrixPresenceSetAt = time.Now()
+		user.presenceLock.Unlock()
 		br.ZLog.Debug().
 			Str("user_id", evt.Sender.String()).
 			Str("matrix_presence", string(content.Presence)).

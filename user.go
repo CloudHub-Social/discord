@@ -96,16 +96,22 @@ type User struct {
 	presenceCache map[string]presenceCacheEntry
 
 	// discordPresenceSetAt is the timestamp of the last time applyPresence
-	// updated the bridge user's own real Matrix account from a Discord status
-	// change. HandleMatrixPresence uses it to suppress the resulting Synapse
-	// push_ephemeral echo for 2 seconds, preventing it from bouncing the
-	// status back to Discord (e.g., DND would become idle on round-trip).
+	// successfully updated the bridge user's own real Matrix account from a
+	// Discord status change. HandleMatrixPresence uses it to suppress the
+	// resulting Synapse push_ephemeral echo for 2 seconds, preventing the
+	// status from bouncing back to Discord (e.g., DND→unavailable→idle).
+	// Only set on success so a failed PUT doesn't block legitimate echoes.
 	discordPresenceSetAt time.Time
+	// matrixPresenceSetAt is the timestamp of the last time HandleMatrixPresence
+	// successfully forwarded a Matrix presence change to Discord. applyPresence
+	// uses it to detect Discord echoes of Matrix-originated status changes and
+	// skip overwriting the Matrix-side state (which may have a [dnd] prefix
+	// that was stripped before forwarding).
+	matrixPresenceSetAt time.Time
 	// lastOwnMatrixPresence / lastOwnMatrixStatusMsg cache the last presence
-	// state written to the user's own Matrix account from Discord. applyPresence
-	// skips the setMatrixPresence call (and the discordPresenceSetAt reset) when
-	// neither value has changed, so frequent Discord rich-presence activity updates
-	// (e.g., game elapsed time) don't repeatedly slide the suppression window.
+	// state successfully written to the user's own Matrix account from Discord.
+	// applyPresence skips redundant calls when neither value has changed.
+	// Cleared on reconnect so a timed-out Matrix presence is always refreshed.
 	lastOwnMatrixPresence  event.Presence
 	lastOwnMatrixStatusMsg string
 
@@ -582,6 +588,7 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastMatrixStatusText = ""
 	user.matrixStatusEverSet = false
 	user.discordPresenceSetAt = time.Time{}
+	user.matrixPresenceSetAt = time.Time{}
 	user.lastOwnMatrixPresence = ""
 	user.lastOwnMatrixStatusMsg = ""
 	clear(user.presenceCache)
@@ -1623,21 +1630,40 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		} else if customUser == user {
 			// Bridge user's own Discord status changed. Update their real Matrix
 			// account so the change is visible in Matrix clients (Discord→Matrix
-			// own-user sync). Only update when something actually changed to avoid
-			// sliding the suppression window on every Discord rich-presence tick.
+			// own-user sync).
+			//
+			// Two guards before calling setMatrixPresence:
+			//
+			// 1. Echo suppression: if HandleMatrixPresence recently forwarded a
+			//    Matrix presence to Discord (matrixPresenceSetAt within 2s), this
+			//    Discord event is likely the gateway echo of that action. Skip it
+			//    to avoid overwriting the Matrix-side state — in particular the
+			//    [dnd] status_msg prefix that Charm uses and that we strip before
+			//    forwarding to Discord.
+			//
+			// 2. Dedup: only call setMatrixPresence when something actually
+			//    changed; frequent Discord rich-presence ticks (e.g. game timers)
+			//    would otherwise slide discordPresenceSetAt continuously.
+			//
+			// Both the timestamp reads and the cache update happen under
+			// presenceLock. The cache is only written on success so a failed PUT
+			// doesn't mark the state as "done" and cause the next identical
+			// Discord event to skip the retry.
 			user.presenceLock.Lock()
-			changed := matrixPresence != user.lastOwnMatrixPresence || customStatusText != user.lastOwnMatrixStatusMsg
-			if changed {
-				user.discordPresenceSetAt = time.Now()
-				user.lastOwnMatrixPresence = matrixPresence
-				user.lastOwnMatrixStatusMsg = customStatusText
-			}
+			isEcho := time.Now().Before(user.matrixPresenceSetAt.Add(2 * time.Second))
+			changed := !isEcho && (matrixPresence != user.lastOwnMatrixPresence || customStatusText != user.lastOwnMatrixStatusMsg)
 			user.presenceLock.Unlock()
 			if changed {
 				if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
 					user.log.Warn().Err(err).
 						Str("discord_user_id", userID).
 						Msg("Failed to set Matrix presence for own double-puppeted account")
+				} else {
+					user.presenceLock.Lock()
+					user.discordPresenceSetAt = time.Now()
+					user.lastOwnMatrixPresence = matrixPresence
+					user.lastOwnMatrixStatusMsg = customStatusText
+					user.presenceLock.Unlock()
 				}
 			}
 		}
@@ -1675,6 +1701,11 @@ func (user *User) startPresenceKeepalive() {
 	// and does nothing, which is the correct conservative behaviour.
 	user.presenceLock.Lock()
 	clear(user.presenceCache)
+	// Reset own-presence dedup so the first applyPresence after reconnect
+	// always refreshes the real Matrix account, even if the Discord status
+	// is unchanged (the Matrix presence may have timed out during the outage).
+	user.lastOwnMatrixPresence = ""
+	user.lastOwnMatrixStatusMsg = ""
 	user.presenceLock.Unlock()
 
 	go user.runPresenceKeepalive(ctx)
