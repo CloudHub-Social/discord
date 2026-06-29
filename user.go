@@ -276,8 +276,8 @@ func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 
 		pendingInteractions: make(map[string]*WrappedCommandEvent),
 
-		relationships:  make(map[string]*discordgo.Relationship),
-		presenceCache:  make(map[string]presenceCacheEntry),
+		relationships: make(map[string]*discordgo.Relationship),
+		presenceCache: make(map[string]presenceCacheEntry),
 	}
 	user.nextDiscordUploadID.Store(rand.Int31n(100))
 	user.BridgeState = br.NewBridgeStateQueue(user)
@@ -783,6 +783,10 @@ func (user *User) eventHandler(rawEvt any) {
 		user.typingStartHandler(evt)
 	case *discordgo.PresenceUpdate:
 		user.presenceUpdateHandler(evt)
+	case *discordgo.GuildMembersChunk:
+		if len(evt.Presences) > 0 {
+			go user.seedPresences(evt.Presences)
+		}
 	case *discordgo.InteractionSuccess:
 		user.interactionSuccessHandler(evt)
 	case *discordgo.ThreadListSync:
@@ -924,12 +928,29 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 	for _, guildMeta := range user.Session.State.Guilds {
 		guild := user.bridge.GetGuildByID(guildMeta.ID, false)
 		if guild != nil && guild.MXID != "" {
-			user.log.Debug().Str("guild_id", guild.ID).Msg("Subscribing to guild")
+			// Build a channels map from bridged portals in this guild.
+			// Discord only sends PRESENCE_UPDATE events for large guilds when you
+			// subscribe to specific channels with member-list ranges; without this,
+			// presence updates are silently suppressed above Discord's lazy-loading
+			// threshold (~250 members). Including the bridged channels here causes
+			// Discord to start delivering PRESENCE_UPDATE for the first 100 members
+			// of each channel, which covers the vast majority of active bridge users.
+			var channels map[string][][]int
+			for _, p := range user.bridge.DB.Portal.GetAllInGuild(guild.ID) {
+				if p.MXID != "" {
+					if channels == nil {
+						channels = make(map[string][][]int)
+					}
+					channels[p.Key.ChannelID] = [][]int{{0, 99}}
+				}
+			}
+			user.log.Debug().Str("guild_id", guild.ID).Int("channel_count", len(channels)).Msg("Subscribing to guild")
 			dat := discordgo.GuildSubscribeData{
 				GuildID:    guild.ID,
 				Typing:     true,
 				Activities: true,
 				Threads:    true,
+				Channels:   channels,
 			}
 			err := user.Session.SubscribeGuild(dat)
 			if err != nil {
