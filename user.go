@@ -74,6 +74,15 @@ type User struct {
 	// and "available" but not logically "ready" just yet.
 	relationshipsReady bool
 	relationshipLock   sync.RWMutex
+
+	// Status text sync state. lastMatrixStatusText is the last non-empty
+	// status_msg received from Matrix. lastDiscordStatusText is the last
+	// custom status text seen from Discord. matrixStatusEverSet tracks
+	// whether Matrix has ever sent a status_msg this session (so we can
+	// distinguish "never set" from "intentionally cleared").
+	lastMatrixStatusText  string
+	lastDiscordStatusText string
+	matrixStatusEverSet   bool
 }
 
 func (user *User) GetRemoteID() string {
@@ -1480,6 +1489,13 @@ func discordCustomStatusText(activities []*discordgo.Activity) string {
 
 func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	if p.User == nil {
+		return
+	}
+	// If this is a presence update for the bridge user themselves, update the
+	// cached Discord-side custom status text so that HandleMatrixPresence can
+	// fall back to it when Matrix has never set a status this session.
+	if p.User.ID == user.DiscordID {
+		user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
 		return
 	}
 	user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))

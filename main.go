@@ -129,6 +129,9 @@ func matrixPresenceToDiscord(presence event.Presence) string {
 const charmDNDPrefix = "[dnd]"
 
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
+	if br.IsGhost(evt.Sender) {
+		return
+	}
 	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
 	if !ok {
 		return
@@ -138,7 +141,10 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		return
 	}
 	discordStatus := matrixPresenceToDiscord(content.Presence)
-	statusText := content.StatusMessage
+
+	// rawStatusText is the unmodified status_msg from Matrix (before DND stripping).
+	rawStatusText := content.StatusMessage
+	statusText := rawStatusText
 
 	// Check for the Charm client DND prefix and strip it if present.
 	// Handles both "[dnd]" (no custom text) and "[dnd] <text>" forms.
@@ -147,12 +153,36 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		discordStatus = string(discordgo.StatusDoNotDisturb)
 	}
 
+	// Determine the status text to send to Discord using last-writer-wins
+	// with intentional-clear detection:
+	//
+	//  - rawStatusText != "": Matrix is explicitly setting a status — cache it
+	//    and use it.
+	//  - rawStatusText == "" && matrixStatusEverSet: Matrix previously had a
+	//    value and is now clearing it — treat as intentional clear, wipe both
+	//    cached values and send empty.
+	//  - rawStatusText == "" && !matrixStatusEverSet: Matrix has never sent a
+	//    status in this session — fall back to the last Discord-side status so
+	//    we don't clobber it.
+	var textToSend string
+	if rawStatusText != "" {
+		user.lastMatrixStatusText = statusText
+		user.matrixStatusEverSet = true
+		textToSend = statusText
+	} else if user.matrixStatusEverSet {
+		user.lastMatrixStatusText = ""
+		user.lastDiscordStatusText = ""
+		textToSend = ""
+	} else {
+		textToSend = user.lastDiscordStatusText
+	}
+
 	var activities []*discordgo.Activity
-	if statusText != "" {
+	if textToSend != "" {
 		activities = []*discordgo.Activity{{
 			Name:  "Custom Status",
 			Type:  discordgo.ActivityTypeCustom,
-			State: statusText,
+			State: textToSend,
 		}}
 	} else {
 		activities = make([]*discordgo.Activity, 0)
@@ -172,7 +202,7 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			Str("user_id", evt.Sender.String()).
 			Str("matrix_presence", string(content.Presence)).
 			Str("discord_status", discordStatus).
-			Str("status_text", statusText).
+			Str("status_text", textToSend).
 			Msg("Bridged Matrix presence to Discord")
 	}
 }
