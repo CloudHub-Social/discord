@@ -1408,11 +1408,28 @@ func discordStatusToMatrix(status discordgo.Status) event.Presence {
 	}
 }
 
+// setMatrixPresence sets the Matrix presence and optional status message for a
+// puppet intent. It makes a raw PUT to the presence endpoint so that status_msg
+// can be included alongside the presence state (the high-level SetPresence
+// helper in mautrix-go only accepts the presence state).
+func setMatrixPresence(intent *appservice.IntentAPI, presence event.Presence, statusMsg string) error {
+	reqBody := struct {
+		Presence  event.Presence `json:"presence"`
+		StatusMsg string         `json:"status_msg,omitempty"`
+	}{
+		Presence:  presence,
+		StatusMsg: statusMsg,
+	}
+	u := intent.BuildClientURL("v3", "presence", intent.UserID, "status")
+	_, err := intent.MakeRequest("PUT", u, reqBody, nil)
+	return err
+}
+
 // applyPresence updates Matrix presence for a Discord user, but only when a
 // puppet for that user already exists. Presence updates for users who have
 // never sent a bridged message are skipped to avoid unbounded puppet-table
 // churn in large guilds.
-func (user *User) applyPresence(userID string, status discordgo.Status) {
+func (user *User) applyPresence(userID string, status discordgo.Status, customStatusText string) {
 	user.bridge.puppetsLock.Lock()
 	puppet, ok := user.bridge.puppets[userID]
 	user.bridge.puppetsLock.Unlock()
@@ -1421,7 +1438,7 @@ func (user *User) applyPresence(userID string, status discordgo.Status) {
 		return
 	}
 	matrixPresence := discordStatusToMatrix(status)
-	err := puppet.DefaultIntent().SetPresence(matrixPresence)
+	err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, customStatusText)
 	if err != nil {
 		user.log.Warn().Err(err).
 			Str("discord_user_id", userID).
@@ -1432,6 +1449,7 @@ func (user *User) applyPresence(userID string, status discordgo.Status) {
 			Str("discord_user_id", userID).
 			Str("discord_status", string(status)).
 			Str("matrix_presence", string(matrixPresence)).
+			Str("status_text", customStatusText).
 			Msg("Bridged Discord presence to Matrix")
 	}
 }
@@ -1444,15 +1462,27 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 		if p.User == nil {
 			continue
 		}
-		user.applyPresence(p.User.ID, p.Status)
+		user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 	}
+}
+
+// discordCustomStatusText extracts the State field from the first
+// ActivityTypeCustom activity in the slice, which is how Discord represents a
+// user's custom status message.
+func discordCustomStatusText(activities []*discordgo.Activity) string {
+	for _, a := range activities {
+		if a.Type == discordgo.ActivityTypeCustom {
+			return a.State
+		}
+	}
+	return ""
 }
 
 func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	if p.User == nil {
 		return
 	}
-	user.applyPresence(p.User.ID, p.Status)
+	user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 }
 
 func (user *User) ensureInvited(intent *appservice.IntentAPI, roomID id.RoomID, isDirect, ignoreCache bool) bool {

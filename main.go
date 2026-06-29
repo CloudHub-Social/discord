@@ -19,6 +19,7 @@ package main
 import (
 	_ "embed"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
@@ -119,6 +120,11 @@ func matrixPresenceToDiscord(presence event.Presence) string {
 	}
 }
 
+// charmDNDPrefix is the status_msg prefix used by the Charm Matrix client to
+// indicate do-not-disturb. When present, it is stripped before forwarding the
+// text to Discord and the Discord status is overridden to "dnd".
+const charmDNDPrefix = "[dnd] "
+
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
 	if !ok {
@@ -129,9 +135,28 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		return
 	}
 	discordStatus := matrixPresenceToDiscord(content.Presence)
+	statusText := content.StatusMessage
+
+	// Check for the Charm client DND prefix and strip it if present.
+	if strings.HasPrefix(statusText, charmDNDPrefix) {
+		statusText = strings.TrimPrefix(statusText, charmDNDPrefix)
+		discordStatus = string(discordgo.StatusDoNotDisturb)
+	}
+
+	var activities []*discordgo.Activity
+	if statusText != "" {
+		activities = []*discordgo.Activity{{
+			Name:  "Custom Status",
+			Type:  discordgo.ActivityTypeCustom,
+			State: statusText,
+		}}
+	} else {
+		activities = make([]*discordgo.Activity, 0)
+	}
+
 	err := user.Session.UpdateStatusComplex(discordgo.UpdateStatusData{
 		Status:     discordStatus,
-		Activities: make([]*discordgo.Activity, 0),
+		Activities: activities,
 	})
 	if err != nil {
 		br.ZLog.Warn().Err(err).
@@ -143,6 +168,7 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			Str("user_id", evt.Sender.String()).
 			Str("matrix_presence", string(content.Presence)).
 			Str("discord_status", discordStatus).
+			Str("status_text", statusText).
 			Msg("Bridged Matrix presence to Discord")
 	}
 }
