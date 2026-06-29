@@ -95,6 +95,20 @@ type User struct {
 	// presence (ghosts never /sync, so presence times out without refresh).
 	presenceCache map[string]presenceCacheEntry
 
+	// discordPresenceSetAt is the timestamp of the last time applyPresence
+	// updated the bridge user's own real Matrix account from a Discord status
+	// change. HandleMatrixPresence uses it to suppress the resulting Synapse
+	// push_ephemeral echo for 2 seconds, preventing it from bouncing the
+	// status back to Discord (e.g., DND would become idle on round-trip).
+	discordPresenceSetAt time.Time
+	// lastOwnMatrixPresence / lastOwnMatrixStatusMsg cache the last presence
+	// state written to the user's own Matrix account from Discord. applyPresence
+	// skips the setMatrixPresence call (and the discordPresenceSetAt reset) when
+	// neither value has changed, so frequent Discord rich-presence activity updates
+	// (e.g., game elapsed time) don't repeatedly slide the suppression window.
+	lastOwnMatrixPresence  event.Presence
+	lastOwnMatrixStatusMsg string
+
 	// stopKeepalive, when non-nil, cancels the presence keepalive goroutine.
 	// Protected by user.Lock().
 	stopKeepalive func()
@@ -567,6 +581,9 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastDiscordStatusText = ""
 	user.lastMatrixStatusText = ""
 	user.matrixStatusEverSet = false
+	user.discordPresenceSetAt = time.Time{}
+	user.lastOwnMatrixPresence = ""
+	user.lastOwnMatrixStatusMsg = ""
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
 	if user.stopKeepalive != nil {
@@ -1596,12 +1613,37 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		// Session check below remains the authoritative gate.
 		customUser := user.bridge.GetUserByMXIDIfExists(puppet.CustomMXID)
 		if customUser == nil || customUser.Session == nil {
+			// No active bridge session for this double-puppeted account — safe to
+			// update the real Matrix account without triggering an echo loop.
 			if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
 				user.log.Warn().Err(err).
 					Str("discord_user_id", userID).
 					Msg("Failed to set Matrix presence for double-puppeted user")
 			}
+		} else if customUser == user {
+			// Bridge user's own Discord status changed. Update their real Matrix
+			// account so the change is visible in Matrix clients (Discord→Matrix
+			// own-user sync). Only update when something actually changed to avoid
+			// sliding the suppression window on every Discord rich-presence tick.
+			user.presenceLock.Lock()
+			changed := matrixPresence != user.lastOwnMatrixPresence || customStatusText != user.lastOwnMatrixStatusMsg
+			if changed {
+				user.discordPresenceSetAt = time.Now()
+				user.lastOwnMatrixPresence = matrixPresence
+				user.lastOwnMatrixStatusMsg = customStatusText
+			}
+			user.presenceLock.Unlock()
+			if changed {
+				if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
+					user.log.Warn().Err(err).
+						Str("discord_user_id", userID).
+						Msg("Failed to set Matrix presence for own double-puppeted account")
+				}
+			}
 		}
+		// If customUser != nil && customUser.Session != nil && customUser != user:
+		// another active bridge user's double-puppeted account — skip to avoid an
+		// echo loop through HandleMatrixPresence on their Discord session.
 	}
 }
 

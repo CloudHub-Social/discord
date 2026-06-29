@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"go.mau.fi/util/configupgrade"
@@ -151,6 +152,19 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	sess := user.Session
 	user.Unlock()
 	if sess == nil {
+		return
+	}
+	// Suppress m.presence echoes that Synapse delivers via push_ephemeral when
+	// the bridge itself sets the user's own Matrix account from a Discord status
+	// change (applyPresence, Discord→Matrix own-user sync). Without suppression
+	// the echo triggers UpdateStatusComplex and clobbers the Discord status —
+	// DND becomes idle because Matrix "unavailable" round-trips to Discord "idle".
+	// The 2-second window exceeds any realistic Synapse push latency while still
+	// being short enough not to suppress deliberate status changes in Charm.
+	user.presenceLock.Lock()
+	suppressUntil := user.discordPresenceSetAt.Add(2 * time.Second)
+	user.presenceLock.Unlock()
+	if time.Now().Before(suppressUntil) {
 		return
 	}
 	discordStatus := matrixPresenceToDiscord(content.Presence)
