@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/bwmarrin/discordgo"
 	"go.mau.fi/util/configupgrade"
 	"go.mau.fi/util/exsync"
 	"golang.org/x/sync/semaphore"
@@ -97,11 +98,53 @@ func (br *DiscordBridge) Init() {
 	br.CommandProcessor = commands.NewProcessor(&br.Bridge)
 	br.RegisterCommands()
 	br.EventProcessor.On(event.StateTombstone, br.HandleTombstone)
+	br.EventProcessor.On(event.EphemeralEventPresence, br.HandleMatrixPresence)
 
 	matrixHTMLParser.PillConverter = br.pillConverter
 
 	br.DB = database.New(br.Bridge.DB, br.Log.Sub("Database"))
 	discordLog = br.ZLog.With().Str("component", "discordgo").Logger()
+}
+
+func matrixPresenceToDiscord(presence event.Presence) string {
+	switch presence {
+	case event.PresenceOnline:
+		return string(discordgo.StatusOnline)
+	case event.PresenceUnavailable:
+		return string(discordgo.StatusIdle)
+	case event.PresenceOffline:
+		return string(discordgo.StatusInvisible)
+	default:
+		return string(discordgo.StatusInvisible)
+	}
+}
+
+func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
+	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
+	if !ok {
+		return
+	}
+	user := br.GetCachedUserByMXID(evt.Sender)
+	if user == nil || user.Session == nil {
+		return
+	}
+	discordStatus := matrixPresenceToDiscord(content.Presence)
+	err := user.Session.UpdateStatusComplex(discordgo.UpdateStatusData{
+		Status:     discordStatus,
+		Activities: make([]*discordgo.Activity, 0),
+	})
+	if err != nil {
+		br.ZLog.Warn().Err(err).
+			Str("user_id", evt.Sender.String()).
+			Str("matrix_presence", string(content.Presence)).
+			Msg("Failed to update Discord status from Matrix presence")
+	} else {
+		br.ZLog.Debug().
+			Str("user_id", evt.Sender.String()).
+			Str("matrix_presence", string(content.Presence)).
+			Str("discord_status", discordStatus).
+			Msg("Bridged Matrix presence to Discord")
+	}
 }
 
 func (br *DiscordBridge) Start() {

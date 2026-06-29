@@ -560,7 +560,7 @@ const BotIntents = discordgo.IntentGuilds |
 	discordgo.IntentDirectMessageTyping |
 	// Privileged intents
 	discordgo.IntentMessageContent |
-	//discordgo.IntentGuildPresences |
+	discordgo.IntentGuildPresences |
 	discordgo.IntentGuildMembers
 
 func (user *User) Connect() error {
@@ -711,6 +711,8 @@ func (user *User) eventHandler(rawEvt any) {
 		user.messageAckHandler(evt)
 	case *discordgo.TypingStart:
 		user.typingStartHandler(evt)
+	case *discordgo.PresenceUpdate:
+		user.presenceUpdateHandler(evt)
 	case *discordgo.InteractionSuccess:
 		user.interactionSuccessHandler(evt)
 	case *discordgo.ThreadListSync:
@@ -1378,6 +1380,40 @@ func (user *User) interactionSuccessHandler(s *discordgo.InteractionSuccess) {
 		user.log.Debug().Str("nonce", s.Nonce).Str("id", s.ID).Msg("Got interaction success for pending interaction")
 		ce.React("✅")
 		delete(user.pendingInteractions, s.Nonce)
+	}
+}
+
+func discordStatusToMatrix(status discordgo.Status) event.Presence {
+	switch status {
+	case discordgo.StatusOnline:
+		return event.PresenceOnline
+	case discordgo.StatusIdle:
+		return event.PresenceUnavailable
+	case discordgo.StatusDoNotDisturb, discordgo.StatusInvisible, discordgo.StatusOffline:
+		return event.PresenceOffline
+	default:
+		return event.PresenceOffline
+	}
+}
+
+func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
+	if p.User == nil {
+		return
+	}
+	puppet := user.bridge.GetPuppetByID(p.User.ID)
+	matrixPresence := discordStatusToMatrix(p.Status)
+	err := puppet.DefaultIntent().SetPresence(matrixPresence)
+	if err != nil {
+		user.log.Warn().Err(err).
+			Str("discord_user_id", p.User.ID).
+			Str("discord_status", string(p.Status)).
+			Msg("Failed to set Matrix presence for Discord user")
+	} else {
+		user.log.Debug().
+			Str("discord_user_id", p.User.ID).
+			Str("discord_status", string(p.Status)).
+			Str("matrix_presence", string(matrixPresence)).
+			Msg("Bridged Discord presence to Matrix")
 	}
 }
 
