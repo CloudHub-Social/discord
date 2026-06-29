@@ -19,8 +19,10 @@ package main
 import (
 	_ "embed"
 	"net/http"
+	"strings"
 	"sync"
 
+	"github.com/bwmarrin/discordgo"
 	"go.mau.fi/util/configupgrade"
 	"go.mau.fi/util/exsync"
 	"golang.org/x/sync/semaphore"
@@ -97,11 +99,139 @@ func (br *DiscordBridge) Init() {
 	br.CommandProcessor = commands.NewProcessor(&br.Bridge)
 	br.RegisterCommands()
 	br.EventProcessor.On(event.StateTombstone, br.HandleTombstone)
+	br.EventProcessor.On(event.EphemeralEventPresence, br.HandleMatrixPresence)
 
 	matrixHTMLParser.PillConverter = br.pillConverter
 
 	br.DB = database.New(br.Bridge.DB, br.Log.Sub("Database"))
 	discordLog = br.ZLog.With().Str("component", "discordgo").Logger()
+}
+
+func matrixPresenceToDiscord(presence event.Presence) string {
+	switch presence {
+	case event.PresenceOnline:
+		return string(discordgo.StatusOnline)
+	case event.PresenceUnavailable:
+		return string(discordgo.StatusIdle)
+	case event.PresenceOffline:
+		return string(discordgo.StatusInvisible)
+	default:
+		return string(discordgo.StatusInvisible)
+	}
+}
+
+// charmDNDPrefix is the status_msg prefix used by the Charm Matrix client to
+// indicate do-not-disturb. When present, it is stripped before forwarding the
+// text to Discord and the Discord status is overridden to "dnd".
+// charmDNDPrefix is the status_msg prefix used by the Charm Matrix client to
+// indicate do-not-disturb. Charm sets status_msg to "[dnd]" (no custom text)
+// or "[dnd] <text>" (with custom text). Both forms are detected and stripped.
+const charmDNDPrefix = "[dnd]"
+
+// discordCustomStatusMaxRunes is Discord's maximum length for a custom status message.
+const discordCustomStatusMaxRunes = 128
+
+func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
+	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
+	if !ok {
+		return
+	}
+	// GetUserByMXIDIfExists checks the cache then the DB without creating a new
+	// row, preventing phantom bridge-user rows for unrelated Matrix users who
+	// share rooms with bridge users and whose presence EDUs the appservice receives.
+	user := br.GetUserByMXIDIfExists(evt.Sender)
+	if user == nil {
+		return
+	}
+	// Snapshot the session under the user lock to avoid a TOCTOU race with
+	// Logout(), which acquires user.Lock() and sets Session to nil. Without this,
+	// the nil check and the subsequent call on line ~197 are not atomic and a
+	// concurrent Logout() can cause a nil pointer dereference panic.
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess == nil {
+		return
+	}
+	discordStatus := matrixPresenceToDiscord(content.Presence)
+
+	// rawStatusText is the unmodified status_msg from Matrix (before DND stripping).
+	rawStatusText := content.StatusMessage
+	statusText := rawStatusText
+
+	// Check for the Charm client DND prefix and strip it if present.
+	// Handles both "[dnd]" (no custom text) and "[dnd] <text>" forms.
+	// Always strip the prefix so the raw marker never reaches Discord as literal
+	// status text, but only override to DND when the Matrix presence is not
+	// offline — a client going offline while retaining a [dnd] status_msg should
+	// still result in Discord invisible, not DND.
+	if rest, ok := strings.CutPrefix(statusText, charmDNDPrefix); ok {
+		statusText = strings.TrimPrefix(rest, " ")
+		if content.Presence != event.PresenceOffline {
+			discordStatus = string(discordgo.StatusDoNotDisturb)
+		}
+	}
+
+	// Determine the status text to send to Discord using last-writer-wins
+	// with intentional-clear detection:
+	//
+	//  - statusText != "": Matrix set a non-empty text (after prefix stripping) —
+	//    cache it and use it.
+	//  - statusText == "" && rawStatusText == "" && matrixStatusEverSet: Matrix
+	//    previously had a status and now explicitly sends empty — intentional clear.
+	//  - otherwise (never set, or raw had content that stripped to empty e.g. bare
+	//    "[dnd]"): fall back to the last Discord-side status so we don't clobber it.
+	user.presenceLock.Lock()
+	var textToSend string
+	if statusText != "" {
+		user.lastMatrixStatusText = statusText
+		user.matrixStatusEverSet = true
+		textToSend = statusText
+	} else if rawStatusText == "" && user.matrixStatusEverSet {
+		// Intentional clear: truly empty status_msg after Matrix previously set one.
+		// Only reset the Matrix-side cache — lastDiscordStatusText is Discord's own
+		// status and must remain as a fallback for bare DND and presence-only updates.
+		user.lastMatrixStatusText = ""
+		textToSend = ""
+	} else {
+		// Never set, or raw was a bare DND prefix with no custom text — preserve Discord's status.
+		textToSend = user.lastDiscordStatusText
+	}
+	user.presenceLock.Unlock()
+
+	// Truncate to Discord's custom status character limit.
+	if runes := []rune(textToSend); len(runes) > discordCustomStatusMaxRunes {
+		textToSend = string(runes[:discordCustomStatusMaxRunes])
+	}
+
+	var activities []*discordgo.Activity
+	if textToSend != "" {
+		activities = []*discordgo.Activity{{
+			Name:  "Custom Status",
+			Type:  discordgo.ActivityTypeCustom,
+			State: textToSend,
+		}}
+	} else {
+		activities = make([]*discordgo.Activity, 0)
+	}
+
+	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
+		Status:     discordStatus,
+		Activities: activities,
+	})
+	if err != nil {
+		br.ZLog.Warn().Err(err).
+			Str("user_id", evt.Sender.String()).
+			Str("matrix_presence", string(content.Presence)).
+			Msg("Failed to update Discord status from Matrix presence")
+	} else {
+		br.ZLog.Debug().
+			Str("user_id", evt.Sender.String()).
+			Str("matrix_presence", string(content.Presence)).
+			Str("discord_status", discordStatus).
+			Str("status_text", textToSend).
+			Msg("Bridged Matrix presence to Discord")
+	}
 }
 
 func (br *DiscordBridge) Start() {

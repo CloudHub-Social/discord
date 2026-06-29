@@ -74,6 +74,30 @@ type User struct {
 	// and "available" but not logically "ready" just yet.
 	relationshipsReady bool
 	relationshipLock   sync.RWMutex
+
+	// presenceLock protects the status-sync fields and presenceCache below,
+	// all accessed concurrently from the discordgo event goroutine and the
+	// appservice EventProcessor goroutine.
+	presenceLock sync.Mutex
+
+	// Status text sync state. lastMatrixStatusText is the last non-empty
+	// status_msg received from Matrix. lastDiscordStatusText is the last
+	// custom status text seen from Discord. matrixStatusEverSet tracks
+	// whether Matrix has ever sent a status_msg this session (so we can
+	// distinguish "never set" from "intentionally cleared").
+	lastMatrixStatusText  string
+	lastDiscordStatusText string
+	matrixStatusEverSet   bool
+
+	// presenceCache maps Discord user IDs to their last known non-offline
+	// Matrix presence state. The keepalive goroutine re-sends these every
+	// presenceKeepaliveInterval so Synapse does not expire ghost users'
+	// presence (ghosts never /sync, so presence times out without refresh).
+	presenceCache map[string]presenceCacheEntry
+
+	// stopKeepalive, when non-nil, cancels the presence keepalive goroutine.
+	// Protected by user.Lock().
+	stopKeepalive func()
 }
 
 func (user *User) GetRemoteID() string {
@@ -173,6 +197,25 @@ func (br *DiscordBridge) loadUser(dbUser *database.User, mxid *id.UserID) *User 
 	return user
 }
 
+// GetUserByMXIDIfExists returns the bridge user for a Matrix user ID if one
+// already exists in the in-memory cache or the database, without creating a
+// new row. Returns nil when no bridge user has ever been created for this MXID.
+func (br *DiscordBridge) GetUserByMXIDIfExists(userID id.UserID) *User {
+	if userID == br.Bot.UserID || br.IsGhost(userID) {
+		return nil
+	}
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+
+	user, ok := br.usersByMXID[userID]
+	if !ok {
+		// Pass nil for the mxid parameter so loadUser does not insert a new row
+		// when the DB returns nil.
+		return br.loadUser(br.DB.User.GetByMXID(userID), nil)
+	}
+	return user
+}
+
 func (br *DiscordBridge) GetUserByMXID(userID id.UserID) *User {
 	if userID == br.Bot.UserID || br.IsGhost(userID) {
 		return nil
@@ -210,6 +253,18 @@ func (br *DiscordBridge) GetCachedUserByMXID(userID id.UserID) *User {
 	return br.usersByMXID[userID]
 }
 
+// presenceCacheEntry holds the last known non-offline Matrix presence state
+// for a Discord user, used by the keepalive goroutine.
+type presenceCacheEntry struct {
+	presence  event.Presence
+	statusMsg string
+}
+
+// presenceKeepaliveInterval is how often the keepalive goroutine re-sends
+// presence for non-offline ghost users. Synapse's default presence timeout
+// is 60s; 30s keeps us safely below it.
+const presenceKeepaliveInterval = 30 * time.Second
+
 func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 	user := &User{
 		User:   dbUser,
@@ -221,7 +276,8 @@ func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 
 		pendingInteractions: make(map[string]*WrappedCommandEvent),
 
-		relationships: make(map[string]*discordgo.Relationship),
+		relationships:  make(map[string]*discordgo.Relationship),
+		presenceCache:  make(map[string]presenceCacheEntry),
 	}
 	user.nextDiscordUploadID.Store(rand.Int31n(100))
 	user.BridgeState = br.NewBridgeStateQueue(user)
@@ -506,6 +562,16 @@ func (user *User) Logout(isOverwriting bool) {
 	user.reconstructRelationships(nil)
 	user.DiscordToken = ""
 	user.ReadStateVersion = 0
+	user.presenceLock.Lock()
+	user.lastDiscordStatusText = ""
+	user.lastMatrixStatusText = ""
+	user.matrixStatusEverSet = false
+	clear(user.presenceCache)
+	user.presenceLock.Unlock()
+	if user.stopKeepalive != nil {
+		user.stopKeepalive()
+		user.stopKeepalive = nil
+	}
 	if !isOverwriting {
 		user.bridge.usersLock.Lock()
 		if user.bridge.usersByID[user.DiscordID] == user {
@@ -560,6 +626,10 @@ const BotIntents = discordgo.IntentGuilds |
 	discordgo.IntentDirectMessageTyping |
 	// Privileged intents
 	discordgo.IntentMessageContent |
+	// IntentGuildPresences is a privileged intent that must be explicitly
+	// enabled in the Discord developer portal for each bot application.
+	// Omit it from BotIntents so bot-token logins don't get rejected with
+	// close 4014 when the application hasn't enabled it.
 	//discordgo.IntentGuildPresences |
 	discordgo.IntentGuildMembers
 
@@ -711,6 +781,8 @@ func (user *User) eventHandler(rawEvt any) {
 		user.messageAckHandler(evt)
 	case *discordgo.TypingStart:
 		user.typingStartHandler(evt)
+	case *discordgo.PresenceUpdate:
+		user.presenceUpdateHandler(evt)
 	case *discordgo.InteractionSuccess:
 		user.interactionSuccessHandler(evt)
 	case *discordgo.ThreadListSync:
@@ -735,6 +807,10 @@ func (user *User) Disconnect() error {
 		return err
 	}
 	user.Session = nil
+	if user.stopKeepalive != nil {
+		user.stopKeepalive()
+		user.stopKeepalive = nil
+	}
 	return nil
 }
 
@@ -773,16 +849,24 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.bridgeStateLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
+		// Write DiscordID under user.Lock BEFORE taking usersLock. Logout() holds
+		// user.Lock for its full duration and later acquires usersLock, so holding
+		// usersLock while waiting for user.Lock would be an AB/BA deadlock.
+		// Use a local to carry the new value into the usersLock block below.
+		user.Lock()
+		newDiscordID := r.User.ID
+		user.DiscordID = newDiscordID
+		user.Unlock()
+
 		user.bridge.usersLock.Lock()
-		user.DiscordID = r.User.ID
-		if previousUser, ok := user.bridge.usersByID[user.DiscordID]; ok && previousUser != user {
+		if previousUser, ok := user.bridge.usersByID[newDiscordID]; ok && previousUser != user {
 			user.log.Warn().
 				Str("previous_user_id", previousUser.MXID.String()).
 				Msg("Another user is logged in with same Discord ID, logging them out")
 			// TODO send notice?
 			previousUser.Logout(true)
 		}
-		user.bridge.usersByID[user.DiscordID] = user
+		user.bridge.usersByID[newDiscordID] = user
 		user.bridge.usersLock.Unlock()
 		user.Update()
 	}
@@ -820,6 +904,15 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	}
 
 	go user.subscribeGuilds(2 * time.Second)
+
+	// Seed Matrix presence from the presence snapshots delivered in READY so
+	// that users who are already online are reflected immediately rather than
+	// waiting for a future PresenceUpdate event.
+	go user.seedPresences(r.Presences)
+
+	// Start the keepalive goroutine that periodically re-sends non-offline
+	// presence so Synapse does not expire ghost users (ghosts never /sync).
+	user.startPresenceKeepalive()
 
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
@@ -1097,6 +1190,9 @@ func (user *User) guildCreateHandler(g *discordgo.GuildCreate) {
 		Bool("unavailable", g.Unavailable).
 		Msg("Got guild create event")
 	user.handleGuild(g.Guild, time.Now(), false)
+	// Seed Matrix presence from GUILD_CREATE presences so reconnect/restart
+	// doesn't leave known users as offline until their next status change.
+	go user.seedPresences(g.Presences)
 }
 
 func (user *User) guildDeleteHandler(g *discordgo.GuildDelete) {
@@ -1379,6 +1475,229 @@ func (user *User) interactionSuccessHandler(s *discordgo.InteractionSuccess) {
 		ce.React("✅")
 		delete(user.pendingInteractions, s.Nonce)
 	}
+}
+
+func discordStatusToMatrix(status discordgo.Status) event.Presence {
+	switch status {
+	case discordgo.StatusOnline:
+		return event.PresenceOnline
+	case discordgo.StatusIdle:
+		return event.PresenceUnavailable
+	case discordgo.StatusDoNotDisturb:
+		// DND is a visible, connected state — map to unavailable rather than offline
+		// so Matrix clients retain the fact that the user is currently present.
+		return event.PresenceUnavailable
+	case discordgo.StatusInvisible, discordgo.StatusOffline:
+		return event.PresenceOffline
+	default:
+		return event.PresenceOffline
+	}
+}
+
+// setMatrixPresence sets the Matrix presence and optional status message for a
+// puppet intent. It makes a raw PUT to the presence endpoint so that status_msg
+// can be included alongside the presence state (the high-level SetPresence
+// helper in mautrix-go only accepts the presence state).
+func setMatrixPresence(intent *appservice.IntentAPI, presence event.Presence, statusMsg string) error {
+	reqBody := struct {
+		Presence  event.Presence `json:"presence"`
+		StatusMsg string         `json:"status_msg,omitempty"`
+	}{
+		Presence:  presence,
+		StatusMsg: statusMsg,
+	}
+	u := intent.BuildClientURL("v3", "presence", intent.UserID, "status")
+	_, err := intent.MakeRequest("PUT", u, reqBody, nil)
+	return err
+}
+
+// applyPresence updates Matrix presence for a Discord user, but only when a
+// puppet for that user already exists. Presence updates for users who have
+// never sent a bridged message are skipped to avoid unbounded puppet-table
+// churn in large guilds.
+func (user *User) applyPresence(userID string, status discordgo.Status, customStatusText string) {
+	puppet := user.bridge.GetPuppetByIDIfExists(userID)
+	if puppet == nil {
+		// No puppet exists yet; skip to avoid creating phantom DB rows.
+		return
+	}
+	matrixPresence := discordStatusToMatrix(status)
+	err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, customStatusText)
+	if err != nil {
+		user.log.Warn().Err(err).
+			Str("discord_user_id", userID).
+			Str("discord_status", string(status)).
+			Msg("Failed to set Matrix presence for Discord user")
+	} else {
+		user.log.Debug().
+			Str("discord_user_id", userID).
+			Str("discord_status", string(status)).
+			Str("matrix_presence", string(matrixPresence)).
+			Str("status_text", customStatusText).
+			Msg("Bridged Discord presence to Matrix")
+	}
+	// Keep the keepalive cache in sync so that the background goroutine can
+	// re-send this presence before Synapse times out the ghost user.
+	user.presenceLock.Lock()
+	if matrixPresence == event.PresenceOffline {
+		delete(user.presenceCache, userID)
+	} else {
+		user.presenceCache[userID] = presenceCacheEntry{presence: matrixPresence, statusMsg: customStatusText}
+	}
+	user.presenceLock.Unlock()
+	// When double puppeting is active, also update the real Matrix account so
+	// clients see the correct presence on the user's own identity, not just on
+	// the bridge ghost which may not be present in all rooms.
+	// Skip any puppet whose CustomMXID belongs to a logged-in bridge user: the
+	// appservice receives the resulting m.presence echo via ephemeral_events and
+	// HandleMatrixPresence would treat it as a Matrix-side change, immediately
+	// clobbering the Discord status (e.g. DND → unavailable → echoed back → idle).
+	// This applies to both the observing user's own account and any other
+	// logged-in user whose Discord presence is being observed.
+	if customIntent := puppet.CustomIntent(); customIntent != nil {
+		// Use GetUserByMXIDIfExists (cache + DB fallback) rather than
+		// GetCachedUserByMXID (cache only) so that a user who is stored in the
+		// DB but not yet loaded into the in-memory map still triggers the echo-
+		// suppression guard. Session is an in-memory field only — a DB-loaded
+		// user without an active session will still have Session == nil, so the
+		// Session check below remains the authoritative gate.
+		customUser := user.bridge.GetUserByMXIDIfExists(puppet.CustomMXID)
+		if customUser == nil || customUser.Session == nil {
+			if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
+				user.log.Warn().Err(err).
+					Str("discord_user_id", userID).
+					Msg("Failed to set Matrix presence for double-puppeted user")
+			}
+		}
+	}
+}
+
+// startPresenceKeepalive launches a background goroutine that re-sends
+// non-offline Matrix presence every presenceKeepaliveInterval. Must be called
+// with no locks held. Cancels any previously-running keepalive first so a
+// reconnect (readyHandler firing again) does not accumulate goroutines.
+func (user *User) startPresenceKeepalive() {
+	user.Lock()
+	// If we raced with Logout (Session is nil), don't start a new goroutine.
+	if user.Session == nil {
+		user.Unlock()
+		return
+	}
+	if user.stopKeepalive != nil {
+		user.stopKeepalive()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	user.stopKeepalive = cancel
+	user.Unlock()
+	go user.runPresenceKeepalive(ctx)
+}
+
+func (user *User) runPresenceKeepalive(ctx context.Context) {
+	ticker := time.NewTicker(presenceKeepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			user.presenceLock.Lock()
+			snapshot := make(map[string]presenceCacheEntry, len(user.presenceCache))
+			for k, v := range user.presenceCache {
+				snapshot[k] = v
+			}
+			user.presenceLock.Unlock()
+
+			for discordID, entry := range snapshot {
+				puppet := user.bridge.GetPuppetByIDIfExists(discordID)
+				if puppet == nil {
+					continue
+				}
+				if err := setMatrixPresence(puppet.DefaultIntent(), entry.presence, entry.statusMsg); err != nil {
+					user.log.Warn().Err(err).Str("discord_user_id", discordID).Msg("Failed to refresh Matrix presence keepalive")
+				}
+				if customIntent := puppet.CustomIntent(); customIntent != nil {
+					customUser := user.bridge.GetUserByMXIDIfExists(puppet.CustomMXID)
+					if customUser == nil || customUser.Session == nil {
+						_ = setMatrixPresence(customIntent, entry.presence, entry.statusMsg)
+					}
+				}
+			}
+		}
+	}
+}
+
+// seedPresences applies presence for a batch of Presence entries received in
+// READY or GUILD_CREATE payloads so that already-online users are reflected in
+// Matrix immediately after a connect or reconnect.
+func (user *User) seedPresences(presences []*discordgo.Presence) {
+	// Snapshot DiscordID under the user lock to avoid a data race with Logout(),
+	// which holds user.Lock() while writing user.DiscordID = "".
+	user.Lock()
+	ownID := user.DiscordID
+	user.Unlock()
+
+	// Deduplicate by Discord user ID: READY/GUILD_CREATE presences are guild-scoped
+	// so the same user appears once per mutual guild. Without deduplication, a user
+	// shared across many guilds would trigger many concurrent Matrix presence PUTs
+	// against the same puppet, hitting rate limits and leaving statuses stale.
+	seen := make(map[string]struct{}, len(presences))
+	for _, p := range presences {
+		if p.User == nil {
+			continue
+		}
+		if _, ok := seen[p.User.ID]; ok {
+			continue
+		}
+		seen[p.User.ID] = struct{}{}
+		// Seed the Discord status cache for the bridge user's own presence so
+		// that the first Matrix→Discord sync after a reconnect doesn't clobber
+		// a pre-existing Discord custom status with an empty fallback.
+		if p.User.ID == ownID {
+			user.presenceLock.Lock()
+			user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
+			user.presenceLock.Unlock()
+		}
+		user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
+	}
+}
+
+// discordCustomStatusText extracts the State field from the first
+// ActivityTypeCustom activity in the slice, which is how Discord represents a
+// user's custom status message.
+func discordCustomStatusText(activities []*discordgo.Activity) string {
+	for _, a := range activities {
+		if a.Type == discordgo.ActivityTypeCustom {
+			return a.State
+		}
+	}
+	return ""
+}
+
+func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
+	if p.User == nil {
+		return
+	}
+	// Snapshot DiscordID under the user lock to avoid a data race with Logout(),
+	// which holds user.Lock() while writing user.DiscordID = "".
+	user.Lock()
+	ownID := user.DiscordID
+	user.Unlock()
+	// Discord PRESENCE_UPDATE can be partial — any combination of fields may be
+	// absent. An empty Status means only non-presence fields (e.g. username)
+	// changed; skip to avoid mapping "" to offline and incorrectly marking the
+	// puppet as offline when only unrelated user data was updated.
+	if p.Status == "" {
+		return
+	}
+	// If this is a presence update for the bridge user themselves, cache the
+	// Discord-side custom status text for fallback in HandleMatrixPresence, then
+	// fall through to applyPresence so their Matrix puppet also reflects the change.
+	if p.User.ID == ownID {
+		user.presenceLock.Lock()
+		user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
+		user.presenceLock.Unlock()
+	}
+	user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 }
 
 func (user *User) ensureInvited(intent *appservice.IntentAPI, roomID id.RoomID, isDirect, ignoreCache bool) bool {
