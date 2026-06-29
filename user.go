@@ -1589,6 +1589,19 @@ func (user *User) startPresenceKeepalive() {
 	ctx, cancel := context.WithCancel(context.Background())
 	user.stopKeepalive = cancel
 	user.Unlock()
+
+	// Discard the cache from the previous connection before starting a fresh
+	// keepalive. Discord's GUILD_CREATE presence lists only include non-offline
+	// members in large guilds, so a user who went offline while the bridge was
+	// disconnected may have no entry in the new READY/GUILD_CREATE payload to
+	// overwrite the stale "online" record. Clearing here ensures seedPresences
+	// rebuilds the cache from authoritative fresh data; in the brief window
+	// before seedPresences repopulates, the keepalive fires against an empty map
+	// and does nothing, which is the correct conservative behaviour.
+	user.presenceLock.Lock()
+	clear(user.presenceCache)
+	user.presenceLock.Unlock()
+
 	go user.runPresenceKeepalive(ctx)
 }
 
