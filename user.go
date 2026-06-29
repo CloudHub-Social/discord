@@ -560,7 +560,11 @@ const BotIntents = discordgo.IntentGuilds |
 	discordgo.IntentDirectMessageTyping |
 	// Privileged intents
 	discordgo.IntentMessageContent |
-	discordgo.IntentGuildPresences |
+	// IntentGuildPresences is a privileged intent that must be explicitly
+	// enabled in the Discord developer portal for each bot application.
+	// Omit it from BotIntents so bot-token logins don't get rejected with
+	// close 4014 when the application hasn't enabled it.
+	//discordgo.IntentGuildPresences |
 	discordgo.IntentGuildMembers
 
 func (user *User) Connect() error {
@@ -822,6 +826,11 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	}
 
 	go user.subscribeGuilds(2 * time.Second)
+
+	// Seed Matrix presence from the presence snapshots delivered in READY so
+	// that users who are already online are reflected immediately rather than
+	// waiting for a future PresenceUpdate event.
+	go user.seedPresences(r.Presences)
 
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
@@ -1099,6 +1108,9 @@ func (user *User) guildCreateHandler(g *discordgo.GuildCreate) {
 		Bool("unavailable", g.Unavailable).
 		Msg("Got guild create event")
 	user.handleGuild(g.Guild, time.Now(), false)
+	// Seed Matrix presence from GUILD_CREATE presences so reconnect/restart
+	// doesn't leave known users as offline until their next status change.
+	go user.seedPresences(g.Presences)
 }
 
 func (user *User) guildDeleteHandler(g *discordgo.GuildDelete) {
@@ -1396,25 +1408,51 @@ func discordStatusToMatrix(status discordgo.Status) event.Presence {
 	}
 }
 
+// applyPresence updates Matrix presence for a Discord user, but only when a
+// puppet for that user already exists. Presence updates for users who have
+// never sent a bridged message are skipped to avoid unbounded puppet-table
+// churn in large guilds.
+func (user *User) applyPresence(userID string, status discordgo.Status) {
+	user.bridge.puppetsLock.Lock()
+	puppet, ok := user.bridge.puppets[userID]
+	user.bridge.puppetsLock.Unlock()
+	if !ok {
+		// No puppet exists yet; skip to avoid creating phantom DB rows.
+		return
+	}
+	matrixPresence := discordStatusToMatrix(status)
+	err := puppet.DefaultIntent().SetPresence(matrixPresence)
+	if err != nil {
+		user.log.Warn().Err(err).
+			Str("discord_user_id", userID).
+			Str("discord_status", string(status)).
+			Msg("Failed to set Matrix presence for Discord user")
+	} else {
+		user.log.Debug().
+			Str("discord_user_id", userID).
+			Str("discord_status", string(status)).
+			Str("matrix_presence", string(matrixPresence)).
+			Msg("Bridged Discord presence to Matrix")
+	}
+}
+
+// seedPresences applies presence for a batch of Presence entries received in
+// READY or GUILD_CREATE payloads so that already-online users are reflected in
+// Matrix immediately after a connect or reconnect.
+func (user *User) seedPresences(presences []*discordgo.Presence) {
+	for _, p := range presences {
+		if p.User == nil {
+			continue
+		}
+		user.applyPresence(p.User.ID, p.Status)
+	}
+}
+
 func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	if p.User == nil {
 		return
 	}
-	puppet := user.bridge.GetPuppetByID(p.User.ID)
-	matrixPresence := discordStatusToMatrix(p.Status)
-	err := puppet.DefaultIntent().SetPresence(matrixPresence)
-	if err != nil {
-		user.log.Warn().Err(err).
-			Str("discord_user_id", p.User.ID).
-			Str("discord_status", string(p.Status)).
-			Msg("Failed to set Matrix presence for Discord user")
-	} else {
-		user.log.Debug().
-			Str("discord_user_id", p.User.ID).
-			Str("discord_status", string(p.Status)).
-			Str("matrix_presence", string(matrixPresence)).
-			Msg("Bridged Discord presence to Matrix")
-	}
+	user.applyPresence(p.User.ID, p.Status)
 }
 
 func (user *User) ensureInvited(intent *appservice.IntentAPI, roomID id.RoomID, isDirect, ignoreCache bool) bool {
