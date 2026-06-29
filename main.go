@@ -128,6 +128,9 @@ func matrixPresenceToDiscord(presence event.Presence) string {
 // or "[dnd] <text>" (with custom text). Both forms are detected and stripped.
 const charmDNDPrefix = "[dnd]"
 
+// discordCustomStatusMaxRunes is Discord's maximum length for a custom status message.
+const discordCustomStatusMaxRunes = 128
+
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
 	if !ok {
@@ -158,12 +161,15 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 
 	// Check for the Charm client DND prefix and strip it if present.
 	// Handles both "[dnd]" (no custom text) and "[dnd] <text>" forms.
-	// Only override to DND when the Matrix presence is not offline — if the
-	// client goes offline while retaining a [dnd] status_msg we should respect
-	// the offline→invisible mapping rather than keeping the account visible as DND.
-	if rest, ok := strings.CutPrefix(statusText, charmDNDPrefix); ok && content.Presence != event.PresenceOffline {
+	// Always strip the prefix so the raw marker never reaches Discord as literal
+	// status text, but only override to DND when the Matrix presence is not
+	// offline — a client going offline while retaining a [dnd] status_msg should
+	// still result in Discord invisible, not DND.
+	if rest, ok := strings.CutPrefix(statusText, charmDNDPrefix); ok {
 		statusText = strings.TrimPrefix(rest, " ")
-		discordStatus = string(discordgo.StatusDoNotDisturb)
+		if content.Presence != event.PresenceOffline {
+			discordStatus = string(discordgo.StatusDoNotDisturb)
+		}
 	}
 
 	// Determine the status text to send to Discord using last-writer-wins
@@ -192,6 +198,11 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		textToSend = user.lastDiscordStatusText
 	}
 	user.presenceLock.Unlock()
+
+	// Truncate to Discord's custom status character limit.
+	if runes := []rune(textToSend); len(runes) > discordCustomStatusMaxRunes {
+		textToSend = string(runes[:discordCustomStatusMaxRunes])
+	}
 
 	var activities []*discordgo.Activity
 	if textToSend != "" {

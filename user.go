@@ -818,7 +818,12 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 
 	if user.DiscordID != r.User.ID {
 		user.bridge.usersLock.Lock()
+		// Hold user.Lock() while writing DiscordID so that presenceUpdateHandler
+		// and seedPresences (which read it under user.Lock()) see a consistent value.
+		// Lock ordering: usersLock (outer) → user.Lock() (inner).
+		user.Lock()
 		user.DiscordID = r.User.ID
+		user.Unlock()
 		if previousUser, ok := user.bridge.usersByID[user.DiscordID]; ok && previousUser != user {
 			user.log.Warn().
 				Str("previous_user_id", previousUser.MXID.String()).
@@ -1495,11 +1500,20 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 	// When double puppeting is active, also update the real Matrix account so
 	// clients see the correct presence on the user's own identity, not just on
 	// the bridge ghost which may not be present in all rooms.
+	// Skip the bridge user's own account: the appservice would receive the
+	// resulting m.presence echo via ephemeral_events and HandleMatrixPresence
+	// would treat it as a Matrix-side change, immediately clobbering the Discord
+	// status (e.g. DND → unavailable → echoed back → idle).
 	if customIntent := puppet.CustomIntent(); customIntent != nil {
-		if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
-			user.log.Warn().Err(err).
-				Str("discord_user_id", userID).
-				Msg("Failed to set Matrix presence for double-puppeted user")
+		user.Lock()
+		isOwnAccount := userID == user.DiscordID
+		user.Unlock()
+		if !isOwnAccount {
+			if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
+				user.log.Warn().Err(err).
+					Str("discord_user_id", userID).
+					Msg("Failed to set Matrix presence for double-puppeted user")
+			}
 		}
 	}
 }
