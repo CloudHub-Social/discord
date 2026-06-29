@@ -154,19 +154,6 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	if sess == nil {
 		return
 	}
-	// Suppress m.presence echoes that Synapse delivers via push_ephemeral when
-	// the bridge itself sets the user's own Matrix account from a Discord status
-	// change (applyPresence, Discord→Matrix own-user sync). Without suppression
-	// the echo triggers UpdateStatusComplex and clobbers the Discord status —
-	// DND becomes idle because Matrix "unavailable" round-trips to Discord "idle".
-	// The 2-second window exceeds any realistic Synapse push latency while still
-	// being short enough not to suppress deliberate status changes in Charm.
-	user.presenceLock.Lock()
-	suppressUntil := user.discordPresenceSetAt.Add(2 * time.Second)
-	user.presenceLock.Unlock()
-	if time.Now().Before(suppressUntil) {
-		return
-	}
 	discordStatus := matrixPresenceToDiscord(content.Presence)
 
 	// rawStatusText is the unmodified status_msg from Matrix (before DND stripping).
@@ -195,6 +182,13 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	//    previously had a status and now explicitly sends empty — intentional clear.
 	//  - otherwise (never set, or raw had content that stripped to empty e.g. bare
 	//    "[dnd]"): fall back to the last Discord-side status so we don't clobber it.
+	//
+	// The text cache is updated BEFORE the echo-suppression check below. Echoes
+	// deliver the content that the bridge itself set on Matrix (e.g. when
+	// applyPresence writes own-user presence from Discord), so they DO reflect the
+	// current Matrix status. Without this ordering, matrixStatusEverSet stays false
+	// after an echo, causing a later intentional Charm clear to fall through to the
+	// lastDiscordStatusText fallback instead of forwarding the clear to Discord.
 	user.presenceLock.Lock()
 	var textToSend string
 	if statusText != "" {
@@ -211,7 +205,21 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		// Never set, or raw was a bare DND prefix with no custom text — preserve Discord's status.
 		textToSend = user.lastDiscordStatusText
 	}
+	// Snapshot the echo-suppression deadline while we still hold the lock.
+	suppressUntil := user.discordPresenceSetAt.Add(2 * time.Second)
 	user.presenceLock.Unlock()
+
+	// Suppress m.presence echoes that Synapse delivers via push_ephemeral when
+	// the bridge itself sets the user's own Matrix account from a Discord status
+	// change (applyPresence, Discord→Matrix own-user sync) or when the keepalive
+	// re-asserts presence. Without suppression the echo triggers UpdateStatusComplex
+	// and clobbers the Discord status — DND becomes idle because Matrix "unavailable"
+	// round-trips to Discord "idle". The 2-second window exceeds any realistic
+	// Synapse push latency while still being short enough not to suppress deliberate
+	// status changes in Charm.
+	if time.Now().Before(suppressUntil) {
+		return
+	}
 
 	// Truncate to Discord's custom status character limit.
 	if runes := []rune(textToSend); len(runes) > discordCustomStatusMaxRunes {
@@ -242,11 +250,15 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			Str("matrix_presence", string(content.Presence)).
 			Msg("Failed to update Discord status from Matrix presence")
 	} else {
-		// Record when we last successfully forwarded a Matrix presence to
-		// Discord so applyPresence can detect and suppress the resulting
-		// Discord gateway echo within its 2-second window.
+		// Record when and what we last forwarded to Discord so applyPresence
+		// can detect and suppress the resulting gateway echo. Storing the
+		// actual status/text values narrows the echo window: a genuine
+		// Discord status change within the 2-second window is only suppressed
+		// when its values match what we just sent.
 		user.presenceLock.Lock()
 		user.matrixPresenceSetAt = time.Now()
+		user.lastSentToDiscordStatus = discordStatus
+		user.lastSentToDiscordText = textToSend
 		user.presenceLock.Unlock()
 		br.ZLog.Debug().
 			Str("user_id", evt.Sender.String()).
