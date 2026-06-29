@@ -137,7 +137,17 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	// the DB if the user isn't in the in-memory cache, preventing presence events
 	// from being silently dropped during the startup window after a bridge restart.
 	user := br.GetUserByMXID(evt.Sender)
-	if user == nil || user.Session == nil {
+	if user == nil {
+		return
+	}
+	// Snapshot the session under the user lock to avoid a TOCTOU race with
+	// Logout(), which acquires user.Lock() and sets Session to nil. Without this,
+	// the nil check and the subsequent call on line ~197 are not atomic and a
+	// concurrent Logout() can cause a nil pointer dereference panic.
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess == nil {
 		return
 	}
 	discordStatus := matrixPresenceToDiscord(content.Presence)
@@ -194,7 +204,7 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		activities = make([]*discordgo.Activity, 0)
 	}
 
-	err := user.Session.UpdateStatusComplex(discordgo.UpdateStatusData{
+	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
 		Status:     discordStatus,
 		Activities: activities,
 	})

@@ -1475,6 +1475,12 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 // READY or GUILD_CREATE payloads so that already-online users are reflected in
 // Matrix immediately after a connect or reconnect.
 func (user *User) seedPresences(presences []*discordgo.Presence) {
+	// Snapshot DiscordID under the user lock to avoid a data race with Logout(),
+	// which holds user.Lock() while writing user.DiscordID = "".
+	user.Lock()
+	ownID := user.DiscordID
+	user.Unlock()
+
 	for _, p := range presences {
 		if p.User == nil {
 			continue
@@ -1482,7 +1488,7 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 		// Seed the Discord status cache for the bridge user's own presence so
 		// that the first Matrix→Discord sync after a reconnect doesn't clobber
 		// a pre-existing Discord custom status with an empty fallback.
-		if p.User.ID == user.DiscordID {
+		if p.User.ID == ownID {
 			user.presenceLock.Lock()
 			user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
 			user.presenceLock.Unlock()
