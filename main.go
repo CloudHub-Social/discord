@@ -173,8 +173,9 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		textToSend = statusText
 	} else if rawStatusText == "" && user.matrixStatusEverSet {
 		// Intentional clear: truly empty status_msg after Matrix previously set one.
+		// Only reset the Matrix-side cache — lastDiscordStatusText is Discord's own
+		// status and must remain as a fallback for bare DND and presence-only updates.
 		user.lastMatrixStatusText = ""
-		user.lastDiscordStatusText = ""
 		textToSend = ""
 	} else {
 		// Never set, or raw was a bare DND prefix with no custom text — preserve Discord's status.
