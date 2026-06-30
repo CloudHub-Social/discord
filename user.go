@@ -1637,6 +1637,23 @@ func discordStatusToMatrix(status discordgo.Status) event.Presence {
 	}
 }
 
+// normalizeDiscordStatusForEcho collapses the invisible/offline pair to one
+// canonical value for echo detection. matrixPresenceToDiscord maps a Matrix
+// offline presence to "invisible" (so the account is hidden rather than shown
+// offline), but Discord's gateway reports a user-account's own hidden state
+// back as "offline". Without normalization, the echo of a Matrix-originated
+// offline change fails strict equality against the stored "invisible" and is
+// misread as a genuine Discord change — clobbering the Matrix-side state (e.g.
+// a Charm [dnd] marker). All other statuses pass through unchanged; in
+// particular idle and dnd are kept distinct even though both map to the same
+// Matrix presence, so a genuine idle↔dnd change is never suppressed as an echo.
+func normalizeDiscordStatusForEcho(status string) string {
+	if status == string(discordgo.StatusInvisible) || status == string(discordgo.StatusOffline) {
+		return string(discordgo.StatusOffline)
+	}
+	return status
+}
+
 // setMatrixPresence sets the Matrix presence and optional status message for a
 // puppet intent. It makes a raw PUT to the presence endpoint so that status_msg
 // can be included alongside the presence state (the high-level SetPresence
@@ -1746,8 +1763,13 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			// old custom status text, not "". We detect this by treating any
 			// echo as matching when lastSentToDiscordText == "" — the preserved
 			// text is never a new user-set value, so suppressing it is correct.
+			//
+			// The status is normalized so that an "offline" echo of a Matrix
+			// offline change matches the "invisible" we sent (see
+			// normalizeDiscordStatusForEcho); without this the echo is misread
+			// as a genuine change and overwrites the Matrix-side state.
 			isEcho := time.Now().Before(user.matrixPresenceSetAt.Add(2*time.Second)) &&
-				string(status) == user.lastSentToDiscordStatus &&
+				normalizeDiscordStatusForEcho(string(status)) == normalizeDiscordStatusForEcho(user.lastSentToDiscordStatus) &&
 				(customStatusText == user.lastSentToDiscordText || user.lastSentToDiscordText == "")
 			if isEcho {
 				// Advance the dedup cache even though we skip the write. Without
