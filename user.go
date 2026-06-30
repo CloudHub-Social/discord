@@ -123,6 +123,11 @@ type User struct {
 	// state successfully written to the user's own Matrix account from Discord.
 	// applyPresence skips redundant calls when neither value has changed.
 	// Cleared on reconnect so a timed-out Matrix presence is always refreshed.
+	// Also updated when a Discord echo is suppressed (isEcho=true) so that
+	// post-window rich-presence ticks see the same value and remain changed=false,
+	// preventing them from writing the stripped status back and removing any
+	// Matrix-client-set [dnd] marker. HandleMatrixPresence reads these to
+	// value-match push_ephemeral echoes before suppressing.
 	lastOwnMatrixPresence  event.Presence
 	lastOwnMatrixStatusMsg string
 
@@ -1670,6 +1675,15 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			isEcho := time.Now().Before(user.matrixPresenceSetAt.Add(2*time.Second)) &&
 				string(status) == user.lastSentToDiscordStatus &&
 				customStatusText == user.lastSentToDiscordText
+			if isEcho {
+				// Advance the dedup cache even though we skip the write. Without
+				// this, a post-window rich-presence tick (game timer) or reconnect
+				// seed with the same Discord status/text would see changed=true and
+				// write the stripped customStatusText back to the real Matrix account,
+				// removing any Matrix-client-set [dnd] marker.
+				user.lastOwnMatrixPresence = matrixPresence
+				user.lastOwnMatrixStatusMsg = customStatusText
+			}
 			changed := !isEcho && (matrixPresence != user.lastOwnMatrixPresence || customStatusText != user.lastOwnMatrixStatusMsg)
 			user.presenceLock.Unlock()
 			if changed {
