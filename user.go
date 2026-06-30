@@ -120,9 +120,12 @@ type User struct {
 	lastSentToDiscordStatus string
 	lastSentToDiscordText   string
 	// lastOwnMatrixPresence / lastOwnMatrixStatusMsg cache the last presence
-	// state successfully written to the user's own Matrix account from Discord.
-	// applyPresence skips redundant calls when neither value has changed.
-	// Cleared on reconnect so a timed-out Matrix presence is always refreshed.
+	// state written to the user's own real Matrix account from Discord, or
+	// pre-armed by the applyPresence PUT path before the HTTP call. applyPresence
+	// skips redundant writes when neither value has changed (dedup), and
+	// HandleMatrixPresence uses them for value-matched echo suppression.
+	// Not cleared on reconnect: seedPresences skips own-account applyPresence
+	// calls to avoid clobbering Charm-side state set while the bridge was down.
 	lastOwnMatrixPresence  event.Presence
 	lastOwnMatrixStatusMsg string
 
@@ -1658,32 +1661,57 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			//    changed; frequent Discord rich-presence ticks (e.g. game timers)
 			//    would otherwise slide discordPresenceSetAt continuously.
 			//
-			// Both the timestamp reads and the cache update happen under
-			// presenceLock. The cache is only written on success so a failed PUT
-			// doesn't mark the state as "done" and cause the next identical
-			// Discord event to skip the retry.
+			// The timestamp and cache are pre-armed before the PUT under presenceLock
+			// so a fast Synapse echo (arriving before the HTTP response) is still
+			// suppressed. On PUT failure the pre-armed values are restored, so the
+			// next identical Discord event retries the PUT rather than being deduped.
 			user.presenceLock.Lock()
-			// An event is treated as an echo only when the timestamp AND the actual
+			// An event is treated as an echo only when the timestamp AND the
 			// Discord status/text match what HandleMatrixPresence just forwarded.
-			// A timestamp-only check would suppress a genuine Discord status change
-			// that happens within the 2-second window of a Matrix→Discord sync.
+			//
+			// A special case: when textToSend was "" (intentional Matrix status
+			// clear), HandleMatrixPresence sends activities=nil to Discord, which
+			// preserves the old Discord custom status instead of clearing it.
+			// Discord's resulting PRESENCE_UPDATE echo therefore contains the
+			// old custom status text, not "". We detect this by treating any
+			// echo as matching when lastSentToDiscordText == "" — the preserved
+			// text is never a new user-set value, so suppressing it is correct.
 			isEcho := time.Now().Before(user.matrixPresenceSetAt.Add(2*time.Second)) &&
 				string(status) == user.lastSentToDiscordStatus &&
-				customStatusText == user.lastSentToDiscordText
+				(customStatusText == user.lastSentToDiscordText || user.lastSentToDiscordText == "")
+			if isEcho {
+				// Advance the dedup cache even though we skip the write. Without
+				// this, a post-window rich-presence tick (game timer) with the same
+				// Discord status/text sees changed=true and writes the stripped
+				// customStatusText back, removing any Matrix-client-set [dnd] marker.
+				user.lastOwnMatrixPresence = matrixPresence
+				user.lastOwnMatrixStatusMsg = customStatusText
+			}
 			changed := !isEcho && (matrixPresence != user.lastOwnMatrixPresence || customStatusText != user.lastOwnMatrixStatusMsg)
-			user.presenceLock.Unlock()
 			if changed {
+				// Pre-arm suppression and expected-echo values before the PUT so
+				// that a fast Synapse push_ephemeral delivery (which can arrive
+				// before the HTTP response returns) is still correctly suppressed
+				// by HandleMatrixPresence. Restore the previous values on failure
+				// so that the next identical Discord event retries the PUT.
+				prevPresence := user.lastOwnMatrixPresence
+				prevStatus := user.lastOwnMatrixStatusMsg
+				user.discordPresenceSetAt = time.Now()
+				user.lastOwnMatrixPresence = matrixPresence
+				user.lastOwnMatrixStatusMsg = customStatusText
+				user.presenceLock.Unlock()
 				if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
 					user.log.Warn().Err(err).
 						Str("discord_user_id", userID).
 						Msg("Failed to set Matrix presence for own double-puppeted account")
-				} else {
 					user.presenceLock.Lock()
-					user.discordPresenceSetAt = time.Now()
-					user.lastOwnMatrixPresence = matrixPresence
-					user.lastOwnMatrixStatusMsg = customStatusText
+					user.discordPresenceSetAt = time.Time{}
+					user.lastOwnMatrixPresence = prevPresence
+					user.lastOwnMatrixStatusMsg = prevStatus
 					user.presenceLock.Unlock()
 				}
+			} else {
+				user.presenceLock.Unlock()
 			}
 		}
 		// If customUser != nil && customUser.Session != nil && customUser != user:
@@ -1710,21 +1738,21 @@ func (user *User) startPresenceKeepalive() {
 	user.stopKeepalive = cancel
 	user.Unlock()
 
-	// Discard the cache from the previous connection before starting a fresh
-	// keepalive. Discord's GUILD_CREATE presence lists only include non-offline
-	// members in large guilds, so a user who went offline while the bridge was
-	// disconnected may have no entry in the new READY/GUILD_CREATE payload to
-	// overwrite the stale "online" record. Clearing here ensures seedPresences
-	// rebuilds the cache from authoritative fresh data; in the brief window
-	// before seedPresences repopulates, the keepalive fires against an empty map
-	// and does nothing, which is the correct conservative behaviour.
+	// Discard the ghost-presence cache from the previous connection. Discord's
+	// GUILD_CREATE lists only include non-offline members in large guilds, so a
+	// ghost whose user went offline during the disconnect may have no entry in the
+	// READY/GUILD_CREATE payload to overwrite the stale "online" record. Clearing
+	// ensures seedPresences rebuilds from authoritative fresh data; the keepalive
+	// fires against an empty map before repopulation, which is safe (does nothing).
+	//
+	// The own-account dedup (lastOwnMatrixPresence/StatusMsg) is intentionally NOT
+	// cleared here. Clearing it would force seedPresences to write the Discord
+	// snapshot through customIntent on reconnect, clobbering any Charm-side state
+	// (idle, DND, [dnd] marker) set while the bridge was disconnected. Own-account
+	// presence is driven by live PRESENCE_UPDATE events; seedPresences skips the
+	// bridge user's own Discord ID to avoid the reconnect-seed clobber.
 	user.presenceLock.Lock()
 	clear(user.presenceCache)
-	// Reset own-presence dedup so the first applyPresence after reconnect
-	// always refreshes the real Matrix account, even if the Discord status
-	// is unchanged (the Matrix presence may have timed out during the outage).
-	user.lastOwnMatrixPresence = ""
-	user.lastOwnMatrixStatusMsg = ""
 	user.presenceLock.Unlock()
 
 	user.log.Info().Msg("Starting presence keepalive goroutine")
@@ -1804,13 +1832,18 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 			skippedEmptyStatus++
 			continue
 		}
-		// Seed the Discord status cache for the bridge user's own presence so
-		// that the first Matrix→Discord sync after a reconnect doesn't clobber
-		// a pre-existing Discord custom status with an empty fallback.
 		if p.User.ID == ownID {
+			// Seed the Discord status cache so the first Matrix→Discord sync
+			// after reconnect doesn't clobber a pre-existing Discord custom status
+			// with an empty fallback, then skip applyPresence for own account.
+			// Calling applyPresence here would write Discord's snapshot through
+			// customIntent, clobbering any Charm-side state (idle, DND, [dnd] marker)
+			// set while the bridge was disconnected. Own-account presence is driven
+			// by live PRESENCE_UPDATE events, not by reconnect seeds.
 			user.presenceLock.Lock()
 			user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
 			user.presenceLock.Unlock()
+			continue
 		}
 		puppet := user.bridge.GetPuppetByIDIfExists(p.User.ID)
 		if puppet == nil {
