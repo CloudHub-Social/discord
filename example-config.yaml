@@ -180,6 +180,13 @@ bridge:
     # (close code 4004) that exceed it, so this is off by default. When enabled,
     # updates are deduplicated and rate-limited before being sent to Discord.
     sync_matrix_presence_to_discord: false
+    # Should Discord presence and status be reflected onto Matrix? Receiving presence
+    # requires subscribing to every bridged guild via gateway opcode 14, which upstream
+    # never does and which Discord may flag on user tokens (close code 4004). This is
+    # off by default; leaving it off makes the bridge behave like upstream and send no
+    # guild subscriptions. Note: disabling this also disables Discord→Matrix typing
+    # notifications for large guilds, since both use the same opcode-14 subscription.
+    sync_discord_presence_to_matrix: false
     # Proxy for Discord connections
     proxy:
     # Should mxc uris copied from Discord be cached?

@@ -64,6 +64,16 @@ type BridgeConfig struct {
 	// defaults to off. When enabled, updates are deduplicated and rate-limited.
 	SyncMatrixPresenceToDiscord bool `yaml:"sync_matrix_presence_to_discord"`
 
+	// SyncDiscordPresenceToMatrix controls whether Discord presence/status is
+	// reflected onto Matrix. Receiving presence requires sending gateway opcode
+	// 14 (guild member-list/activity subscriptions) for every bridged guild,
+	// which upstream never does and which Discord's anti-abuse heuristics flag on
+	// user tokens (close code 4004). It defaults to off; when off the bridge
+	// behaves like upstream and sends no guild subscriptions. Note that disabling
+	// it also disables Discord→Matrix typing notifications for large guilds, since
+	// both ride the same opcode-14 subscription.
+	SyncDiscordPresenceToMatrix bool `yaml:"sync_discord_presence_to_matrix"`
+
 	Proxy string `yaml:"proxy"`
 
 	CacheMedia  string      `yaml:"cache_media"`
