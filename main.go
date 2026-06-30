@@ -260,6 +260,8 @@ func (br *DiscordBridge) Stop() {
 		}
 
 		br.Log.Debugln("Disconnecting", user.MXID)
+		// Latch before Close() so the shutdown disconnect does not reconnect.
+		user.stopReconnecting()
 		user.Session.Close()
 	}
 }

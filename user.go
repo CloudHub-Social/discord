@@ -59,6 +59,19 @@ type User struct {
 	wasDisconnected bool
 	wasLoggedOut    bool
 
+	// Gateway reconnection is owned by the bridge rather than discordgo
+	// (session.ShouldReconnectOnError is disabled in Connect). reconnectLock
+	// guards the fields below. reconnectAttempts counts consecutive failures
+	// since the last successful READY and drives the exponential backoff in
+	// scheduleReconnect; it resets to 0 on READY. reconnectTimer is the pending
+	// backoff timer, if any. manualDisconnect latches when the bridge tears the
+	// session down on purpose (logout / manual disconnect / shutdown) so the
+	// resulting Disconnect event does not trigger a reconnect.
+	reconnectLock     sync.Mutex
+	reconnectAttempts int
+	reconnectTimer    *time.Timer
+	manualDisconnect  bool
+
 	markedOpened     map[string]time.Time
 	markedOpenedLock sync.Mutex
 
@@ -618,6 +631,8 @@ func (user *User) Logout(isOverwriting bool) {
 		}
 	}
 
+	// Latch before Close() so the resulting Disconnect event does not reconnect.
+	user.stopReconnecting()
 	if user.Session != nil {
 		if err := user.Session.Close(); err != nil {
 			user.log.Warn().Err(err).Msg("Error closing session")
@@ -714,7 +729,19 @@ const BotIntents = discordgo.IntentGuilds |
 	//discordgo.IntentGuildPresences |
 	discordgo.IntentGuildMembers
 
+// Connect establishes the Discord gateway connection on purpose (startup,
+// login, or an explicit reconnect command). It clears the manual-disconnect
+// latch so future drops reconnect normally.
 func (user *User) Connect() error {
+	return user.connect(true)
+}
+
+// connect performs the actual gateway connection. When intentional is true the
+// caller is a deliberate connect and the manual-disconnect latch is cleared;
+// when false the caller is the backoff-driven auto-reconnect, which must abort
+// if a manual teardown latched concurrently (otherwise it could race a manual
+// Disconnect and revive a session the user just closed).
+func (user *User) connect(intentional bool) error {
 	user.Lock()
 	// Clear our in-memory relationship cache as it might've changed while
 	// offline; READY will repopulate it.
@@ -725,12 +752,31 @@ func (user *User) Connect() error {
 		return ErrNotLoggedIn
 	}
 
+	user.reconnectLock.Lock()
+	if intentional {
+		user.manualDisconnect = false
+	} else if user.manualDisconnect {
+		// A manual disconnect/logout latched while this auto-reconnect was in
+		// flight; honor it and do not revive the session.
+		user.reconnectLock.Unlock()
+		return nil
+	}
+	user.reconnectLock.Unlock()
+
 	user.log.Debug().Msg("Connecting to discord")
 
 	session, err := discordgo.New(user.DiscordToken)
 	if err != nil {
 		return err
 	}
+	// Take ownership of reconnection. discordgo's built-in auto-reconnect calls
+	// Open() in a loop with exponential backoff, but its Open() treats Discord's
+	// Op9 Invalid Session as a non-fatal handshake result and returns success, so
+	// the backoff never engages and a rejected session re-IDENTIFYs every ~2s
+	// forever — exactly the kind of gateway spam that gets a user token killed.
+	// Instead the bridge drives reconnection from disconnectedHandler via
+	// scheduleReconnect, which backs off based on failures-since-last-READY.
+	session.ShouldReconnectOnError = false
 
 	if user.HeartbeatSession == nil || user.HeartbeatSession.IsExpired() {
 		user.log.Debug().Msg("Creating new heartbeat session")
@@ -896,6 +942,8 @@ func (user *User) Disconnect() error {
 	}
 
 	user.log.Info().Msg("Disconnecting session manually")
+	// Latch before Close() so the resulting Disconnect event does not reconnect.
+	user.stopReconnecting()
 	user.reconstructRelationships(nil)
 	if err := user.Session.Close(); err != nil {
 		return err
@@ -941,6 +989,16 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.bridgeStateLock.Lock()
 	user.wasLoggedOut = false
 	user.bridgeStateLock.Unlock()
+	// A successful handshake clears the reconnect backoff: any pending retry was
+	// for a session that has now been superseded, and future disconnects should
+	// start counting from zero again.
+	user.reconnectLock.Lock()
+	user.reconnectAttempts = 0
+	if user.reconnectTimer != nil {
+		user.reconnectTimer.Stop()
+		user.reconnectTimer = nil
+	}
+	user.reconnectLock.Unlock()
 	// Clear the sent-presence dedup cache so the first Matrix presence ping
 	// after a reconnect always reaches Discord (the new gateway session starts
 	// without this Matrix-derived status).
@@ -1309,9 +1367,114 @@ func (user *User) disconnectedHandler(_ *discordgo.Disconnect) {
 		user.log.Debug().Msg("Disconnected from Discord (not updating bridge state as user was just logged out)")
 		return
 	}
+	// A teardown the bridge initiated (manual disconnect / shutdown) must not
+	// trigger a reconnect.
+	user.reconnectLock.Lock()
+	manual := user.manualDisconnect
+	user.reconnectLock.Unlock()
+	if manual {
+		user.log.Debug().Msg("Disconnected from Discord (manual disconnect, not reconnecting)")
+		return
+	}
 	user.log.Debug().Msg("Disconnected from Discord")
 	user.wasDisconnected = true
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "dc-transient-disconnect", Message: "Temporarily disconnected from Discord, trying to reconnect"})
+	// discordgo's auto-reconnect is disabled; drive it ourselves with backoff.
+	user.scheduleReconnect()
+}
+
+// reconnectBackoffBase and reconnectBackoffMax bound the exponential backoff
+// between gateway reconnect attempts. The first retry after a drop is quick so
+// genuine transient blips recover fast; sustained failure (e.g. Discord
+// rejecting the session with Op9, or an account in a rate-limit penalty) slows
+// to one attempt per reconnectBackoffMax, which keeps IDENTIFY traffic far below
+// any level that would endanger the user token.
+const (
+	reconnectBackoffBase = 2 * time.Second
+	reconnectBackoffMax  = 10 * time.Minute
+)
+
+// scheduleReconnect arms a single backoff timer to reconnect the gateway. The
+// delay grows as 2^(failures-since-last-READY), capped at reconnectBackoffMax.
+// Safe to call from the disconnect handler and from a failed reconnect attempt;
+// it coalesces (one pending timer at a time) and is a no-op after a manual
+// disconnect.
+func (user *User) scheduleReconnect() {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	if user.manualDisconnect || user.reconnectTimer != nil {
+		return
+	}
+	user.reconnectAttempts++
+	shift := user.reconnectAttempts - 1
+	if shift > 9 {
+		shift = 9
+	}
+	delay := reconnectBackoffBase << shift
+	if delay > reconnectBackoffMax {
+		delay = reconnectBackoffMax
+	}
+	user.log.Warn().
+		Int("attempt", user.reconnectAttempts).
+		Dur("delay", delay).
+		Msg("Scheduling Discord gateway reconnect with backoff")
+	user.reconnectTimer = time.AfterFunc(delay, user.doReconnect)
+}
+
+// doReconnect is the backoff timer callback. It performs one reconnect attempt
+// and, on failure, reschedules with a longer backoff. On success it returns and
+// lets the normal lifecycle take over: readyHandler resets the attempt counter,
+// or a fresh Disconnect reschedules.
+func (user *User) doReconnect() {
+	user.reconnectLock.Lock()
+	user.reconnectTimer = nil
+	manual := user.manualDisconnect
+	user.reconnectLock.Unlock()
+	if manual {
+		return
+	}
+	user.bridgeStateLock.Lock()
+	loggedOut := user.wasLoggedOut
+	user.bridgeStateLock.Unlock()
+	if loggedOut {
+		return
+	}
+
+	user.log.Info().Msg("Attempting Discord gateway reconnect")
+	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
+	// connect(false): an auto-reconnect must not clear the manual-disconnect
+	// latch, so a manual teardown racing this attempt still wins.
+	err := user.connect(false)
+	if err == nil {
+		// Connected. Either READY fires and clears the backoff, or Discord rejects
+		// the session and a Disconnect reschedules with a longer delay.
+		return
+	}
+	if errors.Is(err, ErrNotLoggedIn) {
+		// Nothing to reconnect to; stop.
+		return
+	}
+	closeErr := &websocket.CloseError{}
+	if errors.As(err, &closeErr) && closeErr.Code == 4004 {
+		user.invalidAuthHandler(nil)
+		return
+	}
+	user.log.Warn().Err(err).Msg("Discord gateway reconnect attempt failed")
+	user.scheduleReconnect()
+}
+
+// stopReconnecting latches manualDisconnect and cancels any pending backoff
+// timer. Call it before intentionally closing the session (logout, manual
+// disconnect, shutdown) so the resulting Disconnect event is not reconnected.
+func (user *User) stopReconnecting() {
+	user.reconnectLock.Lock()
+	user.manualDisconnect = true
+	user.reconnectAttempts = 0
+	if user.reconnectTimer != nil {
+		user.reconnectTimer.Stop()
+		user.reconnectTimer = nil
+	}
+	user.reconnectLock.Unlock()
 }
 
 func (user *User) invalidAuthHandler(_ *discordgo.InvalidAuth) {
