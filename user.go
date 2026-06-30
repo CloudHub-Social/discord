@@ -847,14 +847,12 @@ func (user *User) connect(intentional bool) error {
 
 	user.Session = session
 
-	// Arm the READY watchdog before Open() so a READY arriving during the
-	// handshake always finds it armed and cancels it (arming after Open() would
-	// race readyHandler, which runs on its own goroutine). discordgo's Open()
-	// returns success even when the handshake got an Op9 Invalid Session instead
-	// of READY, so without this a rejected session would re-IDENTIFY in-band
-	// forever; the watchdog force-closes it and routes the failure through the
-	// backoff path. Disarmed below if Open() fails outright.
-	user.armReadyWatchdog()
+	// New attempt: clear the ready flag before Open() so a stale value from a
+	// previous session can't suppress this attempt's watchdog.
+	user.reconnectLock.Lock()
+	user.sessionReady = false
+	user.reconnectLock.Unlock()
+
 	for {
 		err = user.Session.Open()
 		if errors.Is(err, discordgo.ErrImmediateDisconnect) {
@@ -862,7 +860,6 @@ func (user *User) connect(intentional bool) error {
 			// scheduler backs off instead of looping here every 5s while holding
 			// user.Lock (which would also block Logout/Disconnect).
 			if !intentional {
-				user.disarmReadyWatchdog()
 				return err
 			}
 			user.log.Warn().Err(err).Msg("Retrying initial connection in 5 seconds")
@@ -871,8 +868,18 @@ func (user *User) connect(intentional bool) error {
 		}
 		break
 	}
-	if err != nil {
-		user.disarmReadyWatchdog()
+	if err == nil {
+		// Socket is up. Arm the READY watchdog now — AFTER Open() — so its budget
+		// measures time spent waiting for READY rather than the (possibly slow)
+		// handshake itself; a large account or a slow proxy must not let the timer
+		// expire mid-handshake and close a session that is about to succeed.
+		// armReadyWatchdog skips arming if READY was already processed during
+		// Open() (sessionReady set by readyHandler), avoiding a false close.
+		// discordgo's Open() returns success even when the handshake got Op9
+		// Invalid Session instead of READY, so without this a rejected session
+		// would re-IDENTIFY in-band forever; the watchdog force-closes it and
+		// routes the failure through the backoff path.
+		user.armReadyWatchdog()
 	}
 	return err
 }
@@ -1447,13 +1454,14 @@ const (
 func (user *User) armReadyWatchdog() {
 	user.reconnectLock.Lock()
 	defer user.reconnectLock.Unlock()
-	// New attempt: this session has not reached READY yet.
-	user.sessionReady = false
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
 	}
-	if user.manualDisconnect {
+	// Skip arming if the bridge is tearing down, or if READY was already
+	// processed during Open() (readyHandler set sessionReady) — in that case
+	// there is nothing to watch for.
+	if user.manualDisconnect || user.sessionReady {
 		return
 	}
 	user.readyWatchdog = time.AfterFunc(readyTimeout, user.onReadyTimeout)
