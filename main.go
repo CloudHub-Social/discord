@@ -216,27 +216,32 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	//    a Discord-originated status is still forwarded correctly.
 	//  - otherwise (never set, or raw had content that stripped to empty e.g. bare
 	//    "[dnd]"): fall back to the last Discord-side status so we don't clobber it.
+	// Resolve the custom-status text to send and how it should affect Discord's
+	// activities. clearStatus distinguishes an explicit clear (empty activities
+	// array) from a preserve (nil activities — leave games/Spotify and any existing
+	// custom status untouched); see sendPresenceToDiscord.
 	user.presenceLock.Lock()
 	var textToSend string
+	var clearStatus bool
 	if !sSync {
-		// Status sync disabled: never change the custom status text. Preserve the
-		// user's existing Discord custom status so a presence-state update (opcode 3
-		// rewrites state and activities together) does not wipe it.
-		textToSend = user.lastDiscordStatusText
+		// Status sync disabled: never change the custom status text. Preserve
+		// (textToSend == "" && !clearStatus → nil activities), which keeps both the
+		// existing Discord custom status and any game/Spotify session.
+		textToSend = ""
 	} else if statusText != "" {
 		user.lastMatrixStatusText = statusText
 		user.matrixStatusEverSet = true
 		textToSend = statusText
 	} else if rawStatusText == "" && (user.matrixStatusEverSet || user.lastOwnMatrixStatusMsg != "") {
 		// Intentional clear: truly empty status_msg after Matrix previously set one.
-		// Only reset the Matrix-side cache — lastDiscordStatusText is Discord's own
-		// status and must remain as a fallback for bare DND and presence-only updates.
+		// Emit an explicit clear so the old Discord custom status is removed.
 		user.lastMatrixStatusText = ""
 		user.matrixStatusEverSet = false
 		textToSend = ""
+		clearStatus = true
 	} else {
-		// Never set, or raw was a bare DND prefix with no custom text — preserve Discord's status.
-		textToSend = user.lastDiscordStatusText
+		// Never set, or raw was a bare DND prefix with no custom text — preserve.
+		textToSend = ""
 	}
 	user.presenceLock.Unlock()
 
@@ -247,11 +252,11 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 
 	// Presence sync disabled (status-only mode): don't mirror the Matrix online
 	// state. opcode 3 still requires a state, so we assert "online" — but only when
-	// there is actually status text to deliver. Otherwise an ordinary presence ping
-	// (empty/unchanged status_msg) would make an invisible/offline account visible,
-	// so skip the update entirely when there is nothing to carry.
+	// there is actually a status change to carry (new text or an explicit clear).
+	// A pure presence ping with nothing to say is dropped so it can't make an
+	// invisible/offline account visible.
 	if !pSync {
-		if textToSend == "" {
+		if textToSend == "" && !clearStatus {
 			return
 		}
 		discordStatus = string(discordgo.StatusOnline)
@@ -264,7 +269,7 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	// most one per presenceMinInterval. forwardPresenceToDiscord skips the send
 	// entirely when the effective status/text is unchanged, and records what was
 	// sent so applyPresence can suppress the resulting gateway echo.
-	user.forwardPresenceToDiscord(sess, discordStatus, textToSend)
+	user.forwardPresenceToDiscord(sess, discordStatus, textToSend, clearStatus)
 }
 
 func (br *DiscordBridge) Start() {
