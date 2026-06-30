@@ -1146,6 +1146,15 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
 
+// discordReadEnabled reports whether any Discord→Matrix sync is enabled. Both
+// presence state and custom status text arrive over the same opcode-14 guild
+// subscription, so either flag being on requires subscribing and processing
+// incoming presence.
+func (user *User) discordReadEnabled() bool {
+	return user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix ||
+		user.bridge.Config.Bridge.SyncDiscordStatusToMatrix
+}
+
 func (user *User) subscribeGuilds(delay time.Duration) {
 	// Snapshot the session under the user lock. Logout() holds user.Lock()
 	// while setting Session to nil, so reading it without the lock is a data
@@ -1153,8 +1162,8 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 	// Subscribing to guilds is what makes Discord deliver presence (and large-guild
 	// typing) via opcode 14. Upstream never does this; on user tokens it is a
 	// self-bot fingerprint that risks a 4004 token invalidation, so it is gated
-	// behind the Discord→Matrix presence option and off by default.
-	if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+	// behind the Discord→Matrix presence/status options and off by default.
+	if !user.discordReadEnabled() {
 		return
 	}
 	user.Lock()
@@ -1319,7 +1328,7 @@ const guildSubSendInterval = 2 * time.Second
 // is off or in subscribe-all mode.
 func (user *User) touchGuildPresence(guildID string) {
 	if guildID == "" ||
-		!user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix ||
+		!user.discordReadEnabled() ||
 		user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
 		return
 	}
@@ -2339,7 +2348,18 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		// No puppet exists yet; skip to avoid creating phantom DB rows.
 		return
 	}
+	// Apply the presence/status split. applyPresence runs whenever either read
+	// flag is on, so suppress the component that is disabled:
+	//   - status read off: don't write the custom status text.
+	//   - presence read off: don't mirror Discord's online state; the Matrix PUT
+	//     still needs a presence, so mark the puppet online to carry only the text.
+	if !user.bridge.Config.Bridge.SyncDiscordStatusToMatrix {
+		customStatusText = ""
+	}
 	matrixPresence := discordStatusToMatrix(status)
+	if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+		matrixPresence = event.PresenceOnline
+	}
 	err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, customStatusText)
 	if err != nil {
 		user.log.Warn().Err(err).
@@ -2712,7 +2732,7 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 		// Reflecting other users' presence onto Matrix is the gated Discord→Matrix
 		// direction. Own-account caching above still runs so the Matrix→Discord
 		// fallback text stays seeded even when this direction is off.
-		if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+		if !user.discordReadEnabled() {
 			continue
 		}
 		puppet := user.bridge.GetPuppetByIDIfExists(p.User.ID)
@@ -2770,7 +2790,7 @@ func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	// Own-account status is cached above unconditionally because the Matrix→Discord
 	// direction relies on it for its fallback text. Reflecting presence onto Matrix
 	// (for own or other users) is the Discord→Matrix direction and is gated.
-	if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+	if !user.discordReadEnabled() {
 		return
 	}
 	user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
@@ -2932,7 +2952,7 @@ func (user *User) bridgeGuild(guildID string, everything bool) error {
 	// In subscribe-all mode, subscribe immediately after bridging. In on-demand
 	// mode, skip it: the guild will be subscribed when a Matrix client is next
 	// active in one of its rooms.
-	if user.Session.IsUser && user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix &&
+	if user.Session.IsUser && user.discordReadEnabled() &&
 		user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
 		log.Debug().Msg("Subscribing to guild after bridging")
 		user.sendGuildPresenceSubscribe(user.Session, guild.ID)

@@ -180,6 +180,11 @@ bridge:
     # (close code 4004) that exceed it, so this is off by default. When enabled,
     # updates are deduplicated and rate-limited before being sent to Discord.
     sync_matrix_presence_to_discord: false
+    # Should the Matrix status message (custom status TEXT) be forwarded to Discord?
+    # Discord carries state and text in one update, so: with presence sync off this
+    # shows you as "online" to deliver the text; with this off but presence sync on,
+    # your existing Discord custom status is preserved rather than cleared.
+    sync_matrix_status_to_discord: false
     # Should Discord presence and status be reflected onto Matrix? Receiving presence
     # requires subscribing to every bridged guild via gateway opcode 14, which upstream
     # never does and which Discord may flag on user tokens (close code 4004). This is
@@ -187,6 +192,10 @@ bridge:
     # guild subscriptions. Note: disabling this also disables Discord→Matrix typing
     # notifications for large guilds, since both use the same opcode-14 subscription.
     sync_discord_presence_to_matrix: false
+    # Should the Discord custom status TEXT be reflected onto Matrix? Needs the same
+    # guild subscription as presence, so enabling either one drives subscriptions.
+    # With presence read off but this on, the puppet is shown "online" to carry the text.
+    sync_discord_status_to_matrix: false
     # When sync_discord_presence_to_matrix is enabled, should the bridge subscribe to
     # every bridged guild on connect (true), or only on demand (false, default)?
     # On-demand mode subscribes a guild for presence only when a Matrix client is active

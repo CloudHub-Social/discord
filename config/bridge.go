@@ -58,11 +58,23 @@ type BridgeConfig struct {
 	UseDiscordCDNUpload         bool `yaml:"use_discord_cdn_upload"`
 	ForbidDMingStrangers        bool `yaml:"forbid_dming_strangers"`
 
-	// SyncMatrixPresenceToDiscord controls whether Matrix presence/status is
+	// Presence vs status. Throughout the config "presence" means the online
+	// state (online/idle/dnd/offline) and "status" means the custom status
+	// text. On Discord both are carried by the same gateway opcode-3 update, so
+	// the four flags below interact: see HandleMatrixPresence / applyPresence.
+
+	// SyncMatrixPresenceToDiscord controls whether Matrix presence STATE is
 	// forwarded to Discord (opcode 3). Discord rate-limits presence updates to
 	// 5/min and penalizes user tokens that exceed it (close code 4004), so this
 	// defaults to off. When enabled, updates are deduplicated and rate-limited.
 	SyncMatrixPresenceToDiscord bool `yaml:"sync_matrix_presence_to_discord"`
+
+	// SyncMatrixStatusToDiscord controls whether the Matrix status message (the
+	// custom status TEXT) is forwarded to Discord. Because opcode 3 carries state
+	// and text together, with presence sync off this asserts an "online" state to
+	// deliver the text; with status sync off but presence sync on, the user's
+	// existing Discord custom status is preserved rather than cleared.
+	SyncMatrixStatusToDiscord bool `yaml:"sync_matrix_status_to_discord"`
 
 	// SyncDiscordPresenceToMatrix controls whether Discord presence/status is
 	// reflected onto Matrix. Receiving presence requires sending gateway opcode
@@ -73,6 +85,13 @@ type BridgeConfig struct {
 	// it also disables Discord→Matrix typing notifications for large guilds, since
 	// both ride the same opcode-14 subscription.
 	SyncDiscordPresenceToMatrix bool `yaml:"sync_discord_presence_to_matrix"`
+
+	// SyncDiscordStatusToMatrix controls whether the Discord custom status TEXT is
+	// reflected onto Matrix (as the puppet's status message). Like the presence
+	// read, it needs the opcode-14 guild subscription, so enabling either this or
+	// SyncDiscordPresenceToMatrix drives subscriptions. With presence read off but
+	// status read on, the puppet's state is written as "online" to carry the text.
+	SyncDiscordStatusToMatrix bool `yaml:"sync_discord_status_to_matrix"`
 
 	// DiscordPresenceSubscribeAll, when SyncDiscordPresenceToMatrix is enabled,
 	// controls how guilds are subscribed for presence. When false (default), the
