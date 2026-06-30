@@ -133,6 +133,13 @@ const charmDNDPrefix = "[dnd]"
 const discordCustomStatusMaxRunes = 128
 
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
+	// Forwarding presence to Discord (opcode 3) is opt-in: even with the
+	// rate limiting below, some operators on user tokens prefer not to emit
+	// presence updates at all, since Discord penalizes user tokens that send
+	// them too aggressively (close code 4004).
+	if !br.Config.Bridge.SyncMatrixPresenceToDiscord {
+		return
+	}
 	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
 	if !ok {
 		return
