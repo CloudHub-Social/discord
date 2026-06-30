@@ -1146,6 +1146,15 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
 
+// discordReadEnabled reports whether any Discord→Matrix sync is enabled. Both
+// presence state and custom status text arrive over the same opcode-14 guild
+// subscription, so either flag being on requires subscribing and processing
+// incoming presence.
+func (user *User) discordReadEnabled() bool {
+	return user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix ||
+		user.bridge.Config.Bridge.SyncDiscordStatusToMatrix
+}
+
 func (user *User) subscribeGuilds(delay time.Duration) {
 	// Snapshot the session under the user lock. Logout() holds user.Lock()
 	// while setting Session to nil, so reading it without the lock is a data
@@ -1153,8 +1162,8 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 	// Subscribing to guilds is what makes Discord deliver presence (and large-guild
 	// typing) via opcode 14. Upstream never does this; on user tokens it is a
 	// self-bot fingerprint that risks a 4004 token invalidation, so it is gated
-	// behind the Discord→Matrix presence option and off by default.
-	if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+	// behind the Discord→Matrix presence/status options and off by default.
+	if !user.discordReadEnabled() {
 		return
 	}
 	user.Lock()
@@ -1319,7 +1328,7 @@ const guildSubSendInterval = 2 * time.Second
 // is off or in subscribe-all mode.
 func (user *User) touchGuildPresence(guildID string) {
 	if guildID == "" ||
-		!user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix ||
+		!user.discordReadEnabled() ||
 		user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
 		return
 	}
@@ -2339,8 +2348,31 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		// No puppet exists yet; skip to avoid creating phantom DB rows.
 		return
 	}
-	matrixPresence := discordStatusToMatrix(status)
-	err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, customStatusText)
+	// Apply the presence/status split. applyPresence runs whenever either read
+	// flag is on; compute what to write per flag, but keep the original Discord
+	// values (status, customStatusText) for the own-account echo comparison below.
+	//   - status read off: don't write the custom status text.
+	//   - presence read off, or an activities-only update with no state (status ==
+	//     ""): don't mirror an online state. The Matrix PUT needs a presence, so
+	//     mark the puppet online only when we actually have status text to carry.
+	pSync := user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix
+	sSync := user.bridge.Config.Bridge.SyncDiscordStatusToMatrix
+	syncingState := pSync && status != ""
+	writeText := ""
+	if sSync {
+		writeText = customStatusText
+	}
+	matrixPresence := event.PresenceOnline
+	if syncingState {
+		matrixPresence = discordStatusToMatrix(status)
+	}
+	// Nothing to sync: no presence state to mirror and no status text to carry.
+	// Don't assert "online" for an otherwise empty update (it would make an
+	// offline/invisible user appear online in status-only mode).
+	if !syncingState && writeText == "" {
+		return
+	}
+	err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, writeText)
 	if err != nil {
 		user.log.Warn().Err(err).
 			Str("discord_user_id", userID).
@@ -2351,7 +2383,7 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			Str("discord_user_id", userID).
 			Str("discord_status", string(status)).
 			Str("matrix_presence", string(matrixPresence)).
-			Str("status_text", customStatusText).
+			Str("status_text", writeText).
 			Msg("Bridged Discord presence to Matrix")
 	}
 	// Keep the keepalive cache in sync so that the background goroutine can
@@ -2360,7 +2392,7 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 	if matrixPresence == event.PresenceOffline {
 		delete(user.presenceCache, userID)
 	} else {
-		user.presenceCache[userID] = presenceCacheEntry{presence: matrixPresence, statusMsg: customStatusText}
+		user.presenceCache[userID] = presenceCacheEntry{presence: matrixPresence, statusMsg: writeText}
 	}
 	user.presenceLock.Unlock()
 	// When double puppeting is active, also update the real Matrix account so
@@ -2383,7 +2415,7 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		if customUser == nil || customUser.Session == nil {
 			// No active bridge session for this double-puppeted account — safe to
 			// update the real Matrix account without triggering an echo loop.
-			if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
+			if err := setMatrixPresence(customIntent, matrixPresence, writeText); err != nil {
 				user.log.Warn().Err(err).
 					Str("discord_user_id", userID).
 					Msg("Failed to set Matrix presence for double-puppeted user")
@@ -2426,6 +2458,10 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			// offline change matches the "invisible" we sent (see
 			// normalizeDiscordStatusForEcho); without this the echo is misread
 			// as a genuine change and overwrites the Matrix-side state.
+			// Echo detection compares the original Discord values (status,
+			// customStatusText) against what we last forwarded to Discord. The
+			// values written to the Matrix account are the split-adjusted
+			// matrixPresence/writeText, which is what the dedup cache tracks.
 			isEcho := time.Now().Before(user.matrixPresenceSetAt.Add(2*time.Second)) &&
 				normalizeDiscordStatusForEcho(string(status)) == normalizeDiscordStatusForEcho(user.lastSentToDiscordStatus) &&
 				(customStatusText == user.lastSentToDiscordText || user.lastSentToDiscordText == "")
@@ -2433,11 +2469,11 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 				// Advance the dedup cache even though we skip the write. Without
 				// this, a post-window rich-presence tick (game timer) with the same
 				// Discord status/text sees changed=true and writes the stripped
-				// customStatusText back, removing any Matrix-client-set [dnd] marker.
+				// text back, removing any Matrix-client-set [dnd] marker.
 				user.lastOwnMatrixPresence = matrixPresence
-				user.lastOwnMatrixStatusMsg = customStatusText
+				user.lastOwnMatrixStatusMsg = writeText
 			}
-			changed := !isEcho && (matrixPresence != user.lastOwnMatrixPresence || customStatusText != user.lastOwnMatrixStatusMsg)
+			changed := !isEcho && (matrixPresence != user.lastOwnMatrixPresence || writeText != user.lastOwnMatrixStatusMsg)
 			if changed {
 				// Pre-arm suppression and expected-echo values before the PUT so
 				// that a fast Synapse push_ephemeral delivery (which can arrive
@@ -2448,9 +2484,9 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 				prevStatus := user.lastOwnMatrixStatusMsg
 				user.discordPresenceSetAt = time.Now()
 				user.lastOwnMatrixPresence = matrixPresence
-				user.lastOwnMatrixStatusMsg = customStatusText
+				user.lastOwnMatrixStatusMsg = writeText
 				user.presenceLock.Unlock()
-				if err := setMatrixPresence(customIntent, matrixPresence, customStatusText); err != nil {
+				if err := setMatrixPresence(customIntent, matrixPresence, writeText); err != nil {
 					user.log.Warn().Err(err).
 						Str("discord_user_id", userID).
 						Msg("Failed to set Matrix presence for own double-puppeted account")
@@ -2712,7 +2748,7 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 		// Reflecting other users' presence onto Matrix is the gated Discord→Matrix
 		// direction. Own-account caching above still runs so the Matrix→Discord
 		// fallback text stays seeded even when this direction is off.
-		if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+		if !user.discordReadEnabled() {
 			continue
 		}
 		puppet := user.bridge.GetPuppetByIDIfExists(p.User.ID)
@@ -2753,15 +2789,13 @@ func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	ownID := user.DiscordID
 	user.Unlock()
 	// Discord PRESENCE_UPDATE can be partial — any combination of fields may be
-	// absent. An empty Status means only non-presence fields (e.g. username)
-	// changed; skip to avoid mapping "" to offline and incorrectly marking the
-	// puppet as offline when only unrelated user data was updated.
-	if p.Status == "" {
-		return
-	}
+	// absent. An empty Status means no presence-state change in this event (e.g.
+	// only username or activities changed). We still process it so custom-status
+	// text sync works (activities can change with no status field); applyPresence
+	// will not change the puppet's online state when the status is empty.
+	//
 	// If this is a presence update for the bridge user themselves, cache the
-	// Discord-side custom status text for fallback in HandleMatrixPresence, then
-	// fall through to applyPresence so their Matrix puppet also reflects the change.
+	// Discord-side custom status text for fallback in HandleMatrixPresence first.
 	if p.User.ID == ownID {
 		user.presenceLock.Lock()
 		user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
@@ -2770,7 +2804,7 @@ func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 	// Own-account status is cached above unconditionally because the Matrix→Discord
 	// direction relies on it for its fallback text. Reflecting presence onto Matrix
 	// (for own or other users) is the Discord→Matrix direction and is gated.
-	if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+	if !user.discordReadEnabled() {
 		return
 	}
 	user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
@@ -2932,7 +2966,7 @@ func (user *User) bridgeGuild(guildID string, everything bool) error {
 	// In subscribe-all mode, subscribe immediately after bridging. In on-demand
 	// mode, skip it: the guild will be subscribed when a Matrix client is next
 	// active in one of its rooms.
-	if user.Session.IsUser && user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix &&
+	if user.Session.IsUser && user.discordReadEnabled() &&
 		user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
 		log.Debug().Msg("Subscribing to guild after bridging")
 		user.sendGuildPresenceSubscribe(user.Session, guild.ID)

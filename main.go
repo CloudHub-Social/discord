@@ -133,11 +133,13 @@ const charmDNDPrefix = "[dnd]"
 const discordCustomStatusMaxRunes = 128
 
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
-	// Forwarding presence to Discord (opcode 3) is opt-in: even with the
-	// rate limiting below, some operators on user tokens prefer not to emit
-	// presence updates at all, since Discord penalizes user tokens that send
-	// them too aggressively (close code 4004).
-	if !br.Config.Bridge.SyncMatrixPresenceToDiscord {
+	// Forwarding to Discord (opcode 3) is opt-in per component: presence STATE and
+	// custom status TEXT have independent flags. If neither is enabled there is
+	// nothing to send. (Opt-in matters because Discord penalizes user tokens that
+	// emit opcode-3 updates too aggressively — close code 4004.)
+	pSync := br.Config.Bridge.SyncMatrixPresenceToDiscord
+	sSync := br.Config.Bridge.SyncMatrixStatusToDiscord
+	if !pSync && !sSync {
 		return
 	}
 	content, ok := evt.Content.Parsed.(*event.PresenceEventContent)
@@ -216,7 +218,12 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	//    "[dnd]"): fall back to the last Discord-side status so we don't clobber it.
 	user.presenceLock.Lock()
 	var textToSend string
-	if statusText != "" {
+	if !sSync {
+		// Status sync disabled: never change the custom status text. Preserve the
+		// user's existing Discord custom status so a presence-state update (opcode 3
+		// rewrites state and activities together) does not wipe it.
+		textToSend = user.lastDiscordStatusText
+	} else if statusText != "" {
 		user.lastMatrixStatusText = statusText
 		user.matrixStatusEverSet = true
 		textToSend = statusText
@@ -236,6 +243,18 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	// Truncate to Discord's custom status character limit.
 	if runes := []rune(textToSend); len(runes) > discordCustomStatusMaxRunes {
 		textToSend = string(runes[:discordCustomStatusMaxRunes])
+	}
+
+	// Presence sync disabled (status-only mode): don't mirror the Matrix online
+	// state. opcode 3 still requires a state, so we assert "online" — but only when
+	// there is actually status text to deliver. Otherwise an ordinary presence ping
+	// (empty/unchanged status_msg) would make an invisible/offline account visible,
+	// so skip the update entirely when there is nothing to carry.
+	if !pSync {
+		if textToSend == "" {
+			return
+		}
+		discordStatus = string(discordgo.StatusOnline)
 	}
 
 	// Forward to Discord with content dedup and trailing-debounce rate limiting.
