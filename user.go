@@ -71,6 +71,12 @@ type User struct {
 	reconnectAttempts int
 	reconnectTimer    *time.Timer
 	manualDisconnect  bool
+	// readyWatchdog force-closes a session that connects but never reaches
+	// READY within readyTimeout. discordgo answers a Discord Op9 Invalid Session
+	// by re-IDENTIFYing in-band (no close, no Disconnect event), so without this
+	// a rejected session would re-IDENTIFY at gateway speed and never reach the
+	// backoff path. Closing it routes the failure through disconnectedHandler.
+	readyWatchdog *time.Timer
 
 	markedOpened     map[string]time.Time
 	markedOpenedLock sync.Mutex
@@ -828,15 +834,34 @@ func (user *User) connect(intentional bool) error {
 
 	user.Session = session
 
+	// Arm the READY watchdog before Open() so a READY arriving during the
+	// handshake always finds it armed and cancels it (arming after Open() would
+	// race readyHandler, which runs on its own goroutine). discordgo's Open()
+	// returns success even when the handshake got an Op9 Invalid Session instead
+	// of READY, so without this a rejected session would re-IDENTIFY in-band
+	// forever; the watchdog force-closes it and routes the failure through the
+	// backoff path. Disarmed below if Open() fails outright.
+	user.armReadyWatchdog()
 	for {
 		err = user.Session.Open()
 		if errors.Is(err, discordgo.ErrImmediateDisconnect) {
+			// Op7 during the handshake. On an auto-reconnect, let it escape so the
+			// scheduler backs off instead of looping here every 5s while holding
+			// user.Lock (which would also block Logout/Disconnect).
+			if !intentional {
+				user.disarmReadyWatchdog()
+				return err
+			}
 			user.log.Warn().Err(err).Msg("Retrying initial connection in 5 seconds")
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		return err
+		break
 	}
+	if err != nil {
+		user.disarmReadyWatchdog()
+	}
+	return err
 }
 
 func (user *User) eventHandlerSync(rawEvt any) {
@@ -997,6 +1022,10 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	if user.reconnectTimer != nil {
 		user.reconnectTimer.Stop()
 		user.reconnectTimer = nil
+	}
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
 	}
 	user.reconnectLock.Unlock()
 	// Clear the sent-presence dedup cache so the first Matrix presence ping
@@ -1392,7 +1421,58 @@ func (user *User) disconnectedHandler(_ *discordgo.Disconnect) {
 const (
 	reconnectBackoffBase = 2 * time.Second
 	reconnectBackoffMax  = 10 * time.Minute
+	// readyTimeout is how long a freshly-opened session may take to reach READY
+	// before the watchdog force-closes it. A genuine READY arrives within a few
+	// seconds even for large accounts (guild payloads stream afterwards), so this
+	// only fires on a stuck handshake (e.g. an in-band Op9 re-IDENTIFY loop).
+	readyTimeout = 60 * time.Second
 )
+
+// armReadyWatchdog (re)starts the READY watchdog for the current session. Called
+// after a successful Open(); cancelled by readyHandler on success or by
+// stopReconnecting on teardown.
+func (user *User) armReadyWatchdog() {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
+	}
+	if user.manualDisconnect {
+		return
+	}
+	user.readyWatchdog = time.AfterFunc(readyTimeout, user.onReadyTimeout)
+}
+
+// disarmReadyWatchdog cancels the READY watchdog if armed.
+func (user *User) disarmReadyWatchdog() {
+	user.reconnectLock.Lock()
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
+	}
+	user.reconnectLock.Unlock()
+}
+
+// onReadyTimeout fires when a session opened but never reached READY. It closes
+// the session so discordgo emits a Disconnect, which routes the failure through
+// disconnectedHandler -> scheduleReconnect (capped backoff).
+func (user *User) onReadyTimeout() {
+	user.reconnectLock.Lock()
+	user.readyWatchdog = nil
+	manual := user.manualDisconnect
+	user.reconnectLock.Unlock()
+	if manual {
+		return
+	}
+	user.log.Warn().Msg("No READY received after connect; closing session to trigger backoff reconnect")
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess != nil {
+		_ = sess.Close()
+	}
+}
 
 // scheduleReconnect arms a single backoff timer to reconnect the gateway. The
 // delay grows as 2^(failures-since-last-READY), capped at reconnectBackoffMax.
@@ -1473,6 +1553,10 @@ func (user *User) stopReconnecting() {
 	if user.reconnectTimer != nil {
 		user.reconnectTimer.Stop()
 		user.reconnectTimer = nil
+	}
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
 	}
 	user.reconnectLock.Unlock()
 }
