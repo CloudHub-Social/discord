@@ -59,6 +59,30 @@ type User struct {
 	wasDisconnected bool
 	wasLoggedOut    bool
 
+	// Gateway reconnection is owned by the bridge rather than discordgo
+	// (session.ShouldReconnectOnError is disabled in Connect). reconnectLock
+	// guards the fields below. reconnectAttempts counts consecutive failures
+	// since the last successful READY and drives the exponential backoff in
+	// scheduleReconnect; it resets to 0 on READY. reconnectTimer is the pending
+	// backoff timer, if any. manualDisconnect latches when the bridge tears the
+	// session down on purpose (logout / manual disconnect / shutdown) so the
+	// resulting Disconnect event does not trigger a reconnect.
+	reconnectLock     sync.Mutex
+	reconnectAttempts int
+	reconnectTimer    *time.Timer
+	manualDisconnect  bool
+	// readyWatchdog force-closes a session that connects but never reaches
+	// READY within readyTimeout. discordgo answers a Discord Op9 Invalid Session
+	// by re-IDENTIFYing in-band (no close, no Disconnect event), so without this
+	// a rejected session would re-IDENTIFY at gateway speed and never reach the
+	// backoff path. Closing it routes the failure through disconnectedHandler.
+	readyWatchdog *time.Timer
+	// sessionReady is true once the current session reached READY or RESUMED. It
+	// lets onReadyTimeout bail if the handshake completed concurrently with the
+	// watchdog firing, so a valid session is never closed. Reset to false when a
+	// new connect arms the watchdog.
+	sessionReady bool
+
 	markedOpened     map[string]time.Time
 	markedOpenedLock sync.Mutex
 
@@ -618,6 +642,8 @@ func (user *User) Logout(isOverwriting bool) {
 		}
 	}
 
+	// Latch before Close() so the resulting Disconnect event does not reconnect.
+	user.stopReconnecting()
 	if user.Session != nil {
 		if err := user.Session.Close(); err != nil {
 			user.log.Warn().Err(err).Msg("Error closing session")
@@ -714,7 +740,19 @@ const BotIntents = discordgo.IntentGuilds |
 	//discordgo.IntentGuildPresences |
 	discordgo.IntentGuildMembers
 
+// Connect establishes the Discord gateway connection on purpose (startup,
+// login, or an explicit reconnect command). It clears the manual-disconnect
+// latch so future drops reconnect normally.
 func (user *User) Connect() error {
+	return user.connect(true)
+}
+
+// connect performs the actual gateway connection. When intentional is true the
+// caller is a deliberate connect and the manual-disconnect latch is cleared;
+// when false the caller is the backoff-driven auto-reconnect, which must abort
+// if a manual teardown latched concurrently (otherwise it could race a manual
+// Disconnect and revive a session the user just closed).
+func (user *User) connect(intentional bool) error {
 	user.Lock()
 	// Clear our in-memory relationship cache as it might've changed while
 	// offline; READY will repopulate it.
@@ -725,12 +763,39 @@ func (user *User) Connect() error {
 		return ErrNotLoggedIn
 	}
 
+	user.reconnectLock.Lock()
+	if intentional {
+		user.manualDisconnect = false
+		// A deliberate connect (startup / login / reconnect command) supersedes
+		// any pending auto-reconnect: cancel its timer and reset the backoff so a
+		// stale retry doesn't fire a second session on top of this one.
+		user.reconnectAttempts = 0
+		if user.reconnectTimer != nil {
+			user.reconnectTimer.Stop()
+			user.reconnectTimer = nil
+		}
+	} else if user.manualDisconnect {
+		// A manual disconnect/logout latched while this auto-reconnect was in
+		// flight; honor it and do not revive the session.
+		user.reconnectLock.Unlock()
+		return nil
+	}
+	user.reconnectLock.Unlock()
+
 	user.log.Debug().Msg("Connecting to discord")
 
 	session, err := discordgo.New(user.DiscordToken)
 	if err != nil {
 		return err
 	}
+	// Take ownership of reconnection. discordgo's built-in auto-reconnect calls
+	// Open() in a loop with exponential backoff, but its Open() treats Discord's
+	// Op9 Invalid Session as a non-fatal handshake result and returns success, so
+	// the backoff never engages and a rejected session re-IDENTIFYs every ~2s
+	// forever — exactly the kind of gateway spam that gets a user token killed.
+	// Instead the bridge drives reconnection from disconnectedHandler via
+	// scheduleReconnect, which backs off based on failures-since-last-READY.
+	session.ShouldReconnectOnError = false
 
 	if user.HeartbeatSession == nil || user.HeartbeatSession.IsExpired() {
 		user.log.Debug().Msg("Creating new heartbeat session")
@@ -782,15 +847,41 @@ func (user *User) Connect() error {
 
 	user.Session = session
 
+	// New attempt: clear the ready flag before Open() so a stale value from a
+	// previous session can't suppress this attempt's watchdog.
+	user.reconnectLock.Lock()
+	user.sessionReady = false
+	user.reconnectLock.Unlock()
+
 	for {
 		err = user.Session.Open()
 		if errors.Is(err, discordgo.ErrImmediateDisconnect) {
+			// Op7 during the handshake. On an auto-reconnect, let it escape so the
+			// scheduler backs off instead of looping here every 5s while holding
+			// user.Lock (which would also block Logout/Disconnect).
+			if !intentional {
+				return err
+			}
 			user.log.Warn().Err(err).Msg("Retrying initial connection in 5 seconds")
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		return err
+		break
 	}
+	if err == nil {
+		// Socket is up. Arm the READY watchdog now — AFTER Open() — so its budget
+		// measures time spent waiting for READY rather than the (possibly slow)
+		// handshake itself; a large account or a slow proxy must not let the timer
+		// expire mid-handshake and close a session that is about to succeed.
+		// armReadyWatchdog skips arming if READY was already processed during
+		// Open() (sessionReady set by readyHandler), avoiding a false close.
+		// discordgo's Open() returns success even when the handshake got Op9
+		// Invalid Session instead of READY, so without this a rejected session
+		// would re-IDENTIFY in-band forever; the watchdog force-closes it and
+		// routes the failure through the backoff path.
+		user.armReadyWatchdog()
+	}
+	return err
 }
 
 func (user *User) eventHandlerSync(rawEvt any) {
@@ -896,6 +987,8 @@ func (user *User) Disconnect() error {
 	}
 
 	user.log.Info().Msg("Disconnecting session manually")
+	// Latch before Close() so the resulting Disconnect event does not reconnect.
+	user.stopReconnecting()
 	user.reconstructRelationships(nil)
 	if err := user.Session.Close(); err != nil {
 		return err
@@ -941,6 +1034,7 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.bridgeStateLock.Lock()
 	user.wasLoggedOut = false
 	user.bridgeStateLock.Unlock()
+	user.onConnectionEstablished()
 	// Clear the sent-presence dedup cache so the first Matrix presence ping
 	// after a reconnect always reaches Discord (the new gateway session starts
 	// without this Matrix-derived status).
@@ -1079,6 +1173,11 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 
 func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	user.log.Debug().Msg("Discord connection resumed")
+	// A RESUMED is a successful reconnect just like READY (the bridge copies
+	// HeartbeatSession onto each session, so discordgo may resume). Run the same
+	// success cleanup so the watchdog is disarmed and the backoff is reset —
+	// otherwise the watchdog would close this healthy resumed session at 60s.
+	user.onConnectionEstablished()
 	// Clear the dedup cache so the first presence ping after a resume re-sends
 	// the current status to Discord (the resumed session may have lost it).
 	user.presenceLock.Lock()
@@ -1309,9 +1408,202 @@ func (user *User) disconnectedHandler(_ *discordgo.Disconnect) {
 		user.log.Debug().Msg("Disconnected from Discord (not updating bridge state as user was just logged out)")
 		return
 	}
+	// A teardown the bridge initiated (manual disconnect / shutdown) must not
+	// trigger a reconnect.
+	user.reconnectLock.Lock()
+	manual := user.manualDisconnect
+	user.reconnectLock.Unlock()
+	if manual {
+		user.log.Debug().Msg("Disconnected from Discord (manual disconnect, not reconnecting)")
+		return
+	}
 	user.log.Debug().Msg("Disconnected from Discord")
 	user.wasDisconnected = true
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "dc-transient-disconnect", Message: "Temporarily disconnected from Discord, trying to reconnect"})
+	// The dropped session's READY watchdog is moot now; the next connect arms a
+	// fresh one. Disarm it so it can't fire during the backoff window.
+	user.disarmReadyWatchdog()
+	// discordgo's auto-reconnect is disabled; drive it ourselves with backoff.
+	user.scheduleReconnect()
+}
+
+// reconnectBackoffBase and reconnectBackoffMax bound the exponential backoff
+// between gateway reconnect attempts. The first retry after a drop is quick so
+// genuine transient blips recover fast; sustained failure (e.g. Discord
+// rejecting the session with Op9, or an account in a rate-limit penalty) slows
+// to one attempt per reconnectBackoffMax, which keeps IDENTIFY traffic far below
+// any level that would endanger the user token.
+const (
+	reconnectBackoffBase = 2 * time.Second
+	reconnectBackoffMax  = 10 * time.Minute
+	// readyTimeout is how long a freshly-opened session may take to reach READY
+	// before the watchdog force-closes it. A genuine READY/RESUMED arrives within
+	// a few seconds even for large accounts (guild payloads stream afterwards),
+	// so this is kept short to bound the worst case where Discord holds the socket
+	// open and answers only with in-band Op9 re-IDENTIFYs: it caps that burst at
+	// ~readyTimeout per backoff cycle instead of a full minute. In practice
+	// Discord closes a rejected session within a second or two (4002/4003), which
+	// already routes through the backoff path; this is the backstop for when it
+	// doesn't.
+	readyTimeout = 20 * time.Second
+)
+
+// armReadyWatchdog (re)starts the READY watchdog for the current session. Called
+// after a successful Open(); cancelled by readyHandler on success or by
+// stopReconnecting on teardown.
+func (user *User) armReadyWatchdog() {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
+	}
+	// Skip arming if the bridge is tearing down, or if READY was already
+	// processed during Open() (readyHandler set sessionReady) — in that case
+	// there is nothing to watch for.
+	if user.manualDisconnect || user.sessionReady {
+		return
+	}
+	user.readyWatchdog = time.AfterFunc(readyTimeout, user.onReadyTimeout)
+}
+
+// onConnectionEstablished runs the success cleanup shared by READY and RESUMED:
+// it marks the session ready, disarms the watchdog, and resets the backoff
+// counter. It deliberately does NOT stop reconnectTimer — because gateway events
+// dispatch on separate goroutines, a stale READY can run after a Disconnect from
+// the same connection has already scheduled a retry, and cancelling that timer
+// would leave the bridge disconnected with no pending reconnect. An intentional
+// Connect() supersedes a pending timer instead (see connect()).
+func (user *User) onConnectionEstablished() {
+	user.reconnectLock.Lock()
+	user.sessionReady = true
+	user.reconnectAttempts = 0
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
+	}
+	user.reconnectLock.Unlock()
+}
+
+// disarmReadyWatchdog cancels the READY watchdog if armed.
+func (user *User) disarmReadyWatchdog() {
+	user.reconnectLock.Lock()
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
+	}
+	user.reconnectLock.Unlock()
+}
+
+// onReadyTimeout fires when a session opened but never reached READY. It closes
+// the session so discordgo emits a Disconnect, which routes the failure through
+// disconnectedHandler -> scheduleReconnect (capped backoff).
+func (user *User) onReadyTimeout() {
+	user.reconnectLock.Lock()
+	user.readyWatchdog = nil
+	// Bail if the handshake completed (READY/RESUMED) concurrently with this
+	// timer firing, or if the bridge is tearing down — never close a valid
+	// session. Both this check and onConnectionEstablished's set are under
+	// reconnectLock, so whichever ran first wins deterministically.
+	bail := user.sessionReady || user.manualDisconnect
+	user.reconnectLock.Unlock()
+	if bail {
+		return
+	}
+	user.log.Warn().Msg("No READY received after connect; closing session to trigger backoff reconnect")
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess != nil {
+		_ = sess.Close()
+	}
+}
+
+// scheduleReconnect arms a single backoff timer to reconnect the gateway. The
+// delay grows as 2^(failures-since-last-READY), capped at reconnectBackoffMax.
+// Safe to call from the disconnect handler and from a failed reconnect attempt;
+// it coalesces (one pending timer at a time) and is a no-op after a manual
+// disconnect.
+func (user *User) scheduleReconnect() {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	if user.manualDisconnect || user.reconnectTimer != nil {
+		return
+	}
+	user.reconnectAttempts++
+	shift := user.reconnectAttempts - 1
+	if shift > 9 {
+		shift = 9
+	}
+	delay := reconnectBackoffBase << shift
+	if delay > reconnectBackoffMax {
+		delay = reconnectBackoffMax
+	}
+	user.log.Warn().
+		Int("attempt", user.reconnectAttempts).
+		Dur("delay", delay).
+		Msg("Scheduling Discord gateway reconnect with backoff")
+	user.reconnectTimer = time.AfterFunc(delay, user.doReconnect)
+}
+
+// doReconnect is the backoff timer callback. It performs one reconnect attempt
+// and, on failure, reschedules with a longer backoff. On success it returns and
+// lets the normal lifecycle take over: readyHandler resets the attempt counter,
+// or a fresh Disconnect reschedules.
+func (user *User) doReconnect() {
+	user.reconnectLock.Lock()
+	user.reconnectTimer = nil
+	manual := user.manualDisconnect
+	user.reconnectLock.Unlock()
+	if manual {
+		return
+	}
+	user.bridgeStateLock.Lock()
+	loggedOut := user.wasLoggedOut
+	user.bridgeStateLock.Unlock()
+	if loggedOut {
+		return
+	}
+
+	user.log.Info().Msg("Attempting Discord gateway reconnect")
+	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
+	// connect(false): an auto-reconnect must not clear the manual-disconnect
+	// latch, so a manual teardown racing this attempt still wins.
+	err := user.connect(false)
+	if err == nil {
+		// Connected. Either READY fires and clears the backoff, or Discord rejects
+		// the session and a Disconnect reschedules with a longer delay.
+		return
+	}
+	if errors.Is(err, ErrNotLoggedIn) {
+		// Nothing to reconnect to; stop.
+		return
+	}
+	closeErr := &websocket.CloseError{}
+	if errors.As(err, &closeErr) && closeErr.Code == 4004 {
+		user.invalidAuthHandler(nil)
+		return
+	}
+	user.log.Warn().Err(err).Msg("Discord gateway reconnect attempt failed")
+	user.scheduleReconnect()
+}
+
+// stopReconnecting latches manualDisconnect and cancels any pending backoff
+// timer. Call it before intentionally closing the session (logout, manual
+// disconnect, shutdown) so the resulting Disconnect event is not reconnected.
+func (user *User) stopReconnecting() {
+	user.reconnectLock.Lock()
+	user.manualDisconnect = true
+	user.reconnectAttempts = 0
+	if user.reconnectTimer != nil {
+		user.reconnectTimer.Stop()
+		user.reconnectTimer = nil
+	}
+	if user.readyWatchdog != nil {
+		user.readyWatchdog.Stop()
+		user.readyWatchdog = nil
+	}
+	user.reconnectLock.Unlock()
 }
 
 func (user *User) invalidAuthHandler(_ *discordgo.InvalidAuth) {

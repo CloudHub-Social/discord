@@ -255,12 +255,21 @@ func (br *DiscordBridge) Start() {
 
 func (br *DiscordBridge) Stop() {
 	for _, user := range br.usersByMXID {
-		if user.Session == nil {
+		// Hold user.Lock across the teardown so it serializes with connect(),
+		// which also holds user.Lock for its whole duration. Without this an
+		// in-flight auto-reconnect could open a fresh session after we latch and
+		// close, leaving Discord connected through shutdown.
+		user.Lock()
+		sess := user.Session
+		if sess == nil {
+			user.Unlock()
 			continue
 		}
-
 		br.Log.Debugln("Disconnecting", user.MXID)
-		user.Session.Close()
+		// Latch before Close() so the shutdown disconnect does not reconnect.
+		user.stopReconnecting()
+		sess.Close()
+		user.Unlock()
 	}
 }
 
