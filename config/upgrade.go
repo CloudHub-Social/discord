@@ -65,9 +65,13 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "use_discord_cdn_upload")
 	helper.Copy(up.Bool, "bridge", "forbid_dming_strangers")
 	helper.Copy(up.Bool, "bridge", "sync_matrix_presence_to_discord")
-	helper.Copy(up.Bool, "bridge", "sync_matrix_status_to_discord")
 	helper.Copy(up.Bool, "bridge", "sync_discord_presence_to_matrix")
-	helper.Copy(up.Bool, "bridge", "sync_discord_status_to_matrix")
+	// Before status sync was split from presence sync, the presence flags also
+	// carried custom status text. For existing configs that predate the split (the
+	// status key is absent), default each status flag to the matching presence flag
+	// so a config upgrade doesn't silently stop syncing status text.
+	migratePresenceStatusFlag(helper, "sync_matrix_status_to_discord", "sync_matrix_presence_to_discord")
+	migratePresenceStatusFlag(helper, "sync_discord_status_to_matrix", "sync_discord_presence_to_matrix")
 	helper.Copy(up.Bool, "bridge", "discord_presence_subscribe_all")
 	helper.Copy(up.Int, "bridge", "discord_presence_active_limit")
 	helper.Copy(up.Str|up.Null, "bridge", "proxy")
@@ -138,6 +142,26 @@ func DoUpgrade(helper *up.Helper) {
 	//helper.Copy(up.Bool, "bridge", "relay", "enabled")
 	//helper.Copy(up.Bool, "bridge", "relay", "admin_only")
 	//helper.Copy(up.Map, "bridge", "relay", "message_formats")
+}
+
+// migratePresenceStatusFlag copies statusKey from the existing config when it is
+// present; otherwise it defaults statusKey to the value of presenceKey. This
+// preserves behavior for configs written before custom status text sync was split
+// out of the presence flags (where enabling presence sync also synced status).
+func migratePresenceStatusFlag(helper *up.Helper, statusKey, presenceKey string) {
+	if _, ok := helper.Get(up.Bool, "bridge", statusKey); ok {
+		helper.Copy(up.Bool, "bridge", statusKey)
+		return
+	}
+	// Status key absent: inherit the presence flag's value. Normalize to a canonical
+	// boolean literal rather than forwarding the raw string from Get.
+	if val, ok := helper.Get(up.Bool, "bridge", presenceKey); ok {
+		literal := "false"
+		if val == "true" {
+			literal = "true"
+		}
+		helper.Set(up.Bool, literal, "bridge", statusKey)
+	}
 }
 
 var SpacedBlocks = [][]string{

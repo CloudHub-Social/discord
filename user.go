@@ -145,6 +145,11 @@ type User struct {
 	// would otherwise generate a Discord opcode-3 message).
 	lastSentDiscordStatus     string
 	lastSentDiscordStatusText string
+	// lastSentDiscordClear records whether the last update explicitly cleared the
+	// custom status (sent an empty activities array) rather than preserving it
+	// (nil activities). It is part of the dedup key so a clear is not suppressed
+	// by a prior preserve that happened to carry the same empty text.
+	lastSentDiscordClear bool
 
 	// presenceCache maps Discord user IDs to their last known non-offline
 	// Matrix presence state. The keepalive goroutine re-sends these every
@@ -199,6 +204,7 @@ type User struct {
 	presenceDebounceTimer     *time.Timer
 	pendingDiscordStatus      string
 	pendingDiscordStatusText  string
+	pendingDiscordClear       bool
 
 	// stopKeepalive, when non-nil, cancels the presence keepalive goroutine.
 	// Protected by user.Lock().
@@ -688,6 +694,7 @@ func (user *User) Logout(isOverwriting bool) {
 	user.matrixStatusEverSet = false
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
+	user.lastSentDiscordClear = false
 	user.discordPresenceSetAt = time.Time{}
 	user.matrixPresenceSetAt = time.Time{}
 	user.lastSentToDiscordStatus = ""
@@ -700,6 +707,7 @@ func (user *User) Logout(isOverwriting bool) {
 	}
 	user.pendingDiscordStatus = ""
 	user.pendingDiscordStatusText = ""
+	user.pendingDiscordClear = false
 	user.lastDiscordPresenceSentAt = time.Time{}
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
@@ -1073,6 +1081,7 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.presenceLock.Lock()
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
+	user.lastSentDiscordClear = false
 	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
@@ -1544,6 +1553,7 @@ func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	user.presenceLock.Lock()
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
+	user.lastSentDiscordClear = false
 	user.presenceLock.Unlock()
 	// Re-subscribe with the same pacing as the initial connect (subscribeGuilds
 	// emits one op-14 GuildSubscribe per bridged guild). A 0-delay burst here
@@ -2351,50 +2361,74 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 	// Apply the presence/status split. applyPresence runs whenever either read
 	// flag is on; compute what to write per flag, but keep the original Discord
 	// values (status, customStatusText) for the own-account echo comparison below.
-	//   - status read off: don't write the custom status text.
-	//   - presence read off, or an activities-only update with no state (status ==
-	//     ""): don't mirror an online state. The Matrix PUT needs a presence, so
-	//     mark the puppet online only when we actually have status text to carry.
+	// The presenceCache holds the last (presence, statusMsg) we wrote for this user
+	// and is used to avoid resetting fields the current update shouldn't change.
 	pSync := user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix
 	sSync := user.bridge.Config.Bridge.SyncDiscordStatusToMatrix
+	user.presenceLock.Lock()
+	cached, hadCache := user.presenceCache[userID]
+	user.presenceLock.Unlock()
+
+	// Presence state to write:
+	//   - presence sync on with a state in this event → mirror it.
+	//   - otherwise (presence sync off, or an activities-only update with status ==
+	//     "") → keep the last presence we wrote rather than asserting online.
 	syncingState := pSync && status != ""
+	matrixPresence := event.PresenceOnline
+	if syncingState {
+		matrixPresence = discordStatusToMatrix(status)
+	} else if hadCache {
+		matrixPresence = cached.presence
+	}
+
+	// Status text to write. Only when status sync is on; the empty value of an
+	// on-sync update is an intentional clear. When status sync is off we leave the
+	// text empty and don't try to preserve it via the cache — for ghosts there is
+	// never a bridge-set status to preserve, and a cache-based preserve broke down
+	// across offline transitions (the entry is dropped when a user goes offline).
+	// Known limitation: a status the user sets directly on a double-puppeted Matrix
+	// account is not preserved across Discord-driven presence updates in this mode.
 	writeText := ""
 	if sSync {
 		writeText = customStatusText
 	}
-	matrixPresence := event.PresenceOnline
-	if syncingState {
-		matrixPresence = discordStatusToMatrix(status)
-	}
-	// Nothing to sync: no presence state to mirror and no status text to carry.
-	// Don't assert "online" for an otherwise empty update (it would make an
-	// offline/invisible user appear online in status-only mode).
-	if !syncingState && writeText == "" {
+
+	// First write with nothing meaningful (no state to mirror and no text): don't
+	// assert "online" for an otherwise empty update.
+	if !hadCache && !syncingState && writeText == "" {
 		return
 	}
-	err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, writeText)
-	if err != nil {
-		user.log.Warn().Err(err).
-			Str("discord_user_id", userID).
-			Str("discord_status", string(status)).
-			Msg("Failed to set Matrix presence for Discord user")
-	} else {
-		user.log.Debug().
-			Str("discord_user_id", userID).
-			Str("discord_status", string(status)).
-			Str("matrix_presence", string(matrixPresence)).
-			Str("status_text", writeText).
-			Msg("Bridged Discord presence to Matrix")
+	// Write the ghost puppet only when something we'd write differs from what we
+	// last wrote (an explicit clear passes naturally: writeText "" vs a cached
+	// non-empty statusMsg). This is scoped to the ghost write only — we still fall
+	// through to the double-puppet section below, which has its own dedup/retry, so
+	// a previously-failed own-account PUT can still be retried on a repeat event.
+	ghostChanged := !hadCache || matrixPresence != cached.presence || writeText != cached.statusMsg
+	if ghostChanged {
+		err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, writeText)
+		if err != nil {
+			user.log.Warn().Err(err).
+				Str("discord_user_id", userID).
+				Str("discord_status", string(status)).
+				Msg("Failed to set Matrix presence for Discord user")
+		} else {
+			user.log.Debug().
+				Str("discord_user_id", userID).
+				Str("discord_status", string(status)).
+				Str("matrix_presence", string(matrixPresence)).
+				Str("status_text", writeText).
+				Msg("Bridged Discord presence to Matrix")
+		}
+		// Keep the keepalive cache in sync so that the background goroutine can
+		// re-send this presence before Synapse times out the ghost user.
+		user.presenceLock.Lock()
+		if matrixPresence == event.PresenceOffline {
+			delete(user.presenceCache, userID)
+		} else {
+			user.presenceCache[userID] = presenceCacheEntry{presence: matrixPresence, statusMsg: writeText}
+		}
+		user.presenceLock.Unlock()
 	}
-	// Keep the keepalive cache in sync so that the background goroutine can
-	// re-send this presence before Synapse times out the ghost user.
-	user.presenceLock.Lock()
-	if matrixPresence == event.PresenceOffline {
-		delete(user.presenceCache, userID)
-	} else {
-		user.presenceCache[userID] = presenceCacheEntry{presence: matrixPresence, statusMsg: writeText}
-	}
-	user.presenceLock.Unlock()
 	// When double puppeting is active, also update the real Matrix account so
 	// clients see the correct presence on the user's own identity, not just on
 	// the bridge ghost which may not be present in all rooms.
@@ -2446,25 +2480,28 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			// An event is treated as an echo only when the timestamp AND the
 			// Discord status/text match what HandleMatrixPresence just forwarded.
 			//
-			// A special case: when textToSend was "" (intentional Matrix status
-			// clear), HandleMatrixPresence sends activities=nil to Discord, which
-			// preserves the old Discord custom status instead of clearing it.
-			// Discord's resulting PRESENCE_UPDATE echo therefore contains the
-			// old custom status text, not "". We detect this by treating any
-			// echo as matching when lastSentToDiscordText == "" — the preserved
-			// text is never a new user-set value, so suppressing it is correct.
-			//
-			// The status is normalized so that an "offline" echo of a Matrix
-			// offline change matches the "invisible" we sent (see
-			// normalizeDiscordStatusForEcho); without this the echo is misread
-			// as a genuine change and overwrites the Matrix-side state.
 			// Echo detection compares the original Discord values (status,
 			// customStatusText) against what we last forwarded to Discord. The
 			// values written to the Matrix account are the split-adjusted
 			// matrixPresence/writeText, which is what the dedup cache tracks.
+			//
+			// Text matching:
+			//   - We last set/cleared the status (lastSentDiscordClear true, or a
+			//     non-empty text): require an exact match. After a clear we sent ""
+			//     to Discord, so a genuine new status ("X") will not match and is
+			//     correctly applied.
+			//   - We last sent a *preserve* (nil activities — lastSentToDiscordText
+			//     "" and not a clear): Discord's echo carries whatever custom status
+			//     it already had, which we don't know, so treat empty as a wildcard
+			//     to suppress our own presence-only echo.
+			//
+			// The status is normalized so that an "offline" echo of a Matrix offline
+			// change matches the "invisible" we sent (see normalizeDiscordStatusForEcho).
+			textMatches := customStatusText == user.lastSentToDiscordText ||
+				(user.lastSentToDiscordText == "" && !user.lastSentDiscordClear)
 			isEcho := time.Now().Before(user.matrixPresenceSetAt.Add(2*time.Second)) &&
 				normalizeDiscordStatusForEcho(string(status)) == normalizeDiscordStatusForEcho(user.lastSentToDiscordStatus) &&
-				(customStatusText == user.lastSentToDiscordText || user.lastSentToDiscordText == "")
+				textMatches
 			if isEcho {
 				// Advance the dedup cache even though we skip the write. Without
 				// this, a post-window rich-presence tick (game timer) with the same
@@ -2506,26 +2543,48 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 	}
 }
 
-// forwardPresenceToDiscord forwards a desired (status, statusText) presence to
-// the user's Discord session with content dedup and trailing-debounce rate
-// limiting, so the bridge never emits opcode-3 updates faster than
-// presenceMinInterval. A change outside the cooldown is sent immediately; a
-// change inside it is coalesced into pendingDiscordStatus/Text and dispatched
+// forwardPresenceToDiscord forwards a desired presence to the user's Discord
+// session with content dedup and trailing-debounce rate limiting, so the bridge
+// never emits opcode-3 updates faster than presenceMinInterval. A change outside
+// the cooldown is sent immediately; a change inside it is coalesced and dispatched
 // by a single trailing timer when the cooldown expires. Must be called without
 // presenceLock held; sess must be non-nil.
-func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, statusText string) {
+//
+// clearStatus selects the activities behavior: false leaves activities untouched
+// (nil — keeps any game/Spotify session and existing custom status), true with an
+// empty statusText clears the custom status (empty activities array), and a
+// non-empty statusText sets it. See sendPresenceToDiscord.
+func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
 	user.presenceLock.Lock()
+	// A preserve update (no status change: empty text, not a clear) must not cancel
+	// a status change that is already queued but not yet flushed. If there is an
+	// unsent queued status intent (pending differs from what was last sent), inherit
+	// it so a presence-only ping arriving before the debounce timer fires doesn't
+	// downgrade a pending clear/set back to "leave activities alone". When nothing
+	// is queued, keep this a genuine preserve (nil activities) so we don't re-send
+	// an already-applied custom status — which would wipe a game/Spotify session.
+	if statusText == "" && !clearStatus {
+		queuedUnsent := user.pendingDiscordStatusText != user.lastSentDiscordStatusText ||
+			user.pendingDiscordClear != user.lastSentDiscordClear
+		if queuedUnsent {
+			statusText = user.pendingDiscordStatusText
+			clearStatus = user.pendingDiscordClear
+		}
+	}
 	// Dedup: if the desired state already matches what Discord was last told,
 	// there is nothing to forward. Keep the pending target in sync so a timer
 	// that fires later flushes to current reality rather than a stale value.
-	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText {
+	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText &&
+		clearStatus == user.lastSentDiscordClear {
 		user.pendingDiscordStatus = status
 		user.pendingDiscordStatusText = statusText
+		user.pendingDiscordClear = clearStatus
 		user.presenceLock.Unlock()
 		return
 	}
 	user.pendingDiscordStatus = status
 	user.pendingDiscordStatusText = statusText
+	user.pendingDiscordClear = clearStatus
 	// A trailing send is already scheduled: it will pick up the updated target.
 	if user.presenceDebounceTimer != nil {
 		user.presenceLock.Unlock()
@@ -2541,7 +2600,7 @@ func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, stat
 	// concurrent event coalesces instead of emitting a second opcode-3.
 	user.lastDiscordPresenceSentAt = time.Now()
 	user.presenceLock.Unlock()
-	user.sendPresenceToDiscord(sess, status, statusText)
+	user.sendPresenceToDiscord(sess, status, statusText, clearStatus)
 }
 
 // flushPendingDiscordPresence is invoked by the debounce timer when the
@@ -2552,7 +2611,9 @@ func (user *User) flushPendingDiscordPresence() {
 	user.presenceDebounceTimer = nil
 	status := user.pendingDiscordStatus
 	statusText := user.pendingDiscordStatusText
-	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText {
+	clearStatus := user.pendingDiscordClear
+	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText &&
+		clearStatus == user.lastSentDiscordClear {
 		user.presenceLock.Unlock()
 		return
 	}
@@ -2567,14 +2628,20 @@ func (user *User) flushPendingDiscordPresence() {
 	if sess == nil {
 		return
 	}
-	user.sendPresenceToDiscord(sess, status, statusText)
+	user.sendPresenceToDiscord(sess, status, statusText, clearStatus)
 }
 
 // sendPresenceToDiscord performs the actual opcode-3 UpdateStatusComplex call
 // and, on success, records what was sent for dedup and for the echo
 // suppression that applyPresence and HandleMatrixPresence rely on. Must be
 // called without presenceLock held.
-func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusText string) {
+func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
+	// Three-way activities behavior, because opcode 3 rewrites state and
+	// activities together:
+	//   - statusText != ""     → set the custom status to that text.
+	//   - clearStatus == true  → empty slice ([]) explicitly clears the custom status.
+	//   - otherwise (nil)      → "don't change activities", preserving a game/Spotify
+	//                            session and any existing custom status.
 	var activities []*discordgo.Activity
 	if statusText != "" {
 		activities = []*discordgo.Activity{{
@@ -2582,10 +2649,9 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 			Type:  discordgo.ActivityTypeCustom,
 			State: statusText,
 		}}
+	} else if clearStatus {
+		activities = []*discordgo.Activity{}
 	}
-	// Leave activities nil (JSON null = "don't change activities") when there is
-	// no custom status text, so a presence-only change doesn't clear an active
-	// game or Spotify session. An empty slice would serialize as [] and wipe them.
 	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
 		Status:     status,
 		Activities: activities,
@@ -2603,6 +2669,7 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 	user.lastSentToDiscordText = statusText
 	user.lastSentDiscordStatus = status
 	user.lastSentDiscordStatusText = statusText
+	user.lastSentDiscordClear = clearStatus
 	user.presenceLock.Unlock()
 	user.log.Debug().
 		Str("discord_status", status).
