@@ -236,10 +236,6 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	// generates a Discord opcode-3 message, which looks like bot activity.
 	user.presenceLock.Lock()
 	unchanged := user.lastSentDiscordStatus == discordStatus && user.lastSentDiscordStatusText == textToSend
-	if !unchanged {
-		user.lastSentDiscordStatus = discordStatus
-		user.lastSentDiscordStatusText = textToSend
-	}
 	user.presenceLock.Unlock()
 	if unchanged {
 		return
@@ -278,6 +274,8 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		user.matrixPresenceSetAt = time.Now()
 		user.lastSentToDiscordStatus = discordStatus
 		user.lastSentToDiscordText = textToSend
+		user.lastSentDiscordStatus = discordStatus
+		user.lastSentDiscordStatusText = textToSend
 		user.presenceLock.Unlock()
 		br.ZLog.Debug().
 			Str("user_id", evt.Sender.String()).

@@ -911,6 +911,13 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.bridgeStateLock.Lock()
 	user.wasLoggedOut = false
 	user.bridgeStateLock.Unlock()
+	// Clear the sent-presence dedup cache so the first Matrix presence ping
+	// after a reconnect always reaches Discord (the new gateway session starts
+	// without this Matrix-derived status).
+	user.presenceLock.Lock()
+	user.lastSentDiscordStatus = ""
+	user.lastSentDiscordStatusText = ""
+	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
 		// Write DiscordID under user.Lock BEFORE taking usersLock. Logout() holds
@@ -1025,6 +1032,12 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 
 func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	user.log.Debug().Msg("Discord connection resumed")
+	// Clear the dedup cache so the first presence ping after a resume re-sends
+	// the current status to Discord (the resumed session may have lost it).
+	user.presenceLock.Lock()
+	user.lastSentDiscordStatus = ""
+	user.lastSentDiscordStatusText = ""
+	user.presenceLock.Unlock()
 	user.subscribeGuilds(0 * time.Second)
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
