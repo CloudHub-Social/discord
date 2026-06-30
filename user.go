@@ -74,7 +74,7 @@ type User struct {
 	// them, so bursts of Matrix activity can never blow the gateway command budget.
 	guildSubLock     sync.Mutex
 	activeGuildSubs  map[string]time.Time
-	subscribedGuilds map[string]bool
+	subscribedGuilds map[string][]string
 	// guildSubSignal wakes the reconciler when the desired set changes (buffered
 	// to 1 so a touch never blocks).
 	guildSubSignal chan struct{}
@@ -394,7 +394,7 @@ func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 		relationships:    make(map[string]*discordgo.Relationship),
 		presenceCache:    make(map[string]presenceCacheEntry),
 		activeGuildSubs:  make(map[string]time.Time),
-		subscribedGuilds: make(map[string]bool),
+		subscribedGuilds: make(map[string][]string),
 		guildSubSignal:   make(chan struct{}, 1),
 	}
 	user.nextDiscordUploadID.Store(rand.Int31n(100))
@@ -1206,64 +1206,101 @@ const guildPresenceActiveTTL = 10 * time.Minute
 // unset (<= 0): the most guilds kept subscribed at once in on-demand mode.
 const defaultDiscordPresenceActiveLimit = 10
 
-// guildSubscribeChannels builds the member-list range map Discord needs to
-// deliver PRESENCE_UPDATE for a guild's bridged channels. Discord suppresses
-// presence for large guilds (~250+ members) unless you subscribe to specific
-// channels with ranges; {0,99} covers the first 100 members of each channel.
-func (user *User) guildSubscribeChannels(guildID string) map[string][][]int {
-	var channels map[string][][]int
+// guildChannelIDs returns the sorted Discord channel IDs of a guild's bridged
+// portals. Discord suppresses presence for large guilds (~250+ members) unless
+// you subscribe to specific channels with member-list ranges, so these are the
+// channels we subscribe. Sorted so the slice can be compared for equality to
+// detect when a guild's bridged channel set changed (newly bridged room, etc.).
+func (user *User) guildChannelIDs(guildID string) []string {
+	var ids []string
 	for _, p := range user.bridge.DB.Portal.GetAllInGuild(guildID) {
 		if p.MXID != "" {
-			if channels == nil {
-				channels = make(map[string][][]int)
-			}
-			channels[p.Key.ChannelID] = [][]int{{0, 99}}
+			ids = append(ids, p.Key.ChannelID)
 		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// subscribeRanges maps each channel to the {0,99} member-list range that makes
+// Discord deliver PRESENCE_UPDATE for the first 100 members.
+func subscribeRanges(channelIDs []string) map[string][][]int {
+	channels := make(map[string][][]int, len(channelIDs))
+	for _, id := range channelIDs {
+		channels[id] = [][]int{{0, 99}}
 	}
 	return channels
 }
 
-// sendGuildPresenceSubscribe sends an opcode-14 subscription that makes Discord
-// deliver presence (and typing) for the guild's bridged channels. It returns
-// false if the websocket is gone so callers can stop iterating.
-func (user *User) sendGuildPresenceSubscribe(sess *discordgo.Session, guildID string) bool {
+// releaseRanges maps each channel to an empty range, which is how the official
+// client drops a member list it is no longer viewing.
+func releaseRanges(channelIDs []string) map[string][][]int {
+	channels := make(map[string][][]int, len(channelIDs))
+	for _, id := range channelIDs {
+		channels[id] = [][]int{}
+	}
+	return channels
+}
+
+// sameChannels reports whether two sorted channel-ID slices are equal.
+func sameChannels(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sendGuildSubscribe sends an opcode-14 subscription for the given channel
+// ranges. sent reports whether the command was written without error; abort is
+// true when the websocket is gone so the caller stops the pass.
+func (user *User) sendGuildSubscribe(sess *discordgo.Session, guildID string, channels map[string][][]int) (sent, abort bool) {
 	err := sess.SubscribeGuild(discordgo.GuildSubscribeData{
 		GuildID:    guildID,
 		Typing:     true,
 		Activities: true,
 		Threads:    true,
-		Channels:   user.guildSubscribeChannels(guildID),
+		Channels:   channels,
 	})
 	if err != nil {
 		user.log.Warn().Err(err).Str("guild_id", guildID).Msg("Failed to subscribe to guild")
-		return !errors.Is(err, discordgo.ErrWSNotFound)
+		return false, errors.Is(err, discordgo.ErrWSNotFound)
 	}
-	return true
+	return true, false
 }
 
-// sendGuildPresenceRelease tells Discord to stop sending presence for a guild by
-// re-subscribing each bridged channel with an empty member-list range, which is
-// how the official client drops a member list it is no longer viewing. This is
-// the effective lever for the presence the bridge subscribes to: large-guild
-// PRESENCE_UPDATE flows from the member-list ranges, so clearing them stops it.
+// sendGuildRelease tells Discord to stop sending presence for a guild by
+// re-subscribing the previously-subscribed channels with empty member-list
+// ranges. The channel IDs are the ones we actually subscribed (not the current
+// bridged set), so a guild/channel unbridged before release is still cleared.
 //
 // Note: GuildSubscribeData's bool fields are tagged omitempty in discordgo, so a
 // literal Activities:false / Typing:false cannot be marshaled as an explicit
 // disable through SubscribeGuild — they are simply omitted. Clearing the channel
 // ranges is therefore the mechanism we rely on; the guild-level activity flag
 // stays as last sent until the connection resets (which drops all subscriptions).
-func (user *User) sendGuildPresenceRelease(sess *discordgo.Session, guildID string) {
-	channels := make(map[string][][]int)
-	for channelID := range user.guildSubscribeChannels(guildID) {
-		channels[channelID] = [][]int{}
-	}
+func (user *User) sendGuildRelease(sess *discordgo.Session, guildID string, channelIDs []string) (sent, abort bool) {
 	err := sess.SubscribeGuild(discordgo.GuildSubscribeData{
 		GuildID:  guildID,
-		Channels: channels,
+		Channels: releaseRanges(channelIDs),
 	})
 	if err != nil {
 		user.log.Debug().Err(err).Str("guild_id", guildID).Msg("Failed to release guild presence subscription")
+		return false, errors.Is(err, discordgo.ErrWSNotFound)
 	}
+	return true, false
+}
+
+// sendGuildPresenceSubscribe subscribes all of a guild's currently bridged
+// channels. Used by subscribe-all mode and post-bridging; returns false only
+// when the websocket is gone so callers can stop iterating.
+func (user *User) sendGuildPresenceSubscribe(sess *discordgo.Session, guildID string) bool {
+	_, abort := user.sendGuildSubscribe(sess, guildID, subscribeRanges(user.guildChannelIDs(guildID)))
+	return !abort
 }
 
 // guildSubReconcileInterval is how often the reconciler runs on its own (between
@@ -1347,31 +1384,60 @@ func (user *User) runGuildSubReconciler(ctx context.Context) {
 	}
 }
 
-// reconcileGuildSubs performs one paced convergence pass: it expires idle/no
-// longer bridged guilds from the desired set, then subscribes desired guilds
-// that are not yet subscribed and releases subscribed guilds that are no longer
-// desired, sleeping guildSubSendInterval between sends.
+// reconcileGuildSubs performs one paced convergence pass toward the desired set:
+// it expires idle/no-longer-bridged guilds, then subscribes desired guilds whose
+// subscription is missing or whose bridged channel set changed, and releases
+// guilds no longer desired — sleeping guildSubSendInterval between sends.
+//
+// All Discord-state lookups (guildIsBridged, guildChannelIDs) happen outside
+// guildSubLock so the lock is never held across a DB query (the Matrix hot path
+// also takes it). Each send re-checks the desired state under the lock right
+// before sending, and the subscribed map is only mutated after a successful send,
+// so a failed send is retried on the next pass and stale work is skipped.
 func (user *User) reconcileGuildSubs(ctx context.Context) {
 	if user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
 		return
 	}
 	now := time.Now()
+
+	// Snapshot the desired set, then expire idle / no-longer-bridged guilds.
+	// guildIsBridged hits the DB, so it runs outside the lock.
 	user.guildSubLock.Lock()
-	// Expire idle entries and any guild that is no longer bridged.
+	desired := make(map[string]time.Time, len(user.activeGuildSubs))
 	for gid, last := range user.activeGuildSubs {
+		desired[gid] = last
+	}
+	user.guildSubLock.Unlock()
+	for gid, last := range desired {
 		if now.Sub(last) > guildPresenceActiveTTL || !user.guildIsBridged(gid) {
-			delete(user.activeGuildSubs, gid)
+			delete(desired, gid)
+			user.guildSubLock.Lock()
+			// Only drop it if a fresh touch hasn't bumped the timestamp meanwhile.
+			if cur, ok := user.activeGuildSubs[gid]; ok && !cur.After(last) {
+				delete(user.activeGuildSubs, gid)
+			}
+			user.guildSubLock.Unlock()
 		}
 	}
+
+	// Compute target channel sets (DB) outside the lock, then diff against what is
+	// actually subscribed to build the work lists.
+	targets := make(map[string][]string, len(desired))
+	for gid := range desired {
+		targets[gid] = user.guildChannelIDs(gid)
+	}
+	user.guildSubLock.Lock()
 	var toSubscribe, toRelease []string
-	for gid := range user.activeGuildSubs {
-		if !user.subscribedGuilds[gid] {
+	releaseChannels := make(map[string][]string)
+	for gid := range desired {
+		if cur, ok := user.subscribedGuilds[gid]; !ok || !sameChannels(cur, targets[gid]) {
 			toSubscribe = append(toSubscribe, gid)
 		}
 	}
-	for gid := range user.subscribedGuilds {
-		if _, desired := user.activeGuildSubs[gid]; !desired {
+	for gid, chans := range user.subscribedGuilds {
+		if _, ok := desired[gid]; !ok {
 			toRelease = append(toRelease, gid)
+			releaseChannels[gid] = chans
 		}
 	}
 	user.guildSubLock.Unlock()
@@ -1380,31 +1446,53 @@ func (user *User) reconcileGuildSubs(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Skip if the guild became desired again while we were paced/sleeping.
+		user.guildSubLock.Lock()
+		_, desiredNow := user.activeGuildSubs[gid]
+		user.guildSubLock.Unlock()
+		if desiredNow {
+			continue
+		}
 		sess := user.sessionForGuildSub()
 		if sess == nil {
 			return
 		}
-		user.sendGuildPresenceRelease(sess, gid)
-		user.guildSubLock.Lock()
-		delete(user.subscribedGuilds, gid)
-		user.guildSubLock.Unlock()
+		sent, abort := user.sendGuildRelease(sess, gid, releaseChannels[gid])
+		if abort {
+			return
+		}
+		if sent {
+			user.guildSubLock.Lock()
+			delete(user.subscribedGuilds, gid)
+			user.guildSubLock.Unlock()
+		}
 		user.sleepGuildSub(ctx)
 	}
 	for _, gid := range toSubscribe {
 		if ctx.Err() != nil {
 			return
 		}
+		// Skip if the guild was evicted from the desired set while we were sleeping.
+		user.guildSubLock.Lock()
+		_, desiredNow := user.activeGuildSubs[gid]
+		user.guildSubLock.Unlock()
+		if !desiredNow {
+			continue
+		}
 		sess := user.sessionForGuildSub()
 		if sess == nil {
 			return
 		}
 		user.log.Debug().Str("guild_id", gid).Msg("Subscribing to guild on demand")
-		if !user.sendGuildPresenceSubscribe(sess, gid) {
+		sent, abort := user.sendGuildSubscribe(sess, gid, subscribeRanges(targets[gid]))
+		if abort {
 			return
 		}
-		user.guildSubLock.Lock()
-		user.subscribedGuilds[gid] = true
-		user.guildSubLock.Unlock()
+		if sent {
+			user.guildSubLock.Lock()
+			user.subscribedGuilds[gid] = targets[gid]
+			user.guildSubLock.Unlock()
+		}
 		user.sleepGuildSub(ctx)
 	}
 }
