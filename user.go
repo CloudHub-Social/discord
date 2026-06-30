@@ -62,6 +62,14 @@ type User struct {
 	// commands, and blow Discord's 120-commands/60s gateway budget.
 	subscribingGuilds atomic.Bool
 
+	// guildSubLock guards activeGuildSubs, the on-demand guild presence
+	// subscription set. It maps a Discord guild ID to the last time a Matrix
+	// client was active in one of its rooms; entries are added when a room is
+	// focused, refreshed on continued activity, and released when they go idle
+	// or are evicted to honor DiscordPresenceActiveLimit.
+	guildSubLock    sync.Mutex
+	activeGuildSubs map[string]time.Time
+
 	BridgeState     *bridge.BridgeStateQueue
 	bridgeStateLock sync.Mutex
 	wasDisconnected bool
@@ -374,8 +382,9 @@ func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 
 		pendingInteractions: make(map[string]*WrappedCommandEvent),
 
-		relationships: make(map[string]*discordgo.Relationship),
-		presenceCache: make(map[string]presenceCacheEntry),
+		relationships:   make(map[string]*discordgo.Relationship),
+		presenceCache:   make(map[string]presenceCacheEntry),
+		activeGuildSubs: make(map[string]time.Time),
 	}
 	user.nextDiscordUploadID.Store(rand.Int31n(100))
 	user.BridgeState = br.NewBridgeStateQueue(user)
@@ -683,6 +692,9 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastDiscordPresenceSentAt = time.Time{}
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
+	user.guildSubLock.Lock()
+	clear(user.activeGuildSubs)
+	user.guildSubLock.Unlock()
 	if user.stopKeepalive != nil {
 		user.stopKeepalive()
 		user.stopKeepalive = nil
@@ -1146,6 +1158,31 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 		return
 	}
 	defer user.subscribingGuilds.Store(false)
+	// On-demand mode: don't subscribe every guild on connect. Re-subscribe only
+	// the guilds that were active before this (re)connect, so presence resumes
+	// for rooms the user was actually using without re-announcing interest in the
+	// entire guild list. New activity drives further subscriptions lazily.
+	if !user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
+		user.guildSubLock.Lock()
+		active := make([]string, 0, len(user.activeGuildSubs))
+		for guildID := range user.activeGuildSubs {
+			active = append(active, guildID)
+		}
+		user.guildSubLock.Unlock()
+		for _, guildID := range active {
+			user.Lock()
+			current := user.Session
+			user.Unlock()
+			if current != sess {
+				return
+			}
+			if !user.sendGuildPresenceSubscribe(sess, guildID) {
+				return
+			}
+			time.Sleep(delay)
+		}
+		return
+	}
 	for _, guildMeta := range sess.State.Guilds {
 		guild := user.bridge.GetGuildByID(guildMeta.ID, false)
 		if guild != nil && guild.MXID != "" {
@@ -1157,39 +1194,147 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 			if current != sess {
 				return
 			}
-			// Build a channels map from bridged portals in this guild.
-			// Discord only sends PRESENCE_UPDATE events for large guilds when you
-			// subscribe to specific channels with member-list ranges; without this,
-			// presence updates are silently suppressed above Discord's lazy-loading
-			// threshold (~250 members). Including the bridged channels here causes
-			// Discord to start delivering PRESENCE_UPDATE for the first 100 members
-			// of each channel, which covers the vast majority of active bridge users.
-			var channels map[string][][]int
-			for _, p := range user.bridge.DB.Portal.GetAllInGuild(guild.ID) {
-				if p.MXID != "" {
-					if channels == nil {
-						channels = make(map[string][][]int)
-					}
-					channels[p.Key.ChannelID] = [][]int{{0, 99}}
-				}
-			}
-			user.log.Debug().Str("guild_id", guild.ID).Int("channel_count", len(channels)).Msg("Subscribing to guild")
-			dat := discordgo.GuildSubscribeData{
-				GuildID:    guild.ID,
-				Typing:     true,
-				Activities: true,
-				Threads:    true,
-				Channels:   channels,
-			}
-			err := sess.SubscribeGuild(dat)
-			if err != nil {
-				user.log.Warn().Err(err).Str("guild_id", guild.ID).Msg("Failed to subscribe to guild")
-				if errors.Is(err, discordgo.ErrWSNotFound) {
-					return
-				}
+			user.log.Debug().Str("guild_id", guild.ID).Msg("Subscribing to guild")
+			if !user.sendGuildPresenceSubscribe(sess, guild.ID) {
+				return
 			}
 			time.Sleep(delay)
 		}
+	}
+}
+
+// guildPresenceActiveTTL is how long a guild stays subscribed for presence in
+// on-demand mode after the last Matrix-side activity in one of its rooms.
+const guildPresenceActiveTTL = 10 * time.Minute
+
+// defaultDiscordPresenceActiveLimit is used when DiscordPresenceActiveLimit is
+// unset (<= 0): the most guilds kept subscribed at once in on-demand mode.
+const defaultDiscordPresenceActiveLimit = 10
+
+// guildSubscribeChannels builds the member-list range map Discord needs to
+// deliver PRESENCE_UPDATE for a guild's bridged channels. Discord suppresses
+// presence for large guilds (~250+ members) unless you subscribe to specific
+// channels with ranges; {0,99} covers the first 100 members of each channel.
+func (user *User) guildSubscribeChannels(guildID string) map[string][][]int {
+	var channels map[string][][]int
+	for _, p := range user.bridge.DB.Portal.GetAllInGuild(guildID) {
+		if p.MXID != "" {
+			if channels == nil {
+				channels = make(map[string][][]int)
+			}
+			channels[p.Key.ChannelID] = [][]int{{0, 99}}
+		}
+	}
+	return channels
+}
+
+// sendGuildPresenceSubscribe sends an opcode-14 subscription that makes Discord
+// deliver presence (and typing) for the guild's bridged channels. It returns
+// false if the websocket is gone so callers can stop iterating.
+func (user *User) sendGuildPresenceSubscribe(sess *discordgo.Session, guildID string) bool {
+	err := sess.SubscribeGuild(discordgo.GuildSubscribeData{
+		GuildID:    guildID,
+		Typing:     true,
+		Activities: true,
+		Threads:    true,
+		Channels:   user.guildSubscribeChannels(guildID),
+	})
+	if err != nil {
+		user.log.Warn().Err(err).Str("guild_id", guildID).Msg("Failed to subscribe to guild")
+		return !errors.Is(err, discordgo.ErrWSNotFound)
+	}
+	return true
+}
+
+// sendGuildPresenceRelease tells Discord to stop sending presence/typing for a
+// guild by re-subscribing with empty member-list ranges and activities off,
+// which is how the official client drops a member list it is no longer viewing.
+func (user *User) sendGuildPresenceRelease(sess *discordgo.Session, guildID string) {
+	channels := make(map[string][][]int)
+	for channelID := range user.guildSubscribeChannels(guildID) {
+		channels[channelID] = [][]int{}
+	}
+	err := sess.SubscribeGuild(discordgo.GuildSubscribeData{
+		GuildID:    guildID,
+		Typing:     false,
+		Activities: false,
+		Threads:    false,
+		Channels:   channels,
+	})
+	if err != nil {
+		user.log.Debug().Err(err).Str("guild_id", guildID).Msg("Failed to release guild presence subscription")
+	}
+}
+
+// touchGuildPresence marks a guild as actively viewed from Matrix and ensures it
+// is subscribed for presence in on-demand mode. It refreshes the activity
+// timestamp, subscribes guilds newly added, evicts the least-recently-active
+// guild when over the limit, and releases entries idle past guildPresenceActiveTTL.
+// It is a no-op when presence sync is off or in subscribe-all mode.
+func (user *User) touchGuildPresence(guildID string) {
+	if guildID == "" ||
+		!user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix ||
+		user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
+		return
+	}
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess == nil || !sess.IsUser {
+		return
+	}
+
+	limit := user.bridge.Config.Bridge.DiscordPresenceActiveLimit
+	if limit <= 0 {
+		limit = defaultDiscordPresenceActiveLimit
+	}
+
+	now := time.Now()
+	var toSubscribe string
+	var toRelease []string
+
+	user.guildSubLock.Lock()
+	// Release entries that have gone idle since the last activity anywhere.
+	for gid, last := range user.activeGuildSubs {
+		if gid != guildID && now.Sub(last) > guildPresenceActiveTTL {
+			delete(user.activeGuildSubs, gid)
+			toRelease = append(toRelease, gid)
+		}
+	}
+	if _, ok := user.activeGuildSubs[guildID]; !ok {
+		// Newly active guild: subscribe and, if that pushes us over the limit,
+		// evict the least-recently-active other guild.
+		toSubscribe = guildID
+		user.activeGuildSubs[guildID] = now
+		for len(user.activeGuildSubs) > limit {
+			var oldestID string
+			var oldest time.Time
+			for gid, last := range user.activeGuildSubs {
+				if gid == guildID {
+					continue
+				}
+				if oldestID == "" || last.Before(oldest) {
+					oldestID, oldest = gid, last
+				}
+			}
+			if oldestID == "" {
+				break
+			}
+			delete(user.activeGuildSubs, oldestID)
+			toRelease = append(toRelease, oldestID)
+		}
+	} else {
+		// Already subscribed: just refresh the activity timestamp.
+		user.activeGuildSubs[guildID] = now
+	}
+	user.guildSubLock.Unlock()
+
+	for _, gid := range toRelease {
+		user.sendGuildPresenceRelease(sess, gid)
+	}
+	if toSubscribe != "" {
+		user.log.Debug().Str("guild_id", toSubscribe).Msg("Subscribing to guild on demand")
+		user.sendGuildPresenceSubscribe(sess, toSubscribe)
 	}
 }
 
@@ -2589,17 +2734,13 @@ func (user *User) bridgeGuild(guildID string, everything bool) error {
 	}
 	guild.Update()
 
-	if user.Session.IsUser && user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+	// In subscribe-all mode, subscribe immediately after bridging. In on-demand
+	// mode, skip it: the guild will be subscribed when a Matrix client is next
+	// active in one of its rooms.
+	if user.Session.IsUser && user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix &&
+		user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
 		log.Debug().Msg("Subscribing to guild after bridging")
-		err = user.Session.SubscribeGuild(discordgo.GuildSubscribeData{
-			GuildID:    guild.ID,
-			Typing:     true,
-			Activities: true,
-			Threads:    true,
-		})
-		if err != nil {
-			log.Warn().Err(err).Msg("Failed to subscribe to guild")
-		}
+		user.sendGuildPresenceSubscribe(user.Session, guild.ID)
 	}
 
 	return nil

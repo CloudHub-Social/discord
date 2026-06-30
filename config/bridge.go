@@ -74,6 +74,22 @@ type BridgeConfig struct {
 	// both ride the same opcode-14 subscription.
 	SyncDiscordPresenceToMatrix bool `yaml:"sync_discord_presence_to_matrix"`
 
+	// DiscordPresenceSubscribeAll, when SyncDiscordPresenceToMatrix is enabled,
+	// controls how guilds are subscribed for presence. When false (default), the
+	// bridge subscribes on demand: it only sends an opcode-14 subscription for a
+	// guild when a Matrix client shows activity in one of its rooms (a read
+	// receipt or an outgoing message), keeping at most DiscordPresenceActiveLimit
+	// guilds subscribed and releasing idle ones — mirroring how the official
+	// client only watches the channels you're looking at. When true, the bridge
+	// reverts to subscribing every bridged guild on connect, which is more
+	// complete but a stronger self-bot signal on user tokens.
+	DiscordPresenceSubscribeAll bool `yaml:"discord_presence_subscribe_all"`
+
+	// DiscordPresenceActiveLimit caps how many guilds are kept subscribed at once
+	// in on-demand mode (least-recently-active guilds are released first). Values
+	// <= 0 fall back to the built-in default.
+	DiscordPresenceActiveLimit int `yaml:"discord_presence_active_limit"`
+
 	Proxy string `yaml:"proxy"`
 
 	CacheMedia  string      `yaml:"cache_media"`
