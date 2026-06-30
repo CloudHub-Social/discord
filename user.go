@@ -1757,17 +1757,13 @@ func (user *User) runPresenceKeepalive(ctx context.Context) {
 					customUser := user.bridge.GetUserByMXIDIfExists(puppet.CustomMXID)
 					if customUser == nil || customUser.Session == nil {
 						_ = setMatrixPresence(customIntent, entry.presence, entry.statusMsg)
-					} else if customUser == user {
-						// Re-assert own-user Matrix presence so Synapse doesn't expire
-						// it between Discord status changes. Arm discordPresenceSetAt
-						// first so the push_ephemeral echo from this PUT is suppressed
-						// in HandleMatrixPresence and does not bounce to Discord.
-						user.presenceLock.Lock()
-						user.discordPresenceSetAt = time.Now()
-						user.presenceLock.Unlock()
-						_ = setMatrixPresence(customIntent, entry.presence, entry.statusMsg)
 					}
-					// else: another active bridge user's double-puppet — skip (echo risk)
+					// If customUser has an active session, skip — the bridge user's
+					// real Matrix account is managed by their Matrix client (Charm).
+					// The keepalive is only for ghost users who never /sync and whose
+					// Synapse presence expires. Discord→Matrix own-presence sync is
+					// handled by applyPresence on PRESENCE_UPDATE events instead;
+					// asserting it here would override the client's idle/offline state.
 				}
 			}
 		}
