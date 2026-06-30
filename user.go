@@ -2381,15 +2381,16 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		matrixPresence = cached.presence
 	}
 
-	// Status text to write:
-	//   - status sync on → mirror the Discord text (empty means an intentional clear).
-	//   - status sync off → preserve the last text we wrote rather than clearing it
-	//     on every presence update.
+	// Status text to write. Only when status sync is on; the empty value of an
+	// on-sync update is an intentional clear. When status sync is off we leave the
+	// text empty and don't try to preserve it via the cache — for ghosts there is
+	// never a bridge-set status to preserve, and a cache-based preserve broke down
+	// across offline transitions (the entry is dropped when a user goes offline).
+	// Known limitation: a status the user sets directly on a double-puppeted Matrix
+	// account is not preserved across Discord-driven presence updates in this mode.
 	writeText := ""
 	if sSync {
 		writeText = customStatusText
-	} else if hadCache {
-		writeText = cached.statusMsg
 	}
 
 	// First write with nothing meaningful (no state to mirror and no text): don't
