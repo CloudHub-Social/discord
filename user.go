@@ -89,6 +89,14 @@ type User struct {
 	lastDiscordStatusText string
 	matrixStatusEverSet   bool
 
+	// lastSentDiscordStatus and lastSentDiscordStatusText track what was most
+	// recently sent to Discord via UpdateStatusComplex. Used to suppress
+	// redundant WebSocket status updates when the effective status hasn't
+	// changed (Matrix clients send presence pings frequently, and each one
+	// would otherwise generate a Discord opcode-3 message).
+	lastSentDiscordStatus     string
+	lastSentDiscordStatusText string
+
 	// presenceCache maps Discord user IDs to their last known non-offline
 	// Matrix presence state. The keepalive goroutine re-sends these every
 	// presenceKeepaliveInterval so Synapse does not expire ghost users'
@@ -566,6 +574,8 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastDiscordStatusText = ""
 	user.lastMatrixStatusText = ""
 	user.matrixStatusEverSet = false
+	user.lastSentDiscordStatus = ""
+	user.lastSentDiscordStatusText = ""
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
 	if user.stopKeepalive != nil {
