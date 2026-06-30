@@ -62,13 +62,22 @@ type User struct {
 	// commands, and blow Discord's 120-commands/60s gateway budget.
 	subscribingGuilds atomic.Bool
 
-	// guildSubLock guards activeGuildSubs, the on-demand guild presence
-	// subscription set. It maps a Discord guild ID to the last time a Matrix
-	// client was active in one of its rooms; entries are added when a room is
-	// focused, refreshed on continued activity, and released when they go idle
-	// or are evicted to honor DiscordPresenceActiveLimit.
-	guildSubLock    sync.Mutex
-	activeGuildSubs map[string]time.Time
+	// guildSubLock guards the on-demand guild presence subscription state below.
+	//
+	// activeGuildSubs is the *desired* set: guild ID -> last time a Matrix client
+	// was active in one of its rooms. touchGuildPresence updates it and signals
+	// the reconciler; it never sends opcode 14 itself.
+	//
+	// subscribedGuilds is what has actually been subscribed on the current Discord
+	// connection. The reconciler (runGuildSubReconciler) diffs desired against
+	// subscribed and sends paced opcode-14 subscribe/release commands to converge
+	// them, so bursts of Matrix activity can never blow the gateway command budget.
+	guildSubLock     sync.Mutex
+	activeGuildSubs  map[string]time.Time
+	subscribedGuilds map[string]bool
+	// guildSubSignal wakes the reconciler when the desired set changes (buffered
+	// to 1 so a touch never blocks).
+	guildSubSignal chan struct{}
 
 	BridgeState     *bridge.BridgeStateQueue
 	bridgeStateLock sync.Mutex
@@ -382,9 +391,11 @@ func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 
 		pendingInteractions: make(map[string]*WrappedCommandEvent),
 
-		relationships:   make(map[string]*discordgo.Relationship),
-		presenceCache:   make(map[string]presenceCacheEntry),
-		activeGuildSubs: make(map[string]time.Time),
+		relationships:    make(map[string]*discordgo.Relationship),
+		presenceCache:    make(map[string]presenceCacheEntry),
+		activeGuildSubs:  make(map[string]time.Time),
+		subscribedGuilds: make(map[string]bool),
+		guildSubSignal:   make(chan struct{}, 1),
 	}
 	user.nextDiscordUploadID.Store(rand.Int31n(100))
 	user.BridgeState = br.NewBridgeStateQueue(user)
@@ -694,6 +705,7 @@ func (user *User) Logout(isOverwriting bool) {
 	user.presenceLock.Unlock()
 	user.guildSubLock.Lock()
 	clear(user.activeGuildSubs)
+	clear(user.subscribedGuilds)
 	user.guildSubLock.Unlock()
 	if user.stopKeepalive != nil {
 		user.stopKeepalive()
@@ -1158,29 +1170,12 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 		return
 	}
 	defer user.subscribingGuilds.Store(false)
-	// On-demand mode: don't subscribe every guild on connect. Re-subscribe only
-	// the guilds that were active before this (re)connect, so presence resumes
-	// for rooms the user was actually using without re-announcing interest in the
-	// entire guild list. New activity drives further subscriptions lazily.
+	// On-demand mode: don't subscribe every guild on connect. The reconciler
+	// (runGuildSubReconciler) owns opcode-14 sends and will re-subscribe the
+	// still-active, still-bridged guilds from the desired set at a paced rate.
+	// Just wake it; new Matrix activity drives further subscriptions lazily.
 	if !user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
-		user.guildSubLock.Lock()
-		active := make([]string, 0, len(user.activeGuildSubs))
-		for guildID := range user.activeGuildSubs {
-			active = append(active, guildID)
-		}
-		user.guildSubLock.Unlock()
-		for _, guildID := range active {
-			user.Lock()
-			current := user.Session
-			user.Unlock()
-			if current != sess {
-				return
-			}
-			if !user.sendGuildPresenceSubscribe(sess, guildID) {
-				return
-			}
-			time.Sleep(delay)
-		}
+		user.signalGuildSubReconcile()
 		return
 	}
 	for _, guildMeta := range sess.State.Guilds {
@@ -1246,41 +1241,49 @@ func (user *User) sendGuildPresenceSubscribe(sess *discordgo.Session, guildID st
 	return true
 }
 
-// sendGuildPresenceRelease tells Discord to stop sending presence/typing for a
-// guild by re-subscribing with empty member-list ranges and activities off,
-// which is how the official client drops a member list it is no longer viewing.
+// sendGuildPresenceRelease tells Discord to stop sending presence for a guild by
+// re-subscribing each bridged channel with an empty member-list range, which is
+// how the official client drops a member list it is no longer viewing. This is
+// the effective lever for the presence the bridge subscribes to: large-guild
+// PRESENCE_UPDATE flows from the member-list ranges, so clearing them stops it.
+//
+// Note: GuildSubscribeData's bool fields are tagged omitempty in discordgo, so a
+// literal Activities:false / Typing:false cannot be marshaled as an explicit
+// disable through SubscribeGuild — they are simply omitted. Clearing the channel
+// ranges is therefore the mechanism we rely on; the guild-level activity flag
+// stays as last sent until the connection resets (which drops all subscriptions).
 func (user *User) sendGuildPresenceRelease(sess *discordgo.Session, guildID string) {
 	channels := make(map[string][][]int)
 	for channelID := range user.guildSubscribeChannels(guildID) {
 		channels[channelID] = [][]int{}
 	}
 	err := sess.SubscribeGuild(discordgo.GuildSubscribeData{
-		GuildID:    guildID,
-		Typing:     false,
-		Activities: false,
-		Threads:    false,
-		Channels:   channels,
+		GuildID:  guildID,
+		Channels: channels,
 	})
 	if err != nil {
 		user.log.Debug().Err(err).Str("guild_id", guildID).Msg("Failed to release guild presence subscription")
 	}
 }
 
-// touchGuildPresence marks a guild as actively viewed from Matrix and ensures it
-// is subscribed for presence in on-demand mode. It refreshes the activity
-// timestamp, subscribes guilds newly added, evicts the least-recently-active
-// guild when over the limit, and releases entries idle past guildPresenceActiveTTL.
-// It is a no-op when presence sync is off or in subscribe-all mode.
+// guildSubReconcileInterval is how often the reconciler runs on its own (between
+// activity signals) to release guilds that have gone idle past the TTL.
+const guildSubReconcileInterval = time.Minute
+
+// guildSubSendInterval paces opcode-14 sends from the reconciler so a burst of
+// Matrix activity (e.g. marking many rooms read) cannot exceed Discord's
+// 120-commands/60s gateway budget.
+const guildSubSendInterval = 2 * time.Second
+
+// touchGuildPresence records that a Matrix client is active in one of the guild's
+// rooms and wakes the reconciler. It only updates in-memory desired state (and
+// enforces the active limit by dropping the least-recently-active guild); the
+// reconciler performs the actual paced opcode-14 sends. No-op when presence sync
+// is off or in subscribe-all mode.
 func (user *User) touchGuildPresence(guildID string) {
 	if guildID == "" ||
 		!user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix ||
 		user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
-		return
-	}
-	user.Lock()
-	sess := user.Session
-	user.Unlock()
-	if sess == nil || !sess.IsUser {
 		return
 	}
 
@@ -1290,51 +1293,145 @@ func (user *User) touchGuildPresence(guildID string) {
 	}
 
 	now := time.Now()
-	var toSubscribe string
-	var toRelease []string
-
 	user.guildSubLock.Lock()
-	// Release entries that have gone idle since the last activity anywhere.
-	for gid, last := range user.activeGuildSubs {
-		if gid != guildID && now.Sub(last) > guildPresenceActiveTTL {
-			delete(user.activeGuildSubs, gid)
-			toRelease = append(toRelease, gid)
+	user.activeGuildSubs[guildID] = now
+	// Enforce the active limit by dropping least-recently-active guilds from the
+	// desired set. The reconciler releases anything still subscribed but no longer
+	// desired, so eviction needs no opcode-14 send here.
+	for len(user.activeGuildSubs) > limit {
+		var oldestID string
+		var oldest time.Time
+		for gid, last := range user.activeGuildSubs {
+			if gid == guildID {
+				continue
+			}
+			if oldestID == "" || last.Before(oldest) {
+				oldestID, oldest = gid, last
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		delete(user.activeGuildSubs, oldestID)
+	}
+	user.guildSubLock.Unlock()
+	user.signalGuildSubReconcile()
+}
+
+// signalGuildSubReconcile wakes the reconciler without blocking. The signal
+// channel is buffered to 1, so a pending wake-up coalesces multiple touches.
+func (user *User) signalGuildSubReconcile() {
+	select {
+	case user.guildSubSignal <- struct{}{}:
+	default:
+	}
+}
+
+// runGuildSubReconciler owns all on-demand opcode-14 subscribe/release traffic.
+// It wakes on desired-set changes (touchGuildPresence) and on a periodic ticker
+// (to release idle guilds even without further activity), then converges the
+// subscribed set toward the desired set with paced sends. Started alongside the
+// presence keepalive and stopped via the same context on logout/reconnect.
+func (user *User) runGuildSubReconciler(ctx context.Context) {
+	ticker := time.NewTicker(guildSubReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			user.reconcileGuildSubs(ctx)
+		case <-user.guildSubSignal:
+			user.reconcileGuildSubs(ctx)
 		}
 	}
-	if _, ok := user.activeGuildSubs[guildID]; !ok {
-		// Newly active guild: subscribe and, if that pushes us over the limit,
-		// evict the least-recently-active other guild.
-		toSubscribe = guildID
-		user.activeGuildSubs[guildID] = now
-		for len(user.activeGuildSubs) > limit {
-			var oldestID string
-			var oldest time.Time
-			for gid, last := range user.activeGuildSubs {
-				if gid == guildID {
-					continue
-				}
-				if oldestID == "" || last.Before(oldest) {
-					oldestID, oldest = gid, last
-				}
-			}
-			if oldestID == "" {
-				break
-			}
-			delete(user.activeGuildSubs, oldestID)
-			toRelease = append(toRelease, oldestID)
+}
+
+// reconcileGuildSubs performs one paced convergence pass: it expires idle/no
+// longer bridged guilds from the desired set, then subscribes desired guilds
+// that are not yet subscribed and releases subscribed guilds that are no longer
+// desired, sleeping guildSubSendInterval between sends.
+func (user *User) reconcileGuildSubs(ctx context.Context) {
+	if user.bridge.Config.Bridge.DiscordPresenceSubscribeAll {
+		return
+	}
+	now := time.Now()
+	user.guildSubLock.Lock()
+	// Expire idle entries and any guild that is no longer bridged.
+	for gid, last := range user.activeGuildSubs {
+		if now.Sub(last) > guildPresenceActiveTTL || !user.guildIsBridged(gid) {
+			delete(user.activeGuildSubs, gid)
 		}
-	} else {
-		// Already subscribed: just refresh the activity timestamp.
-		user.activeGuildSubs[guildID] = now
+	}
+	var toSubscribe, toRelease []string
+	for gid := range user.activeGuildSubs {
+		if !user.subscribedGuilds[gid] {
+			toSubscribe = append(toSubscribe, gid)
+		}
+	}
+	for gid := range user.subscribedGuilds {
+		if _, desired := user.activeGuildSubs[gid]; !desired {
+			toRelease = append(toRelease, gid)
+		}
 	}
 	user.guildSubLock.Unlock()
 
 	for _, gid := range toRelease {
+		if ctx.Err() != nil {
+			return
+		}
+		sess := user.sessionForGuildSub()
+		if sess == nil {
+			return
+		}
 		user.sendGuildPresenceRelease(sess, gid)
+		user.guildSubLock.Lock()
+		delete(user.subscribedGuilds, gid)
+		user.guildSubLock.Unlock()
+		user.sleepGuildSub(ctx)
 	}
-	if toSubscribe != "" {
-		user.log.Debug().Str("guild_id", toSubscribe).Msg("Subscribing to guild on demand")
-		user.sendGuildPresenceSubscribe(sess, toSubscribe)
+	for _, gid := range toSubscribe {
+		if ctx.Err() != nil {
+			return
+		}
+		sess := user.sessionForGuildSub()
+		if sess == nil {
+			return
+		}
+		user.log.Debug().Str("guild_id", gid).Msg("Subscribing to guild on demand")
+		if !user.sendGuildPresenceSubscribe(sess, gid) {
+			return
+		}
+		user.guildSubLock.Lock()
+		user.subscribedGuilds[gid] = true
+		user.guildSubLock.Unlock()
+		user.sleepGuildSub(ctx)
+	}
+}
+
+// sessionForGuildSub snapshots the current user session for a reconciler send,
+// returning nil if the user logged out or the session is not a user token.
+func (user *User) sessionForGuildSub() *discordgo.Session {
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess == nil || !sess.IsUser {
+		return nil
+	}
+	return sess
+}
+
+// guildIsBridged reports whether the guild still has a bridged Matrix room.
+func (user *User) guildIsBridged(guildID string) bool {
+	guild := user.bridge.GetGuildByID(guildID, false)
+	return guild != nil && guild.MXID != ""
+}
+
+// sleepGuildSub paces opcode-14 sends, returning early if the context is cancelled.
+func (user *User) sleepGuildSub(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(guildSubSendInterval):
 	}
 }
 
@@ -2424,8 +2521,18 @@ func (user *User) startPresenceKeepalive() {
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
 
+	// A fresh connection (READY/IDENTIFY) loses any prior guild subscriptions, so
+	// forget what we thought was subscribed; the reconciler will re-subscribe the
+	// still-active desired set. (On RESUME the same session keeps its subs and
+	// startPresenceKeepalive is not called, so this does not run.)
+	user.guildSubLock.Lock()
+	clear(user.subscribedGuilds)
+	user.guildSubLock.Unlock()
+
 	user.log.Debug().Msg("Starting presence keepalive goroutine")
 	go user.runPresenceKeepalive(ctx)
+	go user.runGuildSubReconciler(ctx)
+	user.signalGuildSubReconcile()
 }
 
 func (user *User) runPresenceKeepalive(ctx context.Context) {
