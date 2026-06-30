@@ -1957,7 +1957,7 @@ func (user *User) startPresenceKeepalive() {
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
 
-	user.log.Info().Msg("Starting presence keepalive goroutine")
+	user.log.Debug().Msg("Starting presence keepalive goroutine")
 	go user.runPresenceKeepalive(ctx)
 }
 
@@ -1976,7 +1976,7 @@ func (user *User) runPresenceKeepalive(ctx context.Context) {
 			}
 			user.presenceLock.Unlock()
 
-			user.log.Info().Int("count", len(snapshot)).Msg("Presence keepalive tick: refreshing cached presences")
+			user.log.Debug().Int("count", len(snapshot)).Msg("Presence keepalive tick: refreshing cached presences")
 			for discordID, entry := range snapshot {
 				puppet := user.bridge.GetPuppetByIDIfExists(discordID)
 				if puppet == nil {
@@ -2055,7 +2055,7 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 		applied++
 		user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 	}
-	user.log.Info().
+	user.log.Debug().
 		Int("total", len(presences)).
 		Int("applied", applied).
 		Int("skipped_no_puppet", skippedNoPuppet).
