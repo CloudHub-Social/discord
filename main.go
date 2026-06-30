@@ -231,6 +231,16 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		textToSend = string(runes[:discordCustomStatusMaxRunes])
 	}
 
+	// Skip the Discord WebSocket update if nothing actually changed. Matrix
+	// clients send presence pings frequently; without this guard each ping
+	// generates a Discord opcode-3 message, which looks like bot activity.
+	user.presenceLock.Lock()
+	unchanged := user.lastSentDiscordStatus == discordStatus && user.lastSentDiscordStatusText == textToSend
+	user.presenceLock.Unlock()
+	if unchanged {
+		return
+	}
+
 	var activities []*discordgo.Activity
 	if textToSend != "" {
 		activities = []*discordgo.Activity{{
@@ -264,6 +274,8 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		user.matrixPresenceSetAt = time.Now()
 		user.lastSentToDiscordStatus = discordStatus
 		user.lastSentToDiscordText = textToSend
+		user.lastSentDiscordStatus = discordStatus
+		user.lastSentDiscordStatusText = textToSend
 		user.presenceLock.Unlock()
 		br.ZLog.Debug().
 			Str("user_id", evt.Sender.String()).

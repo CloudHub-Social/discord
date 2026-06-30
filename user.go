@@ -89,6 +89,14 @@ type User struct {
 	lastDiscordStatusText string
 	matrixStatusEverSet   bool
 
+	// lastSentDiscordStatus and lastSentDiscordStatusText track what was most
+	// recently sent to Discord via UpdateStatusComplex. Used to suppress
+	// redundant WebSocket status updates when the effective status hasn't
+	// changed (Matrix clients send presence pings frequently, and each one
+	// would otherwise generate a Discord opcode-3 message).
+	lastSentDiscordStatus     string
+	lastSentDiscordStatusText string
+
 	// presenceCache maps Discord user IDs to their last known non-offline
 	// Matrix presence state. The keepalive goroutine re-sends these every
 	// presenceKeepaliveInterval so Synapse does not expire ghost users'
@@ -601,6 +609,8 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastDiscordStatusText = ""
 	user.lastMatrixStatusText = ""
 	user.matrixStatusEverSet = false
+	user.lastSentDiscordStatus = ""
+	user.lastSentDiscordStatusText = ""
 	user.discordPresenceSetAt = time.Time{}
 	user.matrixPresenceSetAt = time.Time{}
 	user.lastSentToDiscordStatus = ""
@@ -901,6 +911,13 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.bridgeStateLock.Lock()
 	user.wasLoggedOut = false
 	user.bridgeStateLock.Unlock()
+	// Clear the sent-presence dedup cache so the first Matrix presence ping
+	// after a reconnect always reaches Discord (the new gateway session starts
+	// without this Matrix-derived status).
+	user.presenceLock.Lock()
+	user.lastSentDiscordStatus = ""
+	user.lastSentDiscordStatusText = ""
+	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
 		// Write DiscordID under user.Lock BEFORE taking usersLock. Logout() holds
@@ -1015,6 +1032,12 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 
 func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	user.log.Debug().Msg("Discord connection resumed")
+	// Clear the dedup cache so the first presence ping after a resume re-sends
+	// the current status to Discord (the resumed session may have lost it).
+	user.presenceLock.Lock()
+	user.lastSentDiscordStatus = ""
+	user.lastSentDiscordStatusText = ""
+	user.presenceLock.Unlock()
 	user.subscribeGuilds(0 * time.Second)
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
