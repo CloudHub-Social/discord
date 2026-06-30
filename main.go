@@ -245,10 +245,15 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		textToSend = string(runes[:discordCustomStatusMaxRunes])
 	}
 
-	// Presence sync disabled: don't mirror the Matrix online state. opcode 3 still
-	// requires a state, so assert "online" — the update then only delivers the
-	// custom status text (this is the unavoidable cost of carrying text on Discord).
+	// Presence sync disabled (status-only mode): don't mirror the Matrix online
+	// state. opcode 3 still requires a state, so we assert "online" — but only when
+	// there is actually status text to deliver. Otherwise an ordinary presence ping
+	// (empty/unchanged status_msg) would make an invisible/offline account visible,
+	// so skip the update entirely when there is nothing to carry.
 	if !pSync {
+		if textToSend == "" {
+			return
+		}
 		discordStatus = string(discordgo.StatusOnline)
 	}
 
