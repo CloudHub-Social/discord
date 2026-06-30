@@ -2636,31 +2636,100 @@ func (user *User) flushPendingDiscordPresence() {
 // suppression that applyPresence and HandleMatrixPresence rely on. Must be
 // called without presenceLock held.
 func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
-	// Three-way activities behavior, because opcode 3 rewrites state and
-	// activities together:
-	//   - statusText != ""     → set the custom status to that text.
-	//   - clearStatus == true  → empty slice ([]) explicitly clears the custom status.
-	//   - otherwise (nil)      → "don't change activities", preserving a game/Spotify
-	//                            session and any existing custom status.
+	// The custom-status TEXT and the presence STATE (online/idle/dnd/invisible)
+	// are delivered through two different channels, and the choice depends on the
+	// token type:
+	//
+	//   - User tokens (sess.IsUser): custom status is NOT a gateway activity. A
+	//     real Discord client sets it via REST (PATCH users/@me/settings ->
+	//     custom_status). If we instead stuff a Custom Status activity into the
+	//     opcode-3 payload, Discord rejects the whole presence update — which
+	//     silently drops the online/idle/dnd state change too. That is the root
+	//     cause of "set DND with a custom message in Charm and nothing applies".
+	//     So for user tokens we send STATE over opcode 3 with NO activity, and
+	//     set the TEXT over REST below.
+	//
+	//   - Bot tokens: bots have no custom status; the historical opcode-3 Custom
+	//     Status activity is the only path. Keep that behavior to avoid regressing
+	//     bot setups (the activity is harmless for bots even though it does little).
 	var activities []*discordgo.Activity
-	if statusText != "" {
-		activities = []*discordgo.Activity{{
-			Name:  "Custom Status",
-			Type:  discordgo.ActivityTypeCustom,
-			State: statusText,
-		}}
-	} else if clearStatus {
-		activities = []*discordgo.Activity{}
+	if !sess.IsUser {
+		// Bot path: three-way activities behavior, because opcode 3 rewrites
+		// state and activities together:
+		//   - statusText != ""     → set the custom status to that text.
+		//   - clearStatus == true  → empty slice ([]) explicitly clears it.
+		//   - otherwise (nil)      → "don't change activities", preserving a
+		//                            game/Spotify session and existing status.
+		if statusText != "" {
+			activities = []*discordgo.Activity{{
+				Name:  "Custom Status",
+				Type:  discordgo.ActivityTypeCustom,
+				State: statusText,
+			}}
+		} else if clearStatus {
+			activities = []*discordgo.Activity{}
+		}
 	}
-	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
+	// Render idle/away. Discord only displays a session as idle when the
+	// opcode-3 payload carries afk=true and a non-nil "since" (epoch ms);
+	// without these, StatusIdle alone is treated as active. Note this is
+	// best-effort for "away even while active": Discord aggregates presence
+	// across a user's clients, so another active client of the same account can
+	// still mask this session-level idle in what others observe.
+	usd := discordgo.UpdateStatusData{
 		Status:     status,
 		Activities: activities,
-	})
+	}
+	if status == string(discordgo.StatusIdle) {
+		since := int(time.Now().UnixMilli())
+		usd.IdleSince = &since
+		usd.AFK = true
+	}
+	err := sess.UpdateStatusComplex(usd)
 	if err != nil {
 		user.log.Warn().Err(err).
 			Str("discord_status", status).
 			Msg("Failed to update Discord status from Matrix presence")
 		return
+	}
+	// User-token custom status goes over REST, decoupled from the state update
+	// above so a custom-status failure never takes down the presence state.
+	// Only PATCH when the text/clear actually changed from what we last pushed,
+	// so a stream of Matrix presence pings does not spam the settings endpoint.
+	//   - non-empty text → set custom_status.text
+	//   - explicit clear → custom_status: null
+	//   - preserve (empty text, not a clear) → leave Discord's current status as-is
+	if sess.IsUser && (statusText != "" || clearStatus) {
+		user.presenceLock.Lock()
+		textChanged := statusText != user.lastSentDiscordStatusText ||
+			clearStatus != user.lastSentDiscordClear
+		user.presenceLock.Unlock()
+		if textChanged {
+			var customStatus interface{}
+			if clearStatus {
+				customStatus = nil
+			} else {
+				customStatus = map[string]interface{}{
+					"text":       statusText,
+					"emoji_id":   nil,
+					"emoji_name": nil,
+					"expires_at": nil,
+				}
+			}
+			body := map[string]interface{}{"custom_status": customStatus}
+			_, restErr := sess.RequestWithBucketID(
+				"PATCH", discordgo.EndpointUserSettings("@me"), body,
+				discordgo.EndpointUserSettings(""))
+			if restErr != nil {
+				// Warn but continue: the presence STATE already applied above,
+				// and we still record dedup state so we don't hammer a
+				// persistently-failing endpoint on every ping.
+				user.log.Warn().Err(restErr).
+					Str("status_text", statusText).
+					Bool("clear", clearStatus).
+					Msg("Failed to set Discord custom status via REST from Matrix presence")
+			}
+		}
 	}
 	now := time.Now()
 	user.presenceLock.Lock()
