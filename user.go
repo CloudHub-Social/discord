@@ -1727,6 +1727,7 @@ func (user *User) startPresenceKeepalive() {
 	user.lastOwnMatrixStatusMsg = ""
 	user.presenceLock.Unlock()
 
+	user.log.Info().Msg("Starting presence keepalive goroutine")
 	go user.runPresenceKeepalive(ctx)
 }
 
@@ -1745,6 +1746,7 @@ func (user *User) runPresenceKeepalive(ctx context.Context) {
 			}
 			user.presenceLock.Unlock()
 
+			user.log.Info().Int("count", len(snapshot)).Msg("Presence keepalive tick: refreshing cached presences")
 			for discordID, entry := range snapshot {
 				puppet := user.bridge.GetPuppetByIDIfExists(discordID)
 				if puppet == nil {
@@ -1785,6 +1787,7 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 	// shared across many guilds would trigger many concurrent Matrix presence PUTs
 	// against the same puppet, hitting rate limits and leaving statuses stale.
 	seen := make(map[string]struct{}, len(presences))
+	var applied, skippedNoPuppet, skippedEmptyStatus int
 	for _, p := range presences {
 		if p.User == nil {
 			continue
@@ -1798,6 +1801,7 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 		// discordStatusToMatrix, which would actively clear a presence that
 		// was just set. presenceUpdateHandler has the same guard.
 		if p.Status == "" {
+			skippedEmptyStatus++
 			continue
 		}
 		// Seed the Discord status cache for the bridge user's own presence so
@@ -1808,8 +1812,20 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 			user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
 			user.presenceLock.Unlock()
 		}
+		puppet := user.bridge.GetPuppetByIDIfExists(p.User.ID)
+		if puppet == nil {
+			skippedNoPuppet++
+			continue
+		}
+		applied++
 		user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 	}
+	user.log.Info().
+		Int("total", len(presences)).
+		Int("applied", applied).
+		Int("skipped_no_puppet", skippedNoPuppet).
+		Int("skipped_empty_status", skippedEmptyStatus).
+		Msg("Seeded Discord presences")
 }
 
 // discordCustomStatusText extracts the State field from the first
