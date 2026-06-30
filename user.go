@@ -54,6 +54,14 @@ type User struct {
 
 	Session *discordgo.Session
 
+	// subscribingGuilds guards against overlapping subscribeGuilds runs. Both
+	// readyHandler (connect) and resumeHandler (resume) launch subscribeGuilds,
+	// and on a resume the *Session pointer is unchanged, so the in-loop session
+	// re-check does not stop a stale run. Without this guard a flapping
+	// connection can stack concurrent goroutines, each emitting opcode-14
+	// commands, and blow Discord's 120-commands/60s gateway budget.
+	subscribingGuilds atomic.Bool
+
 	BridgeState     *bridge.BridgeStateQueue
 	bridgeStateLock sync.Mutex
 	wasDisconnected bool
@@ -1118,12 +1126,26 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 	// Snapshot the session under the user lock. Logout() holds user.Lock()
 	// while setting Session to nil, so reading it without the lock is a data
 	// race and can produce a nil dereference inside discordgo's SubscribeGuild.
+	// Subscribing to guilds is what makes Discord deliver presence (and large-guild
+	// typing) via opcode 14. Upstream never does this; on user tokens it is a
+	// self-bot fingerprint that risks a 4004 token invalidation, so it is gated
+	// behind the Discord→Matrix presence option and off by default.
+	if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+		return
+	}
 	user.Lock()
 	sess := user.Session
 	user.Unlock()
 	if sess == nil || !sess.IsUser {
 		return
 	}
+	// Prevent overlapping runs (connect + repeated resumes) from stacking
+	// opcode-14 commands. A run already in progress is subscribing to every
+	// guild, so a concurrent invocation has nothing to add.
+	if !user.subscribingGuilds.CompareAndSwap(false, true) {
+		return
+	}
+	defer user.subscribingGuilds.Store(false)
 	for _, guildMeta := range sess.State.Guilds {
 		guild := user.bridge.GetGuildByID(guildMeta.ID, false)
 		if guild != nil && guild.MXID != "" {
@@ -2339,6 +2361,12 @@ func (user *User) seedPresences(presences []*discordgo.Presence) {
 			user.presenceLock.Unlock()
 			continue
 		}
+		// Reflecting other users' presence onto Matrix is the gated Discord→Matrix
+		// direction. Own-account caching above still runs so the Matrix→Discord
+		// fallback text stays seeded even when this direction is off.
+		if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+			continue
+		}
 		puppet := user.bridge.GetPuppetByIDIfExists(p.User.ID)
 		if puppet == nil {
 			skippedNoPuppet++
@@ -2390,6 +2418,12 @@ func (user *User) presenceUpdateHandler(p *discordgo.PresenceUpdate) {
 		user.presenceLock.Lock()
 		user.lastDiscordStatusText = discordCustomStatusText(p.Activities)
 		user.presenceLock.Unlock()
+	}
+	// Own-account status is cached above unconditionally because the Matrix→Discord
+	// direction relies on it for its fallback text. Reflecting presence onto Matrix
+	// (for own or other users) is the Discord→Matrix direction and is gated.
+	if !user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
+		return
 	}
 	user.applyPresence(p.User.ID, p.Status, discordCustomStatusText(p.Activities))
 }
@@ -2547,7 +2581,7 @@ func (user *User) bridgeGuild(guildID string, everything bool) error {
 	}
 	guild.Update()
 
-	if user.Session.IsUser {
+	if user.Session.IsUser && user.bridge.Config.Bridge.SyncDiscordPresenceToMatrix {
 		log.Debug().Msg("Subscribing to guild after bridging")
 		err = user.Session.SubscribeGuild(discordgo.GuildSubscribeData{
 			GuildID:    guild.ID,
