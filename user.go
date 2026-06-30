@@ -991,12 +991,27 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 }
 
 func (user *User) subscribeGuilds(delay time.Duration) {
-	if !user.Session.IsUser {
+	// Snapshot the session under the user lock. Logout() holds user.Lock()
+	// while setting Session to nil, so reading it without the lock is a data
+	// race and can produce a nil dereference inside discordgo's SubscribeGuild.
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess == nil || !sess.IsUser {
 		return
 	}
-	for _, guildMeta := range user.Session.State.Guilds {
+	for _, guildMeta := range sess.State.Guilds {
 		guild := user.bridge.GetGuildByID(guildMeta.ID, false)
 		if guild != nil && guild.MXID != "" {
+			// Re-check the session each iteration: the WebSocket connection can
+			// close while we sleep between guilds, which makes SubscribeGuild
+			// panic rather than return an error.
+			user.Lock()
+			current := user.Session
+			user.Unlock()
+			if current != sess {
+				return
+			}
 			// Build a channels map from bridged portals in this guild.
 			// Discord only sends PRESENCE_UPDATE events for large guilds when you
 			// subscribe to specific channels with member-list ranges; without this,
@@ -1021,7 +1036,7 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 				Threads:    true,
 				Channels:   channels,
 			}
-			err := user.Session.SubscribeGuild(dat)
+			err := sess.SubscribeGuild(dat)
 			if err != nil {
 				user.log.Warn().Err(err).Str("guild_id", guild.ID).Msg("Failed to subscribe to guild")
 			}
