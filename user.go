@@ -1003,9 +1003,8 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 	for _, guildMeta := range sess.State.Guilds {
 		guild := user.bridge.GetGuildByID(guildMeta.ID, false)
 		if guild != nil && guild.MXID != "" {
-			// Re-check the session each iteration: the WebSocket connection can
-			// close while we sleep between guilds, which makes SubscribeGuild
-			// panic rather than return an error.
+			// Re-check the session each iteration: Logout() can replace
+			// user.Session with nil while we sleep between guilds.
 			user.Lock()
 			current := user.Session
 			user.Unlock()
@@ -1039,6 +1038,9 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 			err := sess.SubscribeGuild(dat)
 			if err != nil {
 				user.log.Warn().Err(err).Str("guild_id", guild.ID).Msg("Failed to subscribe to guild")
+				if errors.Is(err, discordgo.ErrWSNotFound) {
+					return
+				}
 			}
 			time.Sleep(delay)
 		}
