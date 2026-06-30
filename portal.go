@@ -1540,6 +1540,9 @@ func (portal *Portal) handleMatrixMessage(sender *User, evt *event.Event) {
 		go portal.sendMessageMetrics(evt, errUserNotLoggedIn, "Ignoring")
 		return
 	}
+	// Sending a message means the user is active in this room; refresh the
+	// guild's on-demand presence subscription (no-op for DMs / other modes).
+	sender.touchGuildPresence(portal.GuildID)
 	isWebhookSend := sess == nil
 
 	if portal.IsPrivateChat() {
@@ -2189,6 +2192,9 @@ func (portal *Portal) HandleMatrixReadReceipt(brUser bridge.User, eventID id.Eve
 	if sender.Session == nil {
 		return
 	}
+	// A read receipt means the user is actively looking at this room, so refresh
+	// the guild's on-demand presence subscription (no-op for DMs / other modes).
+	sender.touchGuildPresence(portal.GuildID)
 	var thread *Thread
 	discordThreadID := ""
 	if receipt.ThreadID != "" && receipt.ThreadID != event.ReadReceiptThreadMain {

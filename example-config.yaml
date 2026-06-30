@@ -187,6 +187,16 @@ bridge:
     # guild subscriptions. Note: disabling this also disables Discord→Matrix typing
     # notifications for large guilds, since both use the same opcode-14 subscription.
     sync_discord_presence_to_matrix: false
+    # When sync_discord_presence_to_matrix is enabled, should the bridge subscribe to
+    # every bridged guild on connect (true), or only on demand (false, default)?
+    # On-demand mode subscribes a guild for presence only when a Matrix client is active
+    # in one of its rooms (read receipt or outgoing message), keeps at most
+    # discord_presence_active_limit guilds subscribed, and releases idle ones — this
+    # mirrors the official client and is a weaker self-bot signal on user tokens.
+    discord_presence_subscribe_all: false
+    # Maximum number of guilds kept subscribed at once in on-demand mode. The
+    # least-recently-active guild is released when the limit is exceeded. <= 0 uses the default.
+    discord_presence_active_limit: 10
     # Proxy for Discord connections
     proxy:
     # Should mxc uris copied from Discord be cached?
