@@ -2685,54 +2685,40 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 		usd.IdleSince = &since
 		usd.AFK = true
 	}
-	err := sess.UpdateStatusComplex(usd)
-	if err != nil {
-		user.log.Warn().Err(err).
-			Str("discord_status", status).
-			Msg("Failed to update Discord status from Matrix presence")
-		return
-	}
-	// User-token custom status goes over REST, decoupled from the state update
-	// above so a custom-status failure never takes down the presence state.
-	// Only PATCH when the text/clear actually changed from what we last pushed,
-	// so a stream of Matrix presence pings does not spam the settings endpoint.
+
+	// Pre-arm the dedup and echo-suppression state *before* any network call,
+	// mirroring the pre-arm/restore pattern in applyPresence. This is load-bearing
+	// for two reasons:
+	//   1. REST dedup race: textChanged is computed from lastSentDiscord* under the
+	//      lock. If we only wrote those fields after the network calls, two
+	//      concurrent sends could both observe the old values, both pass the
+	//      changed-check, and both PATCH the settings endpoint. Arming up front
+	//      makes the second send see the first's intent and skip the redundant PATCH.
+	//   2. Echo suppression: the gateway state update produces our own
+	//      PRESENCE_UPDATE echo, which can arrive (and be handled by applyPresence)
+	//      before we'd otherwise have set matrixPresenceSetAt / lastSentToDiscord*.
+	//      If those aren't armed yet, applyPresence's own-account echo check fails
+	//      to match and writes the echo back to Matrix, clobbering Charm's [dnd]
+	//      marker. Arming before the send closes that window.
+	// We capture the previous values so a failed gateway send can roll them back
+	// (so a retry isn't deduped away). We must not hold presenceLock across any
+	// network call.
+	now := time.Now()
+	user.presenceLock.Lock()
+	prevMatrixPresenceSetAt := user.matrixPresenceSetAt
+	prevSentToStatus := user.lastSentToDiscordStatus
+	prevSentToText := user.lastSentToDiscordText
+	prevSentStatus := user.lastSentDiscordStatus
+	prevSentText := user.lastSentDiscordStatusText
+	prevClear := user.lastSentDiscordClear
+	// Decide whether the user-token REST custom-status PATCH is needed, against
+	// the *previous* armed text/clear so a stream of presence pings doesn't spam
+	// the settings endpoint.
 	//   - non-empty text → set custom_status.text
 	//   - explicit clear → custom_status: null
 	//   - preserve (empty text, not a clear) → leave Discord's current status as-is
-	if sess.IsUser && (statusText != "" || clearStatus) {
-		user.presenceLock.Lock()
-		textChanged := statusText != user.lastSentDiscordStatusText ||
-			clearStatus != user.lastSentDiscordClear
-		user.presenceLock.Unlock()
-		if textChanged {
-			var customStatus interface{}
-			if clearStatus {
-				customStatus = nil
-			} else {
-				customStatus = map[string]interface{}{
-					"text":       statusText,
-					"emoji_id":   nil,
-					"emoji_name": nil,
-					"expires_at": nil,
-				}
-			}
-			body := map[string]interface{}{"custom_status": customStatus}
-			_, restErr := sess.RequestWithBucketID(
-				"PATCH", discordgo.EndpointUserSettings("@me"), body,
-				discordgo.EndpointUserSettings(""))
-			if restErr != nil {
-				// Warn but continue: the presence STATE already applied above,
-				// and we still record dedup state so we don't hammer a
-				// persistently-failing endpoint on every ping.
-				user.log.Warn().Err(restErr).
-					Str("status_text", statusText).
-					Bool("clear", clearStatus).
-					Msg("Failed to set Discord custom status via REST from Matrix presence")
-			}
-		}
-	}
-	now := time.Now()
-	user.presenceLock.Lock()
+	restNeeded := sess.IsUser && (statusText != "" || clearStatus) &&
+		(statusText != prevSentText || clearStatus != prevClear)
 	user.matrixPresenceSetAt = now
 	user.lastSentToDiscordStatus = status
 	user.lastSentToDiscordText = statusText
@@ -2740,6 +2726,50 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 	user.lastSentDiscordStatusText = statusText
 	user.lastSentDiscordClear = clearStatus
 	user.presenceLock.Unlock()
+
+	if err := sess.UpdateStatusComplex(usd); err != nil {
+		user.log.Warn().Err(err).
+			Str("discord_status", status).
+			Msg("Failed to update Discord status from Matrix presence")
+		// Roll back the armed state so a retry isn't deduped away.
+		user.presenceLock.Lock()
+		user.matrixPresenceSetAt = prevMatrixPresenceSetAt
+		user.lastSentToDiscordStatus = prevSentToStatus
+		user.lastSentToDiscordText = prevSentToText
+		user.lastSentDiscordStatus = prevSentStatus
+		user.lastSentDiscordStatusText = prevSentText
+		user.lastSentDiscordClear = prevClear
+		user.presenceLock.Unlock()
+		return
+	}
+
+	// User-token custom status goes over REST, decoupled from the state update
+	// above so a custom-status failure never takes down the presence state.
+	if restNeeded {
+		var customStatus interface{}
+		if clearStatus {
+			customStatus = nil
+		} else {
+			customStatus = map[string]interface{}{
+				"text":       statusText,
+				"emoji_id":   nil,
+				"emoji_name": nil,
+				"expires_at": nil,
+			}
+		}
+		body := map[string]interface{}{"custom_status": customStatus}
+		if _, restErr := sess.RequestWithBucketID(
+			"PATCH", discordgo.EndpointUserSettings("@me"), body,
+			discordgo.EndpointUserSettings("")); restErr != nil {
+			// Warn but keep the armed dedup state: the presence STATE already
+			// applied above, and not rolling back means we don't hammer a
+			// persistently-failing endpoint on every subsequent ping.
+			user.log.Warn().Err(restErr).
+				Str("status_text", statusText).
+				Bool("clear", clearStatus).
+				Msg("Failed to set Discord custom status via REST from Matrix presence")
+		}
+	}
 	user.log.Debug().
 		Str("discord_status", status).
 		Str("status_text", statusText).
