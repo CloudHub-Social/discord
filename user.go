@@ -1085,7 +1085,13 @@ func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.presenceLock.Unlock()
-	user.subscribeGuilds(0 * time.Second)
+	// Re-subscribe with the same pacing as the initial connect (subscribeGuilds
+	// emits one op-14 GuildSubscribe per bridged guild). A 0-delay burst here
+	// could blow Discord's 120-commands-per-60s gateway budget for a user in
+	// many guilds — especially on a flapping connection that resumes repeatedly
+	// — risking a 4008 rate-limit close and reconnect churn. Run it in a
+	// goroutine so the resume handler isn't blocked for the duration.
+	go user.subscribeGuilds(2 * time.Second)
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
 
