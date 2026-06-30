@@ -694,6 +694,7 @@ func (user *User) Logout(isOverwriting bool) {
 	user.matrixStatusEverSet = false
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
+	user.lastSentDiscordClear = false
 	user.discordPresenceSetAt = time.Time{}
 	user.matrixPresenceSetAt = time.Time{}
 	user.lastSentToDiscordStatus = ""
@@ -706,6 +707,7 @@ func (user *User) Logout(isOverwriting bool) {
 	}
 	user.pendingDiscordStatus = ""
 	user.pendingDiscordStatusText = ""
+	user.pendingDiscordClear = false
 	user.lastDiscordPresenceSentAt = time.Time{}
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
@@ -1079,6 +1081,7 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.presenceLock.Lock()
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
+	user.lastSentDiscordClear = false
 	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
@@ -1550,6 +1553,7 @@ func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	user.presenceLock.Lock()
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
+	user.lastSentDiscordClear = false
 	user.presenceLock.Unlock()
 	// Re-subscribe with the same pacing as the initial connect (subscribeGuilds
 	// emits one op-14 GuildSubscribe per bridged guild). A 0-delay burst here
