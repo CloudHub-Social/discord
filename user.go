@@ -1486,7 +1486,11 @@ func (user *User) armReadyWatchdog() {
 	if user.manualDisconnect || user.sessionReady {
 		return
 	}
-	user.readyWatchdog = time.AfterFunc(readyTimeout, user.onReadyTimeout)
+	// Capture the session this watchdog guards so a stale timer for an old
+	// session can't close a newer one that has since replaced it. armReadyWatchdog
+	// is called from connect() under user.Lock, so user.Session is stable here.
+	guarded := user.Session
+	user.readyWatchdog = time.AfterFunc(readyTimeout, func() { user.onReadyTimeout(guarded) })
 }
 
 // onConnectionEstablished runs the success cleanup shared by READY and RESUMED:
@@ -1520,7 +1524,7 @@ func (user *User) disarmReadyWatchdog() {
 // onReadyTimeout fires when a session opened but never reached READY. It closes
 // the session so discordgo emits a Disconnect, which routes the failure through
 // disconnectedHandler -> scheduleReconnect (capped backoff).
-func (user *User) onReadyTimeout() {
+func (user *User) onReadyTimeout(guarded *discordgo.Session) {
 	user.reconnectLock.Lock()
 	user.readyWatchdog = nil
 	// Bail if the handshake completed (READY/RESUMED) concurrently with this
@@ -1532,13 +1536,17 @@ func (user *User) onReadyTimeout() {
 	if bail {
 		return
 	}
-	user.log.Warn().Msg("No READY received after connect; closing session to trigger backoff reconnect")
+	// Only close the session this watchdog was armed for. If a newer session has
+	// since replaced it (reconnect after this one dropped), the stale timer must
+	// not touch the new, possibly-healthy session.
 	user.Lock()
-	sess := user.Session
+	current := user.Session
 	user.Unlock()
-	if sess != nil {
-		_ = sess.Close()
+	if current != guarded {
+		return
 	}
+	user.log.Warn().Msg("No READY received after connect; closing session to trigger backoff reconnect")
+	_ = guarded.Close()
 }
 
 // scheduleReconnect arms a single backoff timer to reconnect the gateway. The
