@@ -58,6 +58,12 @@ type BridgeConfig struct {
 	UseDiscordCDNUpload         bool `yaml:"use_discord_cdn_upload"`
 	ForbidDMingStrangers        bool `yaml:"forbid_dming_strangers"`
 
+	// SyncMatrixPresenceToDiscord controls whether Matrix presence/status is
+	// forwarded to Discord (opcode 3). Discord rate-limits presence updates to
+	// 5/min and penalizes user tokens that exceed it (close code 4004), so this
+	// defaults to off. When enabled, updates are deduplicated and rate-limited.
+	SyncMatrixPresenceToDiscord bool `yaml:"sync_matrix_presence_to_discord"`
+
 	Proxy string `yaml:"proxy"`
 
 	CacheMedia  string      `yaml:"cache_media"`
