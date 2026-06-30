@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"go.mau.fi/util/configupgrade"
@@ -172,13 +173,38 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		}
 	}
 
+	// Suppress m.presence echoes that Synapse delivers via push_ephemeral when
+	// the bridge itself writes own-user presence via applyPresence (Discord→Matrix
+	// own-user sync). Without suppression the echo triggers UpdateStatusComplex and
+	// clobbers the Discord status. Echo check happens BEFORE state mutation so an
+	// echo never sets matrixStatusEverSet or lastMatrixStatusText — those flags must
+	// only advance on genuine Matrix-client changes, not bridge self-writes.
+	//
+	// Value matching narrows the suppression window: a genuine Charm change within
+	// the 2s window only matches when both presence and raw status_msg equal what
+	// the bridge last wrote, preventing deliberate user changes from being dropped.
+	user.presenceLock.Lock()
+	suppressUntil := user.discordPresenceSetAt.Add(2 * time.Second)
+	expectedEchoPresence := user.lastOwnMatrixPresence
+	expectedEchoStatus := user.lastOwnMatrixStatusMsg
+	user.presenceLock.Unlock()
+	if time.Now().Before(suppressUntil) &&
+		content.Presence == expectedEchoPresence &&
+		rawStatusText == expectedEchoStatus {
+		return
+	}
+
 	// Determine the status text to send to Discord using last-writer-wins
 	// with intentional-clear detection:
 	//
 	//  - statusText != "": Matrix set a non-empty text (after prefix stripping) —
 	//    cache it and use it.
-	//  - statusText == "" && rawStatusText == "" && matrixStatusEverSet: Matrix
-	//    previously had a status and now explicitly sends empty — intentional clear.
+	//  - statusText == "" && rawStatusText == "" && (matrixStatusEverSet ||
+	//    lastOwnMatrixStatusMsg != ""): Matrix previously had a status and now
+	//    explicitly sends empty — intentional clear. The lastOwnMatrixStatusMsg
+	//    guard catches the case where the Matrix account was set by applyPresence
+	//    rather than directly by a Charm user action, so a clear from Charm after
+	//    a Discord-originated status is still forwarded correctly.
 	//  - otherwise (never set, or raw had content that stripped to empty e.g. bare
 	//    "[dnd]"): fall back to the last Discord-side status so we don't clobber it.
 	user.presenceLock.Lock()
@@ -187,11 +213,12 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		user.lastMatrixStatusText = statusText
 		user.matrixStatusEverSet = true
 		textToSend = statusText
-	} else if rawStatusText == "" && user.matrixStatusEverSet {
+	} else if rawStatusText == "" && (user.matrixStatusEverSet || user.lastOwnMatrixStatusMsg != "") {
 		// Intentional clear: truly empty status_msg after Matrix previously set one.
 		// Only reset the Matrix-side cache — lastDiscordStatusText is Discord's own
 		// status and must remain as a fallback for bare DND and presence-only updates.
 		user.lastMatrixStatusText = ""
+		user.matrixStatusEverSet = false
 		textToSend = ""
 	} else {
 		// Never set, or raw was a bare DND prefix with no custom text — preserve Discord's status.
@@ -225,9 +252,12 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			Type:  discordgo.ActivityTypeCustom,
 			State: textToSend,
 		}}
-	} else {
-		activities = make([]*discordgo.Activity, 0)
 	}
+	// When there is no custom status text to set, leave activities as nil so
+	// Discord serializes it as JSON null ("don't change activities") rather than
+	// an empty array ("clear all activities"). Sending [] would erase the user's
+	// active game, rich presence, or Spotify session whenever they change their
+	// Matrix online/idle/offline state without a custom status text.
 
 	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
 		Status:     discordStatus,
@@ -239,6 +269,16 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			Str("matrix_presence", string(content.Presence)).
 			Msg("Failed to update Discord status from Matrix presence")
 	} else {
+		// Record when and what we last forwarded to Discord so applyPresence
+		// can detect and suppress the resulting gateway echo. Storing the
+		// actual status/text values narrows the echo window: a genuine
+		// Discord status change within the 2-second window is only suppressed
+		// when its values match what we just sent.
+		user.presenceLock.Lock()
+		user.matrixPresenceSetAt = time.Now()
+		user.lastSentToDiscordStatus = discordStatus
+		user.lastSentToDiscordText = textToSend
+		user.presenceLock.Unlock()
 		br.ZLog.Debug().
 			Str("user_id", evt.Sender.String()).
 			Str("matrix_presence", string(content.Presence)).
