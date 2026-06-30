@@ -151,8 +151,16 @@ func DoUpgrade(helper *up.Helper) {
 func migratePresenceStatusFlag(helper *up.Helper, statusKey, presenceKey string) {
 	if _, ok := helper.Get(up.Bool, "bridge", statusKey); ok {
 		helper.Copy(up.Bool, "bridge", statusKey)
-	} else if val, ok := helper.Get(up.Bool, "bridge", presenceKey); ok {
-		helper.Set(up.Bool, val, "bridge", statusKey)
+		return
+	}
+	// Status key absent: inherit the presence flag's value. Normalize to a canonical
+	// boolean literal rather than forwarding the raw string from Get.
+	if val, ok := helper.Get(up.Bool, "bridge", presenceKey); ok {
+		literal := "false"
+		if val == "true" {
+			literal = "true"
+		}
+		helper.Set(up.Bool, literal, "bridge", statusKey)
 	}
 }
 

@@ -2388,39 +2388,42 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		writeText = cached.statusMsg
 	}
 
-	// Skip when nothing we'd write differs from what we last wrote (this naturally
-	// lets an explicit clear through: writeText "" vs a cached non-empty statusMsg).
-	if hadCache && matrixPresence == cached.presence && writeText == cached.statusMsg {
-		return
-	}
 	// First write with nothing meaningful (no state to mirror and no text): don't
 	// assert "online" for an otherwise empty update.
 	if !hadCache && !syncingState && writeText == "" {
 		return
 	}
-	err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, writeText)
-	if err != nil {
-		user.log.Warn().Err(err).
-			Str("discord_user_id", userID).
-			Str("discord_status", string(status)).
-			Msg("Failed to set Matrix presence for Discord user")
-	} else {
-		user.log.Debug().
-			Str("discord_user_id", userID).
-			Str("discord_status", string(status)).
-			Str("matrix_presence", string(matrixPresence)).
-			Str("status_text", writeText).
-			Msg("Bridged Discord presence to Matrix")
+	// Write the ghost puppet only when something we'd write differs from what we
+	// last wrote (an explicit clear passes naturally: writeText "" vs a cached
+	// non-empty statusMsg). This is scoped to the ghost write only — we still fall
+	// through to the double-puppet section below, which has its own dedup/retry, so
+	// a previously-failed own-account PUT can still be retried on a repeat event.
+	ghostChanged := !hadCache || matrixPresence != cached.presence || writeText != cached.statusMsg
+	if ghostChanged {
+		err := setMatrixPresence(puppet.DefaultIntent(), matrixPresence, writeText)
+		if err != nil {
+			user.log.Warn().Err(err).
+				Str("discord_user_id", userID).
+				Str("discord_status", string(status)).
+				Msg("Failed to set Matrix presence for Discord user")
+		} else {
+			user.log.Debug().
+				Str("discord_user_id", userID).
+				Str("discord_status", string(status)).
+				Str("matrix_presence", string(matrixPresence)).
+				Str("status_text", writeText).
+				Msg("Bridged Discord presence to Matrix")
+		}
+		// Keep the keepalive cache in sync so that the background goroutine can
+		// re-send this presence before Synapse times out the ghost user.
+		user.presenceLock.Lock()
+		if matrixPresence == event.PresenceOffline {
+			delete(user.presenceCache, userID)
+		} else {
+			user.presenceCache[userID] = presenceCacheEntry{presence: matrixPresence, statusMsg: writeText}
+		}
+		user.presenceLock.Unlock()
 	}
-	// Keep the keepalive cache in sync so that the background goroutine can
-	// re-send this presence before Synapse times out the ghost user.
-	user.presenceLock.Lock()
-	if matrixPresence == event.PresenceOffline {
-		delete(user.presenceCache, userID)
-	} else {
-		user.presenceCache[userID] = presenceCacheEntry{presence: matrixPresence, statusMsg: writeText}
-	}
-	user.presenceLock.Unlock()
 	// When double puppeting is active, also update the real Matrix account so
 	// clients see the correct presence on the user's own identity, not just on
 	// the bridge ghost which may not be present in all rooms.
@@ -2472,25 +2475,28 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			// An event is treated as an echo only when the timestamp AND the
 			// Discord status/text match what HandleMatrixPresence just forwarded.
 			//
-			// A special case: when textToSend was "" (intentional Matrix status
-			// clear), HandleMatrixPresence sends activities=nil to Discord, which
-			// preserves the old Discord custom status instead of clearing it.
-			// Discord's resulting PRESENCE_UPDATE echo therefore contains the
-			// old custom status text, not "". We detect this by treating any
-			// echo as matching when lastSentToDiscordText == "" — the preserved
-			// text is never a new user-set value, so suppressing it is correct.
-			//
-			// The status is normalized so that an "offline" echo of a Matrix
-			// offline change matches the "invisible" we sent (see
-			// normalizeDiscordStatusForEcho); without this the echo is misread
-			// as a genuine change and overwrites the Matrix-side state.
 			// Echo detection compares the original Discord values (status,
 			// customStatusText) against what we last forwarded to Discord. The
 			// values written to the Matrix account are the split-adjusted
 			// matrixPresence/writeText, which is what the dedup cache tracks.
+			//
+			// Text matching:
+			//   - We last set/cleared the status (lastSentDiscordClear true, or a
+			//     non-empty text): require an exact match. After a clear we sent ""
+			//     to Discord, so a genuine new status ("X") will not match and is
+			//     correctly applied.
+			//   - We last sent a *preserve* (nil activities — lastSentToDiscordText
+			//     "" and not a clear): Discord's echo carries whatever custom status
+			//     it already had, which we don't know, so treat empty as a wildcard
+			//     to suppress our own presence-only echo.
+			//
+			// The status is normalized so that an "offline" echo of a Matrix offline
+			// change matches the "invisible" we sent (see normalizeDiscordStatusForEcho).
+			textMatches := customStatusText == user.lastSentToDiscordText ||
+				(user.lastSentToDiscordText == "" && !user.lastSentDiscordClear)
 			isEcho := time.Now().Before(user.matrixPresenceSetAt.Add(2*time.Second)) &&
 				normalizeDiscordStatusForEcho(string(status)) == normalizeDiscordStatusForEcho(user.lastSentToDiscordStatus) &&
-				(customStatusText == user.lastSentToDiscordText || user.lastSentToDiscordText == "")
+				textMatches
 			if isEcho {
 				// Advance the dedup cache even though we skip the write. Without
 				// this, a post-window rich-presence tick (game timer) with the same
@@ -2545,6 +2551,21 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 // non-empty statusText sets it. See sendPresenceToDiscord.
 func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
 	user.presenceLock.Lock()
+	// A preserve update (no status change: empty text, not a clear) must not cancel
+	// a status change that is already queued but not yet flushed. If there is an
+	// unsent queued status intent (pending differs from what was last sent), inherit
+	// it so a presence-only ping arriving before the debounce timer fires doesn't
+	// downgrade a pending clear/set back to "leave activities alone". When nothing
+	// is queued, keep this a genuine preserve (nil activities) so we don't re-send
+	// an already-applied custom status — which would wipe a game/Spotify session.
+	if statusText == "" && !clearStatus {
+		queuedUnsent := user.pendingDiscordStatusText != user.lastSentDiscordStatusText ||
+			user.pendingDiscordClear != user.lastSentDiscordClear
+		if queuedUnsent {
+			statusText = user.pendingDiscordStatusText
+			clearStatus = user.pendingDiscordClear
+		}
+	}
 	// Dedup: if the desired state already matches what Discord was last told,
 	// there is nothing to forward. Keep the pending target in sync so a timer
 	// that fires later flushes to current reality rather than a stale value.
