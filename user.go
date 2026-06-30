@@ -137,6 +137,20 @@ type User struct {
 	lastOwnMatrixPresence  event.Presence
 	lastOwnMatrixStatusMsg string
 
+	// Presence rate limiting (Matrix→Discord), protected by presenceLock.
+	// Discord invalidates user-account tokens that emit opcode-3 presence
+	// updates at machine cadence, and Matrix presence is a high-frequency
+	// signal (clients oscillate online/idle constantly). Forwarding is
+	// throttled to at most one update per presenceMinInterval: a change
+	// outside the cooldown is sent immediately, while changes inside it are
+	// coalesced into pendingDiscordStatus/Text and flushed by a single
+	// trailing timer (presenceDebounceTimer) when the cooldown expires.
+	// lastDiscordPresenceSentAt is when an opcode-3 update was last dispatched.
+	lastDiscordPresenceSentAt time.Time
+	presenceDebounceTimer     *time.Timer
+	pendingDiscordStatus      string
+	pendingDiscordStatusText  string
+
 	// stopKeepalive, when non-nil, cancels the presence keepalive goroutine.
 	// Protected by user.Lock().
 	stopKeepalive func()
@@ -307,6 +321,15 @@ type presenceCacheEntry struct {
 // ~5s and can override an explicitly-set presence if the virtual user's
 // last_user_sync_ts is very old; 10s re-asserts before a second sweep fires.
 const presenceKeepaliveInterval = 10 * time.Second
+
+// presenceMinInterval is the minimum time between opcode-3 presence updates
+// forwarded to Discord for a single user. HandleMatrixPresence can fire many
+// times per minute as the user's Matrix clients oscillate online/idle, and
+// Discord flags user-account tokens that update presence at machine cadence
+// (closing the gateway with 4004 / invalid auth). Throttling to one update per
+// minute keeps the bridge well under the anti-automation threshold; changes
+// arriving within the interval are coalesced and flushed by a trailing timer.
+const presenceMinInterval = 60 * time.Second
 
 func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 	user := &User{
@@ -617,6 +640,13 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastSentToDiscordText = ""
 	user.lastOwnMatrixPresence = ""
 	user.lastOwnMatrixStatusMsg = ""
+	if user.presenceDebounceTimer != nil {
+		user.presenceDebounceTimer.Stop()
+		user.presenceDebounceTimer = nil
+	}
+	user.pendingDiscordStatus = ""
+	user.pendingDiscordStatusText = ""
+	user.lastDiscordPresenceSentAt = time.Time{}
 	clear(user.presenceCache)
 	user.presenceLock.Unlock()
 	if user.stopKeepalive != nil {
@@ -1758,6 +1788,110 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 		// another active bridge user's double-puppeted account — skip to avoid an
 		// echo loop through HandleMatrixPresence on their Discord session.
 	}
+}
+
+// forwardPresenceToDiscord forwards a desired (status, statusText) presence to
+// the user's Discord session with content dedup and trailing-debounce rate
+// limiting, so the bridge never emits opcode-3 updates faster than
+// presenceMinInterval. A change outside the cooldown is sent immediately; a
+// change inside it is coalesced into pendingDiscordStatus/Text and dispatched
+// by a single trailing timer when the cooldown expires. Must be called without
+// presenceLock held; sess must be non-nil.
+func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, statusText string) {
+	user.presenceLock.Lock()
+	// Dedup: if the desired state already matches what Discord was last told,
+	// there is nothing to forward. Keep the pending target in sync so a timer
+	// that fires later flushes to current reality rather than a stale value.
+	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText {
+		user.pendingDiscordStatus = status
+		user.pendingDiscordStatusText = statusText
+		user.presenceLock.Unlock()
+		return
+	}
+	user.pendingDiscordStatus = status
+	user.pendingDiscordStatusText = statusText
+	// A trailing send is already scheduled: it will pick up the updated target.
+	if user.presenceDebounceTimer != nil {
+		user.presenceLock.Unlock()
+		return
+	}
+	if elapsed := time.Since(user.lastDiscordPresenceSentAt); elapsed < presenceMinInterval {
+		// Inside the cooldown: schedule a trailing flush for when it expires.
+		user.presenceDebounceTimer = time.AfterFunc(presenceMinInterval-elapsed, user.flushPendingDiscordPresence)
+		user.presenceLock.Unlock()
+		return
+	}
+	// Outside the cooldown: send now. Arm the timestamp under the lock so a
+	// concurrent event coalesces instead of emitting a second opcode-3.
+	user.lastDiscordPresenceSentAt = time.Now()
+	user.presenceLock.Unlock()
+	user.sendPresenceToDiscord(sess, status, statusText)
+}
+
+// flushPendingDiscordPresence is invoked by the debounce timer when the
+// rate-limit cooldown expires. It forwards the most recent pending presence
+// state to Discord, unless reality already caught up to it while waiting.
+func (user *User) flushPendingDiscordPresence() {
+	user.presenceLock.Lock()
+	user.presenceDebounceTimer = nil
+	status := user.pendingDiscordStatus
+	statusText := user.pendingDiscordStatusText
+	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText {
+		user.presenceLock.Unlock()
+		return
+	}
+	user.lastDiscordPresenceSentAt = time.Now()
+	user.presenceLock.Unlock()
+
+	// Snapshot the session under user.Lock to avoid racing Logout(), which sets
+	// Session to nil. If the user logged out during the cooldown, drop the send.
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+	if sess == nil {
+		return
+	}
+	user.sendPresenceToDiscord(sess, status, statusText)
+}
+
+// sendPresenceToDiscord performs the actual opcode-3 UpdateStatusComplex call
+// and, on success, records what was sent for dedup and for the echo
+// suppression that applyPresence and HandleMatrixPresence rely on. Must be
+// called without presenceLock held.
+func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusText string) {
+	var activities []*discordgo.Activity
+	if statusText != "" {
+		activities = []*discordgo.Activity{{
+			Name:  "Custom Status",
+			Type:  discordgo.ActivityTypeCustom,
+			State: statusText,
+		}}
+	}
+	// Leave activities nil (JSON null = "don't change activities") when there is
+	// no custom status text, so a presence-only change doesn't clear an active
+	// game or Spotify session. An empty slice would serialize as [] and wipe them.
+	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
+		Status:     status,
+		Activities: activities,
+	})
+	if err != nil {
+		user.log.Warn().Err(err).
+			Str("discord_status", status).
+			Msg("Failed to update Discord status from Matrix presence")
+		return
+	}
+	now := time.Now()
+	user.presenceLock.Lock()
+	user.matrixPresenceSetAt = now
+	user.lastSentToDiscordStatus = status
+	user.lastSentToDiscordText = statusText
+	user.lastSentDiscordStatus = status
+	user.lastSentDiscordStatusText = statusText
+	user.presenceLock.Unlock()
+	user.log.Debug().
+		Str("discord_status", status).
+		Str("status_text", statusText).
+		Msg("Bridged Matrix presence to Discord")
 }
 
 // startPresenceKeepalive launches a background goroutine that re-sends

@@ -231,59 +231,14 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		textToSend = string(runes[:discordCustomStatusMaxRunes])
 	}
 
-	// Skip the Discord WebSocket update if nothing actually changed. Matrix
-	// clients send presence pings frequently; without this guard each ping
-	// generates a Discord opcode-3 message, which looks like bot activity.
-	user.presenceLock.Lock()
-	unchanged := user.lastSentDiscordStatus == discordStatus && user.lastSentDiscordStatusText == textToSend
-	user.presenceLock.Unlock()
-	if unchanged {
-		return
-	}
-
-	var activities []*discordgo.Activity
-	if textToSend != "" {
-		activities = []*discordgo.Activity{{
-			Name:  "Custom Status",
-			Type:  discordgo.ActivityTypeCustom,
-			State: textToSend,
-		}}
-	}
-	// When there is no custom status text to set, leave activities as nil so
-	// Discord serializes it as JSON null ("don't change activities") rather than
-	// an empty array ("clear all activities"). Sending [] would erase the user's
-	// active game, rich presence, or Spotify session whenever they change their
-	// Matrix online/idle/offline state without a custom status text.
-
-	err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{
-		Status:     discordStatus,
-		Activities: activities,
-	})
-	if err != nil {
-		br.ZLog.Warn().Err(err).
-			Str("user_id", evt.Sender.String()).
-			Str("matrix_presence", string(content.Presence)).
-			Msg("Failed to update Discord status from Matrix presence")
-	} else {
-		// Record when and what we last forwarded to Discord so applyPresence
-		// can detect and suppress the resulting gateway echo. Storing the
-		// actual status/text values narrows the echo window: a genuine
-		// Discord status change within the 2-second window is only suppressed
-		// when its values match what we just sent.
-		user.presenceLock.Lock()
-		user.matrixPresenceSetAt = time.Now()
-		user.lastSentToDiscordStatus = discordStatus
-		user.lastSentToDiscordText = textToSend
-		user.lastSentDiscordStatus = discordStatus
-		user.lastSentDiscordStatusText = textToSend
-		user.presenceLock.Unlock()
-		br.ZLog.Debug().
-			Str("user_id", evt.Sender.String()).
-			Str("matrix_presence", string(content.Presence)).
-			Str("discord_status", discordStatus).
-			Str("status_text", textToSend).
-			Msg("Bridged Matrix presence to Discord")
-	}
+	// Forward to Discord with content dedup and trailing-debounce rate limiting.
+	// HandleMatrixPresence fires often as Matrix clients oscillate online/idle,
+	// and Discord invalidates user-account tokens that emit opcode-3 presence
+	// updates at machine cadence, so the actual gateway send is throttled to at
+	// most one per presenceMinInterval. forwardPresenceToDiscord skips the send
+	// entirely when the effective status/text is unchanged, and records what was
+	// sent so applyPresence can suppress the resulting gateway echo.
+	user.forwardPresenceToDiscord(sess, discordStatus, textToSend)
 }
 
 func (br *DiscordBridge) Start() {
