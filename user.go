@@ -836,7 +836,10 @@ func (user *User) connect(intentional bool) error {
 	if !session.IsUser {
 		session.Identify.Intents = BotIntents
 	}
-	session.EventHandler = user.eventHandlerSync
+	// Capture this specific session in the handler so READY/RESUMED can be
+	// attributed to the connection that produced them — a stale READY from a
+	// replaced session must not be mistaken for the current one.
+	session.EventHandler = func(rawEvt any) { user.eventHandlerSync(session, rawEvt) }
 
 	if session.IsUser {
 		err = session.LoadMainPage(context.TODO())
@@ -884,11 +887,11 @@ func (user *User) connect(intentional bool) error {
 	return err
 }
 
-func (user *User) eventHandlerSync(rawEvt any) {
-	go user.eventHandler(rawEvt)
+func (user *User) eventHandlerSync(sess *discordgo.Session, rawEvt any) {
+	go user.eventHandler(sess, rawEvt)
 }
 
-func (user *User) eventHandler(rawEvt any) {
+func (user *User) eventHandler(sess *discordgo.Session, rawEvt any) {
 	defer func() {
 		err := recover()
 		if err != nil {
@@ -900,9 +903,9 @@ func (user *User) eventHandler(rawEvt any) {
 	}()
 	switch evt := rawEvt.(type) {
 	case *discordgo.Ready:
-		user.readyHandler(evt)
+		user.readyHandler(sess, evt)
 	case *discordgo.Resumed:
-		user.resumeHandler(evt)
+		user.resumeHandler(sess, evt)
 	case *discordgo.Connect:
 		user.connectedHandler(evt)
 	case *discordgo.Disconnect:
@@ -1029,12 +1032,12 @@ func (s ChannelSlice) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
-func (user *User) readyHandler(r *discordgo.Ready) {
+func (user *User) readyHandler(sess *discordgo.Session, r *discordgo.Ready) {
 	user.log.Debug().Msg("Discord connection ready")
 	user.bridgeStateLock.Lock()
 	user.wasLoggedOut = false
 	user.bridgeStateLock.Unlock()
-	user.onConnectionEstablished()
+	user.onConnectionEstablished(sess)
 	// Clear the sent-presence dedup cache so the first Matrix presence ping
 	// after a reconnect always reaches Discord (the new gateway session starts
 	// without this Matrix-derived status).
@@ -1171,13 +1174,13 @@ func (user *User) subscribeGuilds(delay time.Duration) {
 	}
 }
 
-func (user *User) resumeHandler(_ *discordgo.Resumed) {
+func (user *User) resumeHandler(sess *discordgo.Session, _ *discordgo.Resumed) {
 	user.log.Debug().Msg("Discord connection resumed")
 	// A RESUMED is a successful reconnect just like READY (the bridge copies
 	// HeartbeatSession onto each session, so discordgo may resume). Run the same
 	// success cleanup so the watchdog is disarmed and the backoff is reset —
 	// otherwise the watchdog would close this healthy resumed session at 60s.
-	user.onConnectionEstablished()
+	user.onConnectionEstablished(sess)
 	// Clear the dedup cache so the first presence ping after a resume re-sends
 	// the current status to Discord (the resumed session may have lost it).
 	user.presenceLock.Lock()
@@ -1478,7 +1481,17 @@ func (user *User) armReadyWatchdog() {
 // the same connection has already scheduled a retry, and cancelling that timer
 // would leave the bridge disconnected with no pending reconnect. An intentional
 // Connect() supersedes a pending timer instead (see connect()).
-func (user *User) onConnectionEstablished() {
+func (user *User) onConnectionEstablished(sess *discordgo.Session) {
+	// Ignore a READY/RESUMED from a session that has already been replaced by a
+	// newer connect attempt. Because gateway events dispatch on independent
+	// goroutines, a stale READY could otherwise mark the wrong attempt ready and
+	// make the new attempt skip its watchdog, leaving an Op9 session unguarded.
+	user.Lock()
+	isCurrent := user.Session == sess
+	user.Unlock()
+	if !isCurrent {
+		return
+	}
 	user.reconnectLock.Lock()
 	user.sessionReady = true
 	user.reconnectAttempts = 0
