@@ -1013,7 +1013,20 @@ func (user *User) eventHandler(rawEvt any) {
 	case *discordgo.ThreadListSync:
 		user.threadListSyncHandler(evt)
 	case *discordgo.Event:
-		// Ignore
+		// discordgo dispatches a raw *Event for gateway event types it doesn't have
+		// a typed handler for. Discord's user gateway delivers presence via newer
+		// events (e.g. PRESENCE_UPDATE_V2, PASSIVE_UPDATE_V2) that discordgo does not
+		// parse, so they land here and are otherwise dropped — which is why some
+		// users never get a Matrix-side presence. Log the raw payload of the
+		// presence-relevant ones at debug so their schema can be captured and a
+		// proper handler written. Other unknown events are ignored.
+		switch evt.Type {
+		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
+			user.log.Debug().
+				Str("event_type", evt.Type).
+				RawJSON("payload", evt.RawData).
+				Msg("Unhandled raw gateway event (presence diagnostic)")
+		}
 	default:
 		user.log.Debug().Type("event_type", evt).Msg("Unhandled event")
 	}
