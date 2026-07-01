@@ -2578,6 +2578,26 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 	}
 }
 
+// presenceSendNeeded reports whether a presence send should proceed for the
+// given desired state, or be deduped away. It is true when the opcode-3 dedup key
+// (status/text/clear) differs from what was last sent, OR when a user-token
+// account-level status PATCH is still owed — i.e. the last UserUpdateStatus REST
+// attempt failed, leaving lastSentDiscordRESTStatus stale. The REST-owed clause is
+// what lets a failed settings PATCH retry on the next identical Matrix presence
+// ping: without it, sendPresenceToDiscord pre-arms lastSentDiscordStatus on the
+// opcode-3 success path, so an otherwise-identical ping would dedup here before
+// ever reaching the REST retry. Retries stay throttled by the caller's cooldown.
+// Caller must hold presenceLock.
+func (user *User) presenceSendNeeded(isUser bool, status, statusText string, clearStatus bool) bool {
+	opcodeChanged := status != user.lastSentDiscordStatus ||
+		statusText != user.lastSentDiscordStatusText ||
+		clearStatus != user.lastSentDiscordClear
+	restStatusOwed := isUser &&
+		user.bridge.Config.Bridge.SyncMatrixPresenceToDiscord &&
+		status != user.lastSentDiscordRESTStatus
+	return opcodeChanged || restStatusOwed
+}
+
 // forwardPresenceToDiscord forwards a desired presence to the user's Discord
 // session with content dedup and trailing-debounce rate limiting, so the bridge
 // never emits opcode-3 updates faster than presenceMinInterval. A change outside
@@ -2606,11 +2626,11 @@ func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, stat
 			clearStatus = user.pendingDiscordClear
 		}
 	}
-	// Dedup: if the desired state already matches what Discord was last told,
-	// there is nothing to forward. Keep the pending target in sync so a timer
-	// that fires later flushes to current reality rather than a stale value.
-	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText &&
-		clearStatus == user.lastSentDiscordClear {
+	// Dedup: if the desired state already matches what Discord was last told (and no
+	// account-level status PATCH is still owed after a failed REST attempt), there is
+	// nothing to forward. Keep the pending target in sync so a timer that fires later
+	// flushes to current reality rather than a stale value.
+	if !user.presenceSendNeeded(sess.IsUser, status, statusText, clearStatus) {
 		user.pendingDiscordStatus = status
 		user.pendingDiscordStatusText = statusText
 		user.pendingDiscordClear = clearStatus
@@ -2642,27 +2662,25 @@ func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, stat
 // rate-limit cooldown expires. It forwards the most recent pending presence
 // state to Discord, unless reality already caught up to it while waiting.
 func (user *User) flushPendingDiscordPresence() {
+	// Snapshot the session under user.Lock to avoid racing Logout(), which sets
+	// Session to nil. If the user logged out during the cooldown, drop the send.
+	// Taken before presenceLock (the two are never held nested) so the dedup check
+	// below can consider sess.IsUser for the REST-owed retry clause.
+	user.Lock()
+	sess := user.Session
+	user.Unlock()
+
 	user.presenceLock.Lock()
 	user.presenceDebounceTimer = nil
 	status := user.pendingDiscordStatus
 	statusText := user.pendingDiscordStatusText
 	clearStatus := user.pendingDiscordClear
-	if status == user.lastSentDiscordStatus && statusText == user.lastSentDiscordStatusText &&
-		clearStatus == user.lastSentDiscordClear {
+	if sess == nil || !user.presenceSendNeeded(sess.IsUser, status, statusText, clearStatus) {
 		user.presenceLock.Unlock()
 		return
 	}
 	user.lastDiscordPresenceSentAt = time.Now()
 	user.presenceLock.Unlock()
-
-	// Snapshot the session under user.Lock to avoid racing Logout(), which sets
-	// Session to nil. If the user logged out during the cooldown, drop the send.
-	user.Lock()
-	sess := user.Session
-	user.Unlock()
-	if sess == nil {
-		return
-	}
 	user.sendPresenceToDiscord(sess, status, statusText, clearStatus)
 }
 
