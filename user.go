@@ -2787,56 +2787,59 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 		return
 	}
 
-	// For user tokens, also set the ACCOUNT-level status via REST (settings.status),
-	// the same channel the official client's status picker uses. The opcode-3 update
-	// above only sets THIS session's presence, which Discord aggregates with the
-	// user's other live clients — so a bridged idle/dnd/invisible is masked by an
-	// online desktop/web client and never shows to others (custom status works
-	// because it is already account-level). The settings status is account-level and
-	// authoritative, so the Matrix presence state actually applies. Deduped against
-	// the previously-sent status. Note: this status is sticky — it persists on the
-	// account until changed again (like picking a status in the client). Offline is
-	// never sent here (Matrix offline maps to invisible, which UserUpdateStatus accepts).
-	if statusChanged {
-		if _, statusErr := sess.UserUpdateStatus(discordgo.Status(status)); statusErr != nil {
-			user.log.Warn().Err(statusErr).
-				Str("discord_status", status).
-				Msg("Failed to set Discord account status via REST from Matrix presence")
-		} else {
-			// Record the success-only dedup state so subsequent identical presence
-			// pings skip the PATCH, while a failure above leaves it stale so the
-			// next ping retries rather than being deduped away.
-			user.presenceLock.Lock()
-			user.lastSentDiscordRESTStatus = status
-			user.presenceLock.Unlock()
+	// For user tokens, set the ACCOUNT-level state via REST on the user settings
+	// endpoint (PATCH /users/@me/settings), the same channel the official client's
+	// status picker uses. Two fields ride this endpoint:
+	//
+	//   - status: the presence STATE (online/idle/dnd/invisible). The opcode-3
+	//     update above only sets THIS session's presence, which Discord aggregates
+	//     with the user's other live clients — so a bridged idle/dnd/invisible is
+	//     masked by an online desktop/web client and never shows to others. The
+	//     settings status is account-level and authoritative, so it actually
+	//     applies. It is sticky — it persists on the account until changed again
+	//     (like picking a status in the client). Offline is never sent here (Matrix
+	//     offline maps to invisible). Deduped against lastSentDiscordRESTStatus.
+	//   - custom_status: the status TEXT (set or explicit clear).
+	//
+	// Both target the same settings resource, so when both change they are folded
+	// into a single PATCH to halve the request count and rate-limit pressure. On
+	// failure the account-status dedup state is left stale so the next ping retries;
+	// the custom_status arm state is intentionally kept (the presence STATE already
+	// applied via opcode 3, and not rolling back avoids hammering a persistently
+	// failing endpoint on every subsequent ping).
+	if statusChanged || restNeeded {
+		body := map[string]interface{}{}
+		if statusChanged {
+			body["status"] = status
 		}
-	}
-
-	// User-token custom status goes over REST, decoupled from the state update
-	// above so a custom-status failure never takes down the presence state.
-	if restNeeded {
-		var customStatus interface{}
-		if clearStatus {
-			customStatus = nil
-		} else {
-			customStatus = map[string]interface{}{
-				"text":       statusText,
-				"emoji_id":   nil,
-				"emoji_name": nil,
-				"expires_at": nil,
+		if restNeeded {
+			var customStatus interface{}
+			if !clearStatus {
+				customStatus = map[string]interface{}{
+					"text":       statusText,
+					"emoji_id":   nil,
+					"emoji_name": nil,
+					"expires_at": nil,
+				}
 			}
+			body["custom_status"] = customStatus
 		}
-		body := map[string]interface{}{"custom_status": customStatus}
 		if _, restErr := sess.RequestWithBucketID(
 			"PATCH", discordgo.EndpointUserSettings("@me"), body,
 			discordgo.EndpointUserSettings("")); restErr != nil {
-			// Warn but keep the armed dedup state: the presence STATE already
-			// applied above, and not rolling back means we don't hammer a
-			// persistently-failing endpoint on every subsequent ping.
 			user.log.Warn().Err(restErr).
+				Bool("status_changed", statusChanged).
+				Str("discord_status", status).
 				Str("status_text", statusText).
 				Bool("clear", clearStatus).
-				Msg("Failed to set Discord custom status via REST from Matrix presence")
+				Msg("Failed to set Discord account status/custom status via REST from Matrix presence")
+		} else if statusChanged {
+			// Record the success-only dedup state so subsequent identical presence
+			// pings skip the account-status PATCH, while a failure above leaves it
+			// stale so the next ping retries rather than being deduped away.
+			user.presenceLock.Lock()
+			user.lastSentDiscordRESTStatus = status
+			user.presenceLock.Unlock()
 		}
 	}
 	user.log.Debug().
