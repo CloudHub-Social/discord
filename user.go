@@ -158,6 +158,16 @@ type User struct {
 	// presence (ghosts never /sync, so presence times out without refresh).
 	presenceCache map[string]presenceCacheEntry
 
+	// mergedPresencesRaw holds the most recent READY/READY_SUPPLEMENTAL raw payload
+	// (which carries merged_presences). readyComplete is set once readyHandler has
+	// finished its setup (DM puppets created, keepalive started, presenceCache
+	// cleared). Together they coordinate friend-presence seeding so it runs only
+	// after that setup — otherwise the seed can apply presences before the puppets
+	// exist (silently dropped) or before the cache clear (immediately wiped). Both
+	// are guarded by presenceLock.
+	mergedPresencesRaw []byte
+	readyComplete      bool
+
 	// discordPresenceSetAt is the timestamp of the last time applyPresence
 	// successfully updated the bridge user's own real Matrix account from a
 	// Discord status change. HandleMatrixPresence uses it to suppress the
@@ -1024,14 +1034,24 @@ func (user *User) eventHandler(rawEvt any) {
 		switch evt.Type {
 		case "READY", "READY_SUPPLEMENTAL":
 			// discordgo's typed Ready does not parse merged_presences, where a user
-			// account's friend presences are delivered at connect. Seed them so
-			// friends have a Matrix presence immediately after (re)connect instead
-			// of only once they next change state. Discord's user gateway actually
-			// delivers merged_presences in the separate READY_SUPPLEMENTAL event
-			// dispatched right after READY; READY itself carries an empty (or
-			// absent) merged_presences and seeds nothing. We handle both so the
-			// seeding is robust to which event actually carries the data.
-			go user.seedMergedPresences(evt.RawData)
+			// account's friend presences are delivered at connect (Discord's user
+			// gateway sends it in the separate READY_SUPPLEMENTAL event; READY itself
+			// carries an empty/absent merged_presences). Handle both so seeding is
+			// robust to which event carries the data.
+			//
+			// Do NOT seed inline: this handler runs in its own goroutine and can race
+			// readyHandler, which creates the DM friend puppets and clears
+			// presenceCache. Seeding before that would drop presences (no puppet yet)
+			// or have them wiped by the cache clear. Instead stash the payload and
+			// seed only after readyHandler completes (it seeds the stash at its tail);
+			// if this event arrives *after* readyHandler finished, seed now.
+			user.presenceLock.Lock()
+			user.mergedPresencesRaw = evt.RawData
+			ready := user.readyComplete
+			user.presenceLock.Unlock()
+			if ready {
+				go user.seedMergedPresences(evt.RawData)
+			}
 			// Log only merged_presences at debug so the exact schema can be confirmed from production logs.
 			if user.log.Debug().Enabled() {
 				var diag struct {
@@ -1039,7 +1059,7 @@ func (user *User) eventHandler(rawEvt any) {
 				}
 				if err := json.Unmarshal(evt.RawData, &diag); err != nil {
 					user.log.Debug().Err(err).Str("event_type", evt.Type).Msg("Failed to parse merged_presences for diagnostic logging")
-				} else {
+				} else if len(diag.MergedPresences) > 0 {
 					user.log.Debug().
 						Str("event_type", evt.Type).
 						Int("payload_bytes", len(evt.RawData)).
@@ -1121,6 +1141,9 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
+	// Reset merged-presence seeding coordination for this fresh connection.
+	user.readyComplete = false
+	user.mergedPresencesRaw = nil
 	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
@@ -1190,6 +1213,18 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	// that users who are already online are reflected immediately rather than
 	// waiting for a future PresenceUpdate event.
 	go user.seedPresences(r.Presences)
+
+	// Now that DM puppets are created, the keepalive is running and presenceCache
+	// has been cleared, seed friend presences from any merged_presences payload
+	// stashed by the READY/READY_SUPPLEMENTAL raw-event handler. Mark readyComplete
+	// so a READY_SUPPLEMENTAL that arrives *after* this point seeds itself.
+	user.presenceLock.Lock()
+	user.readyComplete = true
+	stashed := user.mergedPresencesRaw
+	user.presenceLock.Unlock()
+	if stashed != nil {
+		go user.seedMergedPresences(stashed)
+	}
 
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
