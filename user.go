@@ -1022,12 +1022,22 @@ func (user *User) eventHandler(rawEvt any) {
 		// presence-relevant ones at debug so their schema can be captured and a
 		// proper handler written. Other unknown events are ignored.
 		switch evt.Type {
-		case "READY":
+		case "READY", "READY_SUPPLEMENTAL":
 			// discordgo's typed Ready does not parse merged_presences, where a user
 			// account's friend presences are delivered at connect. Seed them so
 			// friends have a Matrix presence immediately after (re)connect instead
-			// of only once they next change state.
+			// of only once they next change state. Discord's user gateway actually
+			// delivers merged_presences in the separate READY_SUPPLEMENTAL event
+			// dispatched right after READY; READY itself carries an empty (or
+			// absent) merged_presences and seeds nothing. We handle both so the
+			// seeding is robust to which event actually carries the data.
 			go user.seedMergedPresences(evt.RawData)
+			// Log the raw payload at debug so the exact merged_presences schema can
+			// be confirmed from production logs (READY_SUPPLEMENTAL can be large).
+			user.log.Debug().
+				Str("event_type", evt.Type).
+				RawJSON("payload", evt.RawData).
+				Msg("Raw gateway event (presence seeding diagnostic)")
 		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
 			user.log.Debug().
 				Str("event_type", evt.Type).
@@ -2897,12 +2907,21 @@ func (user *User) runPresenceKeepalive(ctx context.Context) {
 	}
 }
 
-// seedMergedPresences seeds friend presences from the raw READY payload's
+// seedMergedPresences seeds friend presences from a raw gateway payload's
 // merged_presences field, which discordgo's typed Ready does not parse. On a
-// user account, friends' current presence is delivered here at connect; without
-// this a friend has no Matrix presence until they next change state. Parsed
-// defensively — if the field is absent or shaped differently, it simply seeds
-// nothing (no regression). No-op unless a Discord→Matrix read is enabled.
+// user account, friends' current presence is delivered in the READY_SUPPLEMENTAL
+// event (dispatched right after READY), not in READY itself — the READY payload
+// carries an empty/absent merged_presences. Called for both events; READY simply
+// seeds nothing. Without this a friend has no Matrix presence until they next
+// change state. Parsed defensively — if the field is absent or shaped
+// differently, it simply seeds nothing (no regression). No-op unless a
+// Discord→Matrix read is enabled.
+//
+// TODO: merged_presences also carries a "guilds" array (a per-guild list of
+// presence entries). We only parse "friends" here since the reported issue is
+// DM/friend presence; guild presences are already seeded via GUILD_CREATE. Add
+// guild parsing here only once the exact nested shape is confirmed from the
+// READY_SUPPLEMENTAL debug log added above.
 func (user *User) seedMergedPresences(raw json.RawMessage) {
 	if !user.discordReadEnabled() {
 		return
@@ -2917,7 +2936,7 @@ func (user *User) seedMergedPresences(raw json.RawMessage) {
 		} `json:"merged_presences"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		user.log.Debug().Err(err).Msg("Failed to parse merged_presences from READY")
+		user.log.Debug().Err(err).Msg("Failed to parse merged_presences from READY/READY_SUPPLEMENTAL")
 		return
 	}
 	seeded := 0
