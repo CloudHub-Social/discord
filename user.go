@@ -939,6 +939,16 @@ func (user *User) connect(intentional bool) error {
 }
 
 func (user *User) eventHandlerSync(rawEvt any) {
+	// Reset the friend-presence seeding-ready flag synchronously here (discordgo
+	// calls eventHandlerSync in gateway order) so it happens BEFORE the following
+	// READY_SUPPLEMENTAL event's handler goroutine runs. Doing it inside the async
+	// readyHandler instead would race: on reconnect the supplemental handler could
+	// observe a stale readyComplete==true and seed before DM setup / cache rebuild.
+	if _, ok := rawEvt.(*discordgo.Ready); ok {
+		user.presenceLock.Lock()
+		user.readyComplete = false
+		user.presenceLock.Unlock()
+	}
 	go user.eventHandler(rawEvt)
 }
 
@@ -1049,15 +1059,24 @@ func (user *User) eventHandler(rawEvt any) {
 			// readyHandler seed it from its tail (after setup); if this event arrives
 			// *after* readyHandler finished, seed now.
 			//
-			// Only act when merged_presences is actually present: READY carries an
-			// empty/absent merged_presences, and stashing that would clobber a
-			// READY_SUPPLEMENTAL payload a concurrent goroutine already stashed.
+			// Only act when merged_presences actually carries friends: READY sends an
+			// empty/absent merged_presences (possibly as `{}` or `{"friends":[]}`),
+			// and stashing that would clobber a READY_SUPPLEMENTAL payload a
+			// concurrent goroutine already stashed. Check the decoded friends count
+			// rather than raw byte length so `{}`/`{"friends":[]}` don't slip through.
 			var diag struct {
 				MergedPresences json.RawMessage `json:"merged_presences"`
 			}
+			var hasFriends bool
 			if err := json.Unmarshal(evt.RawData, &diag); err != nil {
 				user.log.Debug().Err(err).Str("event_type", evt.Type).Msg("Failed to parse merged_presences for diagnostic logging")
 			} else if len(diag.MergedPresences) > 0 {
+				var mp struct {
+					Friends []json.RawMessage `json:"friends"`
+				}
+				hasFriends = json.Unmarshal(diag.MergedPresences, &mp) == nil && len(mp.Friends) > 0
+			}
+			if hasFriends {
 				// If readyHandler has already finished (readyComplete), seed directly
 				// and do NOT stash — a stashed-but-already-seeded payload would be
 				// replayed by the next reconnect's tail. Only stash when setup is still
@@ -1153,11 +1172,11 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
-	// Reset the seeding-ready flag for this fresh connection so a READY_SUPPLEMENTAL
-	// doesn't seed before setup completes. Do NOT nil mergedPresencesRaw here: a
-	// concurrent READY_SUPPLEMENTAL goroutine may have already stashed a payload,
-	// and clearing it would drop it. The stash is consumed (and nil'd) at the tail.
-	user.readyComplete = false
+	// Note: readyComplete is reset to false synchronously in eventHandlerSync when
+	// the READY event is dispatched (before this async handler and before the
+	// READY_SUPPLEMENTAL handler run), so it is not reset here. mergedPresencesRaw
+	// is intentionally left as-is: a concurrent READY_SUPPLEMENTAL may have already
+	// stashed a payload; the tail consumes and nils it.
 	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
