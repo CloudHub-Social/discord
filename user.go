@@ -152,6 +152,18 @@ type User struct {
 	// by a prior preserve that happened to carry the same empty text.
 	lastSentDiscordClear bool
 
+	// otherSessionsActive is true when the account has at least one non-bridge
+	// Discord session connected (a real client), derived from SESSIONS_REPLACE.
+	// Guarded by presenceLock. Matrix→Discord presence STATE is only asserted when
+	// this is false (the bridge is the sole session): otherwise Discord aggregates
+	// presence across sessions and a real client is both more accurate and would
+	// mask the bridge's opcode-3 state anyway. Custom status text still syncs
+	// regardless (it is account-level). See sendPresenceToDiscord.
+	otherSessionsActive bool
+	// gatewaySessionID is the bridge's own gateway session_id (from READY), used to
+	// exclude the bridge itself when counting other sessions. Guarded by user.Lock.
+	gatewaySessionID string
+
 	// presenceCache maps Discord user IDs to their last known non-offline
 	// Matrix presence state. The keepalive goroutine re-sends these every
 	// presenceKeepaliveInterval so Synapse does not expire ghost users'
@@ -696,6 +708,7 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
+	user.otherSessionsActive = false
 	user.discordPresenceSetAt = time.Time{}
 	user.matrixPresenceSetAt = time.Time{}
 	user.lastSentToDiscordStatus = ""
@@ -1038,7 +1051,11 @@ func (user *User) eventHandler(rawEvt any) {
 				Str("event_type", evt.Type).
 				RawJSON("payload", evt.RawData).
 				Msg("Raw gateway event (presence seeding diagnostic)")
-		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
+		case "SESSIONS_REPLACE":
+			// Tracks whether a real (non-bridge) Discord client is connected, which
+			// gates Matrix→Discord presence-state assertion (see sendPresenceToDiscord).
+			user.handleSessionsReplace(evt.RawData)
+		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2":
 			user.log.Debug().
 				Str("event_type", evt.Type).
 				RawJSON("payload", evt.RawData).
@@ -1113,6 +1130,11 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
 	user.presenceLock.Unlock()
+	// Record our own gateway session_id so SESSIONS_REPLACE handling can exclude
+	// the bridge itself when detecting whether a real client is connected.
+	user.Lock()
+	user.gatewaySessionID = r.SessionID
+	user.Unlock()
 
 	if user.DiscordID != r.User.ID {
 		// Write DiscordID under user.Lock BEFORE taking usersLock. Logout() holds
@@ -2727,61 +2749,57 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 		usd.AFK = true
 	}
 
-	// Pre-arm the dedup and echo-suppression state *before* any network call,
-	// mirroring the pre-arm/restore pattern in applyPresence. This is load-bearing
-	// for two reasons:
-	//   1. REST dedup race: textChanged is computed from lastSentDiscord* under the
-	//      lock. If we only wrote those fields after the network calls, two
-	//      concurrent sends could both observe the old values, both pass the
-	//      changed-check, and both PATCH the settings endpoint. Arming up front
-	//      makes the second send see the first's intent and skip the redundant PATCH.
-	//   2. Echo suppression: the gateway state update produces our own
-	//      PRESENCE_UPDATE echo, which can arrive (and be handled by applyPresence)
-	//      before we'd otherwise have set matrixPresenceSetAt / lastSentToDiscord*.
-	//      If those aren't armed yet, applyPresence's own-account echo check fails
-	//      to match and writes the echo back to Matrix, clobbering Charm's [dnd]
-	//      marker. Arming before the send closes that window.
-	// We capture the previous values so a failed gateway send can roll them back
-	// (so a retry isn't deduped away). We must not hold presenceLock across any
-	// network call.
-	now := time.Now()
+	// Fallback gating: only assert presence STATE (opcode 3) when the bridge is the
+	// user's SOLE session. When a real Discord client is connected
+	// (otherSessionsActive, tracked from SESSIONS_REPLACE), skip the state update —
+	// Discord aggregates presence across sessions, so the real client is both more
+	// accurate and would mask the bridge's opcode-3 state anyway; asserting it would
+	// also fight the client. Custom status text (below) still syncs regardless, as
+	// it is account-level. Bot tokens always send state.
+	//
+	// State/echo fields are armed *before* the network call (echo-suppression
+	// window + concurrent-send dedup, mirroring applyPresence), and rolled back on
+	// failure. The custom-status dedup is tracked independently so a state send
+	// being skipped or failing never suppresses a status update.
 	user.presenceLock.Lock()
-	prevMatrixPresenceSetAt := user.matrixPresenceSetAt
-	prevSentToStatus := user.lastSentToDiscordStatus
-	prevSentToText := user.lastSentToDiscordText
-	prevSentStatus := user.lastSentDiscordStatus
+	sendState := !sess.IsUser || !user.otherSessionsActive
 	prevSentText := user.lastSentDiscordStatusText
 	prevClear := user.lastSentDiscordClear
-	// Decide whether the user-token REST custom-status PATCH is needed, against
-	// the *previous* armed text/clear so a stream of presence pings doesn't spam
-	// the settings endpoint.
-	//   - non-empty text → set custom_status.text
-	//   - explicit clear → custom_status: null
-	//   - preserve (empty text, not a clear) → leave Discord's current status as-is
 	restNeeded := sess.IsUser && (statusText != "" || clearStatus) &&
 		(statusText != prevSentText || clearStatus != prevClear)
-	user.matrixPresenceSetAt = now
-	user.lastSentToDiscordStatus = status
-	user.lastSentToDiscordText = statusText
-	user.lastSentDiscordStatus = status
-	user.lastSentDiscordStatusText = statusText
-	user.lastSentDiscordClear = clearStatus
+	if restNeeded {
+		user.lastSentDiscordStatusText = statusText
+		user.lastSentDiscordClear = clearStatus
+	}
+	var prevMatrixPresenceSetAt time.Time
+	var prevSentToStatus, prevSentToText, prevSentStatus string
+	if sendState {
+		prevMatrixPresenceSetAt = user.matrixPresenceSetAt
+		prevSentToStatus = user.lastSentToDiscordStatus
+		prevSentToText = user.lastSentToDiscordText
+		prevSentStatus = user.lastSentDiscordStatus
+		user.matrixPresenceSetAt = time.Now()
+		user.lastSentToDiscordStatus = status
+		user.lastSentToDiscordText = statusText
+		user.lastSentDiscordStatus = status
+	}
 	user.presenceLock.Unlock()
 
-	if err := sess.UpdateStatusComplex(usd); err != nil {
-		user.log.Warn().Err(err).
-			Str("discord_status", status).
-			Msg("Failed to update Discord status from Matrix presence")
-		// Roll back the armed state so a retry isn't deduped away.
-		user.presenceLock.Lock()
-		user.matrixPresenceSetAt = prevMatrixPresenceSetAt
-		user.lastSentToDiscordStatus = prevSentToStatus
-		user.lastSentToDiscordText = prevSentToText
-		user.lastSentDiscordStatus = prevSentStatus
-		user.lastSentDiscordStatusText = prevSentText
-		user.lastSentDiscordClear = prevClear
-		user.presenceLock.Unlock()
-		return
+	if sendState {
+		if err := sess.UpdateStatusComplex(usd); err != nil {
+			user.log.Warn().Err(err).
+				Str("discord_status", status).
+				Msg("Failed to update Discord status from Matrix presence")
+			// Roll back the armed state fields so a retry isn't deduped away. The
+			// custom-status dedup is separate and intentionally left as-is.
+			user.presenceLock.Lock()
+			user.matrixPresenceSetAt = prevMatrixPresenceSetAt
+			user.lastSentToDiscordStatus = prevSentToStatus
+			user.lastSentToDiscordText = prevSentToText
+			user.lastSentDiscordStatus = prevSentStatus
+			user.presenceLock.Unlock()
+			// Fall through: still attempt the custom-status update below.
+		}
 	}
 
 	// User-token custom status goes over REST, decoupled from the state update
@@ -2953,6 +2971,51 @@ func (user *User) seedMergedPresences(raw json.RawMessage) {
 		Int("total", len(payload.MergedPresences.Friends)).
 		Int("seeded", seeded).
 		Msg("Seeded Discord friend presences from merged_presences")
+}
+
+// handleSessionsReplace updates otherSessionsActive from a SESSIONS_REPLACE
+// payload (the account's list of connected sessions). A real client is any entry
+// that is neither the "all" aggregate nor the bridge's own gateway session. The
+// Matrix→Discord presence state is only asserted when no real client is present
+// (see sendPresenceToDiscord). When the last real client disconnects (transition
+// to sole session), the sent-presence dedup is cleared so the next Matrix
+// presence ping re-asserts the bridge's state rather than being deduped away.
+func (user *User) handleSessionsReplace(raw json.RawMessage) {
+	var sessions []struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(raw, &sessions); err != nil {
+		user.log.Debug().Err(err).Msg("Failed to parse SESSIONS_REPLACE")
+		return
+	}
+	user.Lock()
+	ownID := user.gatewaySessionID
+	user.Unlock()
+
+	others := 0
+	for _, s := range sessions {
+		if s.SessionID == "" || s.SessionID == "all" || s.SessionID == ownID {
+			continue
+		}
+		others++
+	}
+	active := others > 0
+
+	user.presenceLock.Lock()
+	became := user.otherSessionsActive && !active
+	user.otherSessionsActive = active
+	if became {
+		// Bridge is now the sole session; clear the state dedup so the next Matrix
+		// presence ping re-asserts state instead of being suppressed as unchanged.
+		user.lastSentDiscordStatus = ""
+	}
+	user.presenceLock.Unlock()
+
+	user.log.Debug().
+		Str("own_session", ownID).
+		Int("other_sessions", others).
+		Bool("other_sessions_active", active).
+		Msg("Updated Discord session presence gating")
 }
 
 // seedPresences applies presence for a batch of Presence entries received in
