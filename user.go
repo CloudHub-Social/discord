@@ -1032,12 +1032,21 @@ func (user *User) eventHandler(rawEvt any) {
 			// absent) merged_presences and seeds nothing. We handle both so the
 			// seeding is robust to which event actually carries the data.
 			go user.seedMergedPresences(evt.RawData)
-			// Log the raw payload at debug so the exact merged_presences schema can
-			// be confirmed from production logs (READY_SUPPLEMENTAL can be large).
-			user.log.Debug().
-				Str("event_type", evt.Type).
-				RawJSON("payload", evt.RawData).
-				Msg("Raw gateway event (presence seeding diagnostic)")
+			// Log only merged_presences at debug so the exact schema can be confirmed from production logs.
+			if user.log.Debug().Enabled() {
+				var diag struct {
+					MergedPresences json.RawMessage `json:"merged_presences"`
+				}
+				if err := json.Unmarshal(evt.RawData, &diag); err != nil {
+					user.log.Debug().Err(err).Str("event_type", evt.Type).Msg("Failed to parse merged_presences for diagnostic logging")
+				} else {
+					user.log.Debug().
+						Str("event_type", evt.Type).
+						Int("payload_bytes", len(evt.RawData)).
+						RawJSON("merged_presences", diag.MergedPresences).
+						Msg("Raw gateway merged_presences (presence seeding diagnostic)")
+				}
+			}
 		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
 			user.log.Debug().
 				Str("event_type", evt.Type).
