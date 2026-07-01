@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -1021,6 +1022,12 @@ func (user *User) eventHandler(rawEvt any) {
 		// presence-relevant ones at debug so their schema can be captured and a
 		// proper handler written. Other unknown events are ignored.
 		switch evt.Type {
+		case "READY":
+			// discordgo's typed Ready does not parse merged_presences, where a user
+			// account's friend presences are delivered at connect. Seed them so
+			// friends have a Matrix presence immediately after (re)connect instead
+			// of only once they next change state.
+			go user.seedMergedPresences(evt.RawData)
 		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
 			user.log.Debug().
 				Str("event_type", evt.Type).
@@ -2888,6 +2895,45 @@ func (user *User) runPresenceKeepalive(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// seedMergedPresences seeds friend presences from the raw READY payload's
+// merged_presences field, which discordgo's typed Ready does not parse. On a
+// user account, friends' current presence is delivered here at connect; without
+// this a friend has no Matrix presence until they next change state. Parsed
+// defensively — if the field is absent or shaped differently, it simply seeds
+// nothing (no regression). No-op unless a Discord→Matrix read is enabled.
+func (user *User) seedMergedPresences(raw json.RawMessage) {
+	if !user.discordReadEnabled() {
+		return
+	}
+	var payload struct {
+		MergedPresences struct {
+			Friends []struct {
+				UserID     string                `json:"user_id"`
+				Status     discordgo.Status      `json:"status"`
+				Activities []*discordgo.Activity `json:"activities"`
+			} `json:"friends"`
+		} `json:"merged_presences"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		user.log.Debug().Err(err).Msg("Failed to parse merged_presences from READY")
+		return
+	}
+	seeded := 0
+	for _, f := range payload.MergedPresences.Friends {
+		// Empty status means no presence info in this entry; skip so we don't map
+		// it to offline and clear a presence set elsewhere.
+		if f.UserID == "" || f.Status == "" {
+			continue
+		}
+		user.applyPresence(f.UserID, f.Status, discordCustomStatusText(f.Activities))
+		seeded++
+	}
+	user.log.Debug().
+		Int("total", len(payload.MergedPresences.Friends)).
+		Int("seeded", seeded).
+		Msg("Seeded Discord friend presences from merged_presences")
 }
 
 // seedPresences applies presence for a batch of Presence entries received in
