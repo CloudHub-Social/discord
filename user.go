@@ -2336,6 +2336,17 @@ func normalizeDiscordStatusForEcho(status string) string {
 // can be included alongside the presence state (the high-level SetPresence
 // helper in mautrix-go only accepts the presence state).
 func setMatrixPresence(intent *appservice.IntentAPI, presence event.Presence, statusMsg string) error {
+	// Ensure the ghost is registered on the homeserver before writing presence.
+	// This issues a raw PUT (so status_msg can be included), which bypasses the
+	// lazy registration that high-level intent methods perform. Without this, a
+	// ghost whose puppet row exists but who was never materialized on the
+	// homeserver (e.g. a friend/DM contact who never joined a bridged room) gets
+	// M_FORBIDDEN "Application service has not registered this user", so their
+	// presence never applies. EnsureRegistered is a cheap no-op for already-
+	// registered ghosts and for custom (double-puppet) intents.
+	if err := intent.EnsureRegistered(); err != nil {
+		return err
+	}
 	reqBody := struct {
 		Presence  event.Presence `json:"presence"`
 		StatusMsg string         `json:"status_msg,omitempty"`
