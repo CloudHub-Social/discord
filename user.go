@@ -1042,24 +1042,27 @@ func (user *User) eventHandler(rawEvt any) {
 			// Do NOT seed inline: this handler runs in its own goroutine and can race
 			// readyHandler, which creates the DM friend puppets and clears
 			// presenceCache. Seeding before that would drop presences (no puppet yet)
-			// or have them wiped by the cache clear. Instead stash the payload and
-			// seed only after readyHandler completes (it seeds the stash at its tail);
-			// if this event arrives *after* readyHandler finished, seed now.
-			user.presenceLock.Lock()
-			user.mergedPresencesRaw = evt.RawData
-			ready := user.readyComplete
-			user.presenceLock.Unlock()
-			if ready {
-				go user.seedMergedPresences(evt.RawData)
+			// or have them wiped by the cache clear. Instead stash the payload and let
+			// readyHandler seed it from its tail (after setup); if this event arrives
+			// *after* readyHandler finished, seed now.
+			//
+			// Only act when merged_presences is actually present: READY carries an
+			// empty/absent merged_presences, and stashing that would clobber a
+			// READY_SUPPLEMENTAL payload a concurrent goroutine already stashed.
+			var diag struct {
+				MergedPresences json.RawMessage `json:"merged_presences"`
 			}
-			// Log only merged_presences at debug so the exact schema can be confirmed from production logs.
-			if user.log.Debug().Enabled() {
-				var diag struct {
-					MergedPresences json.RawMessage `json:"merged_presences"`
+			if err := json.Unmarshal(evt.RawData, &diag); err != nil {
+				user.log.Debug().Err(err).Str("event_type", evt.Type).Msg("Failed to parse merged_presences for diagnostic logging")
+			} else if len(diag.MergedPresences) > 0 {
+				user.presenceLock.Lock()
+				user.mergedPresencesRaw = evt.RawData
+				ready := user.readyComplete
+				user.presenceLock.Unlock()
+				if ready {
+					go user.seedMergedPresences(evt.RawData)
 				}
-				if err := json.Unmarshal(evt.RawData, &diag); err != nil {
-					user.log.Debug().Err(err).Str("event_type", evt.Type).Msg("Failed to parse merged_presences for diagnostic logging")
-				} else if len(diag.MergedPresences) > 0 {
+				if user.log.Debug().Enabled() {
 					user.log.Debug().
 						Str("event_type", evt.Type).
 						Int("payload_bytes", len(evt.RawData)).
@@ -1141,9 +1144,11 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
-	// Reset merged-presence seeding coordination for this fresh connection.
+	// Reset the seeding-ready flag for this fresh connection so a READY_SUPPLEMENTAL
+	// doesn't seed before setup completes. Do NOT nil mergedPresencesRaw here: a
+	// concurrent READY_SUPPLEMENTAL goroutine may have already stashed a payload,
+	// and clearing it would drop it. The stash is consumed (and nil'd) at the tail.
 	user.readyComplete = false
-	user.mergedPresencesRaw = nil
 	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
@@ -1221,6 +1226,10 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.presenceLock.Lock()
 	user.readyComplete = true
 	stashed := user.mergedPresencesRaw
+	// Consume the stash so a later READY_SUPPLEMENTAL (which now sees readyComplete)
+	// seeds itself rather than being re-seeded here, and so a subsequent reconnect
+	// doesn't replay this connection's payload.
+	user.mergedPresencesRaw = nil
 	user.presenceLock.Unlock()
 	if stashed != nil {
 		go user.seedMergedPresences(stashed)
