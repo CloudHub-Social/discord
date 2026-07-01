@@ -2743,6 +2743,8 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 	//   - preserve (empty text, not a clear) → leave Discord's current status as-is
 	restNeeded := sess.IsUser && (statusText != "" || clearStatus) &&
 		(statusText != prevSentText || clearStatus != prevClear)
+	// Decide whether to also set the account-level status via REST (see below).
+	statusChanged := sess.IsUser && status != prevSentStatus
 	user.matrixPresenceSetAt = now
 	user.lastSentToDiscordStatus = status
 	user.lastSentToDiscordText = statusText
@@ -2765,6 +2767,24 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 		user.lastSentDiscordClear = prevClear
 		user.presenceLock.Unlock()
 		return
+	}
+
+	// For user tokens, also set the ACCOUNT-level status via REST (settings.status),
+	// the same channel the official client's status picker uses. The opcode-3 update
+	// above only sets THIS session's presence, which Discord aggregates with the
+	// user's other live clients — so a bridged idle/dnd/invisible is masked by an
+	// online desktop/web client and never shows to others (custom status works
+	// because it is already account-level). The settings status is account-level and
+	// authoritative, so the Matrix presence state actually applies. Deduped against
+	// the previously-sent status. Note: this status is sticky — it persists on the
+	// account until changed again (like picking a status in the client). Offline is
+	// never sent here (Matrix offline maps to invisible, which UserUpdateStatus accepts).
+	if statusChanged {
+		if _, statusErr := sess.UserUpdateStatus(discordgo.Status(status)); statusErr != nil {
+			user.log.Warn().Err(statusErr).
+				Str("discord_status", status).
+				Msg("Failed to set Discord account status via REST from Matrix presence")
+		}
 	}
 
 	// User-token custom status goes over REST, decoupled from the state update
