@@ -712,6 +712,9 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastSentToDiscordText = ""
 	user.lastOwnMatrixPresence = ""
 	user.lastOwnMatrixStatusMsg = ""
+	// Drop any stashed friend-presence snapshot so it isn't replayed on next login.
+	user.mergedPresencesRaw = nil
+	user.readyComplete = false
 	if user.presenceDebounceTimer != nil {
 		user.presenceDebounceTimer.Stop()
 		user.presenceDebounceTimer = nil
@@ -1055,9 +1058,15 @@ func (user *User) eventHandler(rawEvt any) {
 			if err := json.Unmarshal(evt.RawData, &diag); err != nil {
 				user.log.Debug().Err(err).Str("event_type", evt.Type).Msg("Failed to parse merged_presences for diagnostic logging")
 			} else if len(diag.MergedPresences) > 0 {
+				// If readyHandler has already finished (readyComplete), seed directly
+				// and do NOT stash — a stashed-but-already-seeded payload would be
+				// replayed by the next reconnect's tail. Only stash when setup is still
+				// in progress, so the tail consumes it exactly once.
 				user.presenceLock.Lock()
-				user.mergedPresencesRaw = evt.RawData
 				ready := user.readyComplete
+				if !ready {
+					user.mergedPresencesRaw = evt.RawData
+				}
 				user.presenceLock.Unlock()
 				if ready {
 					go user.seedMergedPresences(evt.RawData)
