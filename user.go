@@ -1021,7 +1021,7 @@ func (user *User) eventHandler(rawEvt any) {
 		// presence-relevant ones at debug so their schema can be captured and a
 		// proper handler written. Other unknown events are ignored.
 		switch evt.Type {
-		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "PRESENCES_REPLACE", "SESSIONS_REPLACE":
+		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
 			user.log.Debug().
 				Str("event_type", evt.Type).
 				RawJSON("payload", evt.RawData).
