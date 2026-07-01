@@ -158,6 +158,16 @@ type User struct {
 	// presence (ghosts never /sync, so presence times out without refresh).
 	presenceCache map[string]presenceCacheEntry
 
+	// mergedPresencesRaw holds the most recent READY/READY_SUPPLEMENTAL raw payload
+	// (which carries merged_presences). readyComplete is set once readyHandler has
+	// finished its setup (DM puppets created, keepalive started, presenceCache
+	// cleared). Together they coordinate friend-presence seeding so it runs only
+	// after that setup — otherwise the seed can apply presences before the puppets
+	// exist (silently dropped) or before the cache clear (immediately wiped). Both
+	// are guarded by presenceLock.
+	mergedPresencesRaw []byte
+	readyComplete      bool
+
 	// discordPresenceSetAt is the timestamp of the last time applyPresence
 	// successfully updated the bridge user's own real Matrix account from a
 	// Discord status change. HandleMatrixPresence uses it to suppress the
@@ -702,6 +712,9 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastSentToDiscordText = ""
 	user.lastOwnMatrixPresence = ""
 	user.lastOwnMatrixStatusMsg = ""
+	// Drop any stashed friend-presence snapshot so it isn't replayed on next login.
+	user.mergedPresencesRaw = nil
+	user.readyComplete = false
 	if user.presenceDebounceTimer != nil {
 		user.presenceDebounceTimer.Stop()
 		user.presenceDebounceTimer = nil
@@ -926,6 +939,16 @@ func (user *User) connect(intentional bool) error {
 }
 
 func (user *User) eventHandlerSync(rawEvt any) {
+	// Reset the friend-presence seeding-ready flag synchronously here (discordgo
+	// calls eventHandlerSync in gateway order) so it happens BEFORE the following
+	// READY_SUPPLEMENTAL event's handler goroutine runs. Doing it inside the async
+	// readyHandler instead would race: on reconnect the supplemental handler could
+	// observe a stale readyComplete==true and seed before DM setup / cache rebuild.
+	if _, ok := rawEvt.(*discordgo.Ready); ok {
+		user.presenceLock.Lock()
+		user.readyComplete = false
+		user.presenceLock.Unlock()
+	}
 	go user.eventHandler(rawEvt)
 }
 
@@ -1022,12 +1045,59 @@ func (user *User) eventHandler(rawEvt any) {
 		// presence-relevant ones at debug so their schema can be captured and a
 		// proper handler written. Other unknown events are ignored.
 		switch evt.Type {
-		case "READY":
+		case "READY", "READY_SUPPLEMENTAL":
 			// discordgo's typed Ready does not parse merged_presences, where a user
-			// account's friend presences are delivered at connect. Seed them so
-			// friends have a Matrix presence immediately after (re)connect instead
-			// of only once they next change state.
-			go user.seedMergedPresences(evt.RawData)
+			// account's friend presences are delivered at connect (Discord's user
+			// gateway sends it in the separate READY_SUPPLEMENTAL event; READY itself
+			// carries an empty/absent merged_presences). Handle both so seeding is
+			// robust to which event carries the data.
+			//
+			// Do NOT seed inline: this handler runs in its own goroutine and can race
+			// readyHandler, which creates the DM friend puppets and clears
+			// presenceCache. Seeding before that would drop presences (no puppet yet)
+			// or have them wiped by the cache clear. Instead stash the payload and let
+			// readyHandler seed it from its tail (after setup); if this event arrives
+			// *after* readyHandler finished, seed now.
+			//
+			// Only act when merged_presences actually carries friends: READY sends an
+			// empty/absent merged_presences (possibly as `{}` or `{"friends":[]}`),
+			// and stashing that would clobber a READY_SUPPLEMENTAL payload a
+			// concurrent goroutine already stashed. Check the decoded friends count
+			// rather than raw byte length so `{}`/`{"friends":[]}` don't slip through.
+			var diag struct {
+				MergedPresences json.RawMessage `json:"merged_presences"`
+			}
+			var hasFriends bool
+			if err := json.Unmarshal(evt.RawData, &diag); err != nil {
+				user.log.Debug().Err(err).Str("event_type", evt.Type).Msg("Failed to parse merged_presences for diagnostic logging")
+			} else if len(diag.MergedPresences) > 0 {
+				var mp struct {
+					Friends []json.RawMessage `json:"friends"`
+				}
+				hasFriends = json.Unmarshal(diag.MergedPresences, &mp) == nil && len(mp.Friends) > 0
+			}
+			if hasFriends {
+				// If readyHandler has already finished (readyComplete), seed directly
+				// and do NOT stash — a stashed-but-already-seeded payload would be
+				// replayed by the next reconnect's tail. Only stash when setup is still
+				// in progress, so the tail consumes it exactly once.
+				user.presenceLock.Lock()
+				ready := user.readyComplete
+				if !ready {
+					user.mergedPresencesRaw = evt.RawData
+				}
+				user.presenceLock.Unlock()
+				if ready {
+					go user.seedMergedPresences(evt.RawData)
+				}
+				if user.log.Debug().Enabled() {
+					user.log.Debug().
+						Str("event_type", evt.Type).
+						Int("payload_bytes", len(evt.RawData)).
+						RawJSON("merged_presences", diag.MergedPresences).
+						Msg("Raw gateway merged_presences (presence seeding diagnostic)")
+				}
+			}
 		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
 			user.log.Debug().
 				Str("event_type", evt.Type).
@@ -1102,6 +1172,11 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
+	// Note: readyComplete is reset to false synchronously in eventHandlerSync when
+	// the READY event is dispatched (before this async handler and before the
+	// READY_SUPPLEMENTAL handler run), so it is not reset here. mergedPresencesRaw
+	// is intentionally left as-is: a concurrent READY_SUPPLEMENTAL may have already
+	// stashed a payload; the tail consumes and nils it.
 	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
@@ -1171,6 +1246,22 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	// that users who are already online are reflected immediately rather than
 	// waiting for a future PresenceUpdate event.
 	go user.seedPresences(r.Presences)
+
+	// Now that DM puppets are created, the keepalive is running and presenceCache
+	// has been cleared, seed friend presences from any merged_presences payload
+	// stashed by the READY/READY_SUPPLEMENTAL raw-event handler. Mark readyComplete
+	// so a READY_SUPPLEMENTAL that arrives *after* this point seeds itself.
+	user.presenceLock.Lock()
+	user.readyComplete = true
+	stashed := user.mergedPresencesRaw
+	// Consume the stash so a later READY_SUPPLEMENTAL (which now sees readyComplete)
+	// seeds itself rather than being re-seeded here, and so a subsequent reconnect
+	// doesn't replay this connection's payload.
+	user.mergedPresencesRaw = nil
+	user.presenceLock.Unlock()
+	if stashed != nil {
+		go user.seedMergedPresences(stashed)
+	}
 
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 }
@@ -2897,12 +2988,21 @@ func (user *User) runPresenceKeepalive(ctx context.Context) {
 	}
 }
 
-// seedMergedPresences seeds friend presences from the raw READY payload's
+// seedMergedPresences seeds friend presences from a raw gateway payload's
 // merged_presences field, which discordgo's typed Ready does not parse. On a
-// user account, friends' current presence is delivered here at connect; without
-// this a friend has no Matrix presence until they next change state. Parsed
-// defensively — if the field is absent or shaped differently, it simply seeds
-// nothing (no regression). No-op unless a Discord→Matrix read is enabled.
+// user account, friends' current presence is delivered in the READY_SUPPLEMENTAL
+// event (dispatched right after READY), not in READY itself — the READY payload
+// carries an empty/absent merged_presences. Called for both events; READY simply
+// seeds nothing. Without this a friend has no Matrix presence until they next
+// change state. Parsed defensively — if the field is absent or shaped
+// differently, it simply seeds nothing (no regression). No-op unless a
+// Discord→Matrix read is enabled.
+//
+// TODO: merged_presences also carries a "guilds" array (a per-guild list of
+// presence entries). We only parse "friends" here since the reported issue is
+// DM/friend presence; guild presences are already seeded via GUILD_CREATE. Add
+// guild parsing here only once the exact nested shape is confirmed from the
+// READY_SUPPLEMENTAL debug log added above.
 func (user *User) seedMergedPresences(raw json.RawMessage) {
 	if !user.discordReadEnabled() {
 		return
@@ -2917,7 +3017,7 @@ func (user *User) seedMergedPresences(raw json.RawMessage) {
 		} `json:"merged_presences"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		user.log.Debug().Err(err).Msg("Failed to parse merged_presences from READY")
+		user.log.Debug().Err(err).Msg("Failed to parse merged_presences from READY/READY_SUPPLEMENTAL")
 		return
 	}
 	seeded := 0
