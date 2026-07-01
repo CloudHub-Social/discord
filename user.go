@@ -151,6 +151,14 @@ type User struct {
 	// by a prior preserve that happened to carry the same empty text.
 	lastSentDiscordClear bool
 
+	// lastSentDiscordRESTStatus records the account-level status (settings.status)
+	// last *successfully* set via UserUpdateStatus for user tokens. It is separate
+	// from lastSentDiscordStatus (the opcode-3 dedup key) and is updated only after
+	// the REST call succeeds — never pre-armed — so a transient REST failure leaves
+	// it stale and the next presence ping with the same desired state retries the
+	// PATCH instead of being deduped away.
+	lastSentDiscordRESTStatus string
+
 	// presenceCache maps Discord user IDs to their last known non-offline
 	// Matrix presence state. The keepalive goroutine re-sends these every
 	// presenceKeepaliveInterval so Synapse does not expire ghost users'
@@ -695,6 +703,7 @@ func (user *User) Logout(isOverwriting bool) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
+	user.lastSentDiscordRESTStatus = ""
 	user.discordPresenceSetAt = time.Time{}
 	user.matrixPresenceSetAt = time.Time{}
 	user.lastSentToDiscordStatus = ""
@@ -1095,6 +1104,7 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
+	user.lastSentDiscordRESTStatus = ""
 	user.presenceLock.Unlock()
 
 	if user.DiscordID != r.User.ID {
@@ -1567,6 +1577,7 @@ func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	user.lastSentDiscordStatus = ""
 	user.lastSentDiscordStatusText = ""
 	user.lastSentDiscordClear = false
+	user.lastSentDiscordRESTStatus = ""
 	user.presenceLock.Unlock()
 	// Re-subscribe with the same pacing as the initial connect (subscribeGuilds
 	// emits one op-14 GuildSubscribe per bridged guild). A 0-delay burst here
@@ -2744,7 +2755,14 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 	restNeeded := sess.IsUser && (statusText != "" || clearStatus) &&
 		(statusText != prevSentText || clearStatus != prevClear)
 	// Decide whether to also set the account-level status via REST (see below).
-	statusChanged := sess.IsUser && status != prevSentStatus
+	// Gated on presence sync being enabled: in status-only mode HandleMatrixPresence
+	// substitutes "online" as a mere carrier for a custom-status update, so pushing
+	// it to the account-level settings.status would wrongly make an invisible/offline
+	// account appear online. Deduped against the status last *successfully* set via
+	// REST — a distinct field from the opcode-3 dedup key, updated only on success —
+	// so a transient REST failure is retried on the next ping instead of masked.
+	pSync := user.bridge.Config.Bridge.SyncMatrixPresenceToDiscord
+	statusChanged := sess.IsUser && pSync && status != user.lastSentDiscordRESTStatus
 	user.matrixPresenceSetAt = now
 	user.lastSentToDiscordStatus = status
 	user.lastSentToDiscordText = statusText
@@ -2784,6 +2802,13 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 			user.log.Warn().Err(statusErr).
 				Str("discord_status", status).
 				Msg("Failed to set Discord account status via REST from Matrix presence")
+		} else {
+			// Record the success-only dedup state so subsequent identical presence
+			// pings skip the PATCH, while a failure above leaves it stale so the
+			// next ping retries rather than being deduped away.
+			user.presenceLock.Lock()
+			user.lastSentDiscordRESTStatus = status
+			user.presenceLock.Unlock()
 		}
 	}
 
