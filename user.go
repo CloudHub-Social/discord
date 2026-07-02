@@ -122,6 +122,25 @@ type User struct {
 	// watchdog firing, so a valid session is never closed. Reset to false when a
 	// new connect arms the watchdog.
 	sessionReady bool
+	// stableTimer fires stableConnectionThreshold after READY/RESUMED and is what
+	// actually clears reconnectAttempts (via onConnectionStable) — reaching READY
+	// alone no longer resets the backoff. A connection that dies again within the
+	// threshold never reaches this timer, so scheduleReconnect keeps escalating
+	// instead of restarting from the base delay every cycle.
+	stableTimer *time.Timer
+	// connectionEpoch increments every time a connection drops (see
+	// disarmReadyWatchdog), independent of whether user.Session has been
+	// replaced by a new object yet. onConnectionEstablished captures the epoch
+	// when arming stableTimer; onConnectionStable only clears reconnectAttempts
+	// if the epoch is unchanged when the timer fires. This closes a race where
+	// time.Timer.Stop() can return too late for a timer that's already begun
+	// executing: a session-pointer check alone can't tell "this connection
+	// dropped, but the next connect() hasn't run yet" from "this connection is
+	// still the current one", since user.Session doesn't change until the next
+	// connect() attempt. The epoch changes at the moment of disconnect instead,
+	// and both the bump and the check happen under reconnectLock, so whichever
+	// runs first is deterministic rather than a real-time race.
+	connectionEpoch uint64
 
 	markedOpened     map[string]time.Time
 	markedOpenedLock sync.Mutex
@@ -1944,7 +1963,32 @@ const (
 	// already routes through the backoff path; this is the backstop for when it
 	// doesn't.
 	readyTimeout = 20 * time.Second
+	// stableConnectionThreshold is how long a connection must stay up past
+	// READY/RESUMED before it's considered recovered and reconnectAttempts is
+	// cleared. Reaching READY is not enough on its own: a session can be accepted
+	// by the handshake and still be killed a second or two later (Discord
+	// rejecting something the bridge sends over the now-authenticated
+	// connection), and without this threshold every such cycle would reset the
+	// backoff counter to 0, so scheduleReconnect never escalates past its base
+	// delay no matter how many times this happens in a row.
+	stableConnectionThreshold = 30 * time.Second
 )
+
+// reconnectDelay computes the backoff delay for the given number of consecutive
+// reconnect attempts since the last stable connection (see
+// stableConnectionThreshold): 2^(attempts-1) * reconnectBackoffBase, capped at
+// reconnectBackoffMax. attempts is expected to be >= 1.
+func reconnectDelay(attempts int) time.Duration {
+	shift := attempts - 1
+	if shift > 9 {
+		shift = 9
+	}
+	delay := reconnectBackoffBase << shift
+	if delay > reconnectBackoffMax {
+		delay = reconnectBackoffMax
+	}
+	return delay
+}
 
 // armReadyWatchdog (re)starts the READY watchdog for the current session. Called
 // after a successful Open(); cancelled by readyHandler on success or by
@@ -1970,30 +2014,83 @@ func (user *User) armReadyWatchdog() {
 }
 
 // onConnectionEstablished runs the success cleanup shared by READY and RESUMED:
-// it marks the session ready, disarms the watchdog, and resets the backoff
-// counter. It deliberately does NOT stop reconnectTimer — because gateway events
-// dispatch on separate goroutines, a stale READY can run after a Disconnect from
-// the same connection has already scheduled a retry, and cancelling that timer
-// would leave the bridge disconnected with no pending reconnect. An intentional
-// Connect() supersedes a pending timer instead (see connect()).
+// it marks the session ready, disarms the READY watchdog, and arms the stability
+// timer that will clear the backoff counter — but only after the connection has
+// actually stayed up for stableConnectionThreshold (see onConnectionStable). It
+// deliberately does NOT stop reconnectTimer — because gateway events dispatch on
+// separate goroutines, a stale READY can run after a Disconnect from the same
+// connection has already scheduled a retry, and cancelling that timer would leave
+// the bridge disconnected with no pending reconnect. An intentional Connect()
+// supersedes a pending timer instead (see connect()).
 func (user *User) onConnectionEstablished() {
 	user.reconnectLock.Lock()
 	user.sessionReady = true
-	user.reconnectAttempts = 0
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
 	}
+	if user.stableTimer != nil {
+		user.stableTimer.Stop()
+	}
+	// Capture the current epoch so onConnectionStable can tell, when it fires,
+	// whether a disconnect happened in the meantime (see connectionEpoch).
+	epoch := user.connectionEpoch
+	user.stableTimer = time.AfterFunc(stableConnectionThreshold, func() { user.onConnectionStable(epoch) })
 	user.reconnectLock.Unlock()
 }
 
-// disarmReadyWatchdog cancels the READY watchdog if armed.
+// onConnectionStable fires stableConnectionThreshold after a READY/RESUMED that
+// wasn't superseded by another disconnect/reconnect cycle in the meantime — i.e.
+// the connection actually recovered rather than just briefly reaching READY
+// before dying again. Only then is it safe to clear reconnectAttempts, so a
+// flapping connection keeps escalating its backoff instead of restarting from
+// the base delay every cycle.
+//
+// The epoch check alone isn't sufficient: onConnectionEstablished can run for a
+// READY/RESUMED whose dispatch was delayed until after disconnectedHandler
+// already processed that same connection's drop (event handlers can run on a
+// goroutine that lags behind the actual gateway state). In that case the
+// stale event captures the *current* (already-bumped) epoch when it arms this
+// timer, so an epoch match alone would wrongly look legitimate. Gating on
+// reconnectTimer == nil closes this: a non-nil reconnectTimer means a backoff
+// reconnect is currently scheduled, which can only be true if we are not
+// presently in a genuinely stable, connected state, regardless of how this
+// particular timer came to be armed.
+func (user *User) onConnectionStable(epoch uint64) {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	user.stableTimer = nil
+	if epoch != user.connectionEpoch {
+		// A disconnect bumped the epoch since this timer was armed -- the
+		// connection it was tracking didn't stay up. Do not touch the backoff
+		// counter on its behalf.
+		return
+	}
+	if user.reconnectTimer != nil {
+		// A backoff reconnect is currently scheduled, so we are not actually in
+		// a stable connected state right now -- this timer must have been armed
+		// by a stale/delayed event. Leave reconnectAttempts alone.
+		return
+	}
+	user.reconnectAttempts = 0
+}
+
+// disarmReadyWatchdog cancels the READY watchdog and the stability timer, if
+// armed, and bumps connectionEpoch. Called when a connection drops: whichever
+// timer was pending is now moot, since the connection it was tracking is gone,
+// and the epoch bump tells any in-flight onConnectionStable for that connection
+// not to clear the backoff counter even if it fired concurrently with Stop().
 func (user *User) disarmReadyWatchdog() {
 	user.reconnectLock.Lock()
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
 	}
+	if user.stableTimer != nil {
+		user.stableTimer.Stop()
+		user.stableTimer = nil
+	}
+	user.connectionEpoch++
 	user.reconnectLock.Unlock()
 }
 
@@ -2037,14 +2134,7 @@ func (user *User) scheduleReconnect() {
 		return
 	}
 	user.reconnectAttempts++
-	shift := user.reconnectAttempts - 1
-	if shift > 9 {
-		shift = 9
-	}
-	delay := reconnectBackoffBase << shift
-	if delay > reconnectBackoffMax {
-		delay = reconnectBackoffMax
-	}
+	delay := reconnectDelay(user.reconnectAttempts)
 	user.log.Warn().
 		Int("attempt", user.reconnectAttempts).
 		Dur("delay", delay).
@@ -2109,6 +2199,11 @@ func (user *User) stopReconnecting() {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
 	}
+	if user.stableTimer != nil {
+		user.stableTimer.Stop()
+		user.stableTimer = nil
+	}
+	user.connectionEpoch++
 	user.reconnectLock.Unlock()
 }
 
