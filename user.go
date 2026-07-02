@@ -84,18 +84,18 @@ type User struct {
 	bridgeStateLock sync.Mutex
 	wasDisconnected bool
 	wasLoggedOut    bool
-	// sentBadCredentialsNotice guards the management-room notice sent alongside
-	// StateBadCredentials (see sendBadCredentialsNotice): both invalidAuthHandler
-	// and handlePossible40002 can report bad credentials, and the latter can be
-	// hit repeatedly by retried REST calls while the account stays broken, so
-	// this must fire at most once per invalidation rather than once per trigger.
-	// Reset to false on the next successful Login, same lifecycle as wasLoggedOut.
+	// sentBadCredentialsNotice records whether the most recent management-room
+	// notice attempt (see sendBadCredentialsNotice) succeeded. Not a permanent
+	// "ever sent" latch: handlePossible40002 doesn't log the user out or clear
+	// DiscordToken, so a session can keep running long after one successful
+	// notice with no further Login to reset this -- badCredentialsNoticeAttemptDecision
+	// gates on badCredentialsNoticeResendCooldown instead of blocking forever,
+	// so a persisting or recurring issue still gets a fresh reminder eventually.
+	// Also reset to false on the next successful Login, same as wasLoggedOut.
 	sentBadCredentialsNotice bool
-	// lastBadCredentialsNoticeAttempt bounds how often a failed notice send is
-	// retried (see badCredentialsNoticeRetryCooldown): handlePossible40002 can be
-	// hit repeatedly in a short burst by retried REST calls, and without this a
-	// homeserver outage during that burst would mean a real send attempt on
-	// every single failed call instead of backing off. Zero value means no
+	// lastBadCredentialsNoticeAttempt is when sentBadCredentialsNotice was last
+	// set, driving both badCredentialsNoticeRetryCooldown (after a failure) and
+	// badCredentialsNoticeResendCooldown (after a success). Zero value means no
 	// attempt yet; reset alongside sentBadCredentialsNotice on the next Login.
 	lastBadCredentialsNoticeAttempt time.Time
 
@@ -2164,12 +2164,25 @@ func badCredentialsNoticeSkipReason(noticesEnabled bool, managementRoom id.RoomI
 	return "", false
 }
 
-// badCredentialsNoticeRetryCooldown bounds how often a failed notice send is
-// retried. handlePossible40002 can be triggered repeatedly in a short burst by
-// retried REST calls while the account stays broken; without this, a
-// homeserver outage during that burst would mean a real send attempt on every
-// single failed call instead of backing off.
-const badCredentialsNoticeRetryCooldown = 1 * time.Minute
+const (
+	// badCredentialsNoticeRetryCooldown bounds how often a *failed* notice send
+	// is retried. handlePossible40002 can be triggered repeatedly in a short
+	// burst by retried REST calls while the account stays broken; without this,
+	// a homeserver outage during that burst would mean a real send attempt on
+	// every single failed call instead of backing off.
+	badCredentialsNoticeRetryCooldown = 1 * time.Minute
+	// badCredentialsNoticeResendCooldown bounds how often a notice is resent
+	// after a *successful* send. sentBadCredentialsNotice only resets on the
+	// next Login, but handlePossible40002 doesn't log the user out or clear
+	// DiscordToken, so a session can run for a long time after the one
+	// successful notice with no further Login to reset it -- without this, any
+	// later bad-credentials event in that same session (the same still-broken
+	// account, or a distinct new issue) would be silently suppressed forever.
+	// An hour is long enough to avoid re-notifying on transient blips shortly
+	// after the first notice, but short enough that a persisting or recurring
+	// problem gets a fresh reminder well within a single day.
+	badCredentialsNoticeResendCooldown = 1 * time.Hour
+)
 
 // noticeSender is the minimal interface sendBadCredentialsNotice needs from
 // user.bridge.Bot (an *appservice.IntentAPI). Narrowed down so tests can
@@ -2184,12 +2197,19 @@ type noticeSender interface {
 // cooldown interaction is testable without real timers). Pure and separate
 // from sendBadCredentialsNotice, which owns the actual locking around this
 // state.
+//
+// alreadySent means the most recent attempt succeeded, not "ever sent" --
+// deliberately not a permanent block, see badCredentialsNoticeResendCooldown.
 func badCredentialsNoticeAttemptDecision(alreadySent bool, lastAttempt, now time.Time) (attempt bool, skipReason string) {
-	if alreadySent {
-		return false, "already_sent"
+	if lastAttempt.IsZero() {
+		return true, ""
 	}
-	if !lastAttempt.IsZero() && now.Sub(lastAttempt) < badCredentialsNoticeRetryCooldown {
-		return false, "retry_cooldown"
+	cooldown, reason := badCredentialsNoticeRetryCooldown, "retry_cooldown"
+	if alreadySent {
+		cooldown, reason = badCredentialsNoticeResendCooldown, "resend_cooldown"
+	}
+	if now.Sub(lastAttempt) < cooldown {
+		return false, reason
 	}
 	return true, ""
 }

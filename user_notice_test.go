@@ -53,10 +53,15 @@ func TestBadCredentialsNoticeSkipReason(t *testing.T) {
 }
 
 // TestBadCredentialsNoticeAttemptDecision covers requirement P0-A.2 (fire at
-// most once per invalidation, not once per call) and the retry-cooldown
-// hardening added on review: a burst of handlePossible40002 calls while the
-// homeserver send keeps failing must back off rather than retrying on every
-// single call.
+// most once per invalidation, not once per call), the retry-cooldown hardening
+// added on review (a burst of handlePossible40002 calls while the homeserver
+// send keeps failing must back off rather than retrying on every single
+// call), and the regression Sentry flagged on a later review pass: since
+// handlePossible40002 never logs the user out, sentBadCredentialsNotice has no
+// natural "issue resolved" signal to reset on besides the next Login -- a
+// permanent block would silently suppress every later bad-credentials event
+// for the rest of a long-running session. alreadySent must therefore be a
+// cooldown, not a permanent latch.
 func TestBadCredentialsNoticeAttemptDecision(t *testing.T) {
 	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
 
@@ -68,11 +73,12 @@ func TestBadCredentialsNoticeAttemptDecision(t *testing.T) {
 		wantSkipReason string
 	}{
 		{"first ever attempt proceeds", false, time.Time{}, true, ""},
-		{"already sent this invalidation is suppressed", true, time.Time{}, false, "already_sent"},
-		{"already_sent wins even if the cooldown would also allow a retry", true, now.Add(-time.Hour), false, "already_sent"},
-		{"retry within the cooldown window is suppressed", false, now.Add(-30 * time.Second), false, "retry_cooldown"},
-		{"retry right at the cooldown boundary is suppressed", false, now.Add(-badCredentialsNoticeRetryCooldown + time.Second), false, "retry_cooldown"},
-		{"retry after the cooldown has elapsed proceeds", false, now.Add(-badCredentialsNoticeRetryCooldown - time.Second), true, ""},
+		{"failed attempt retried within the short cooldown is suppressed", false, now.Add(-30 * time.Second), false, "retry_cooldown"},
+		{"failed attempt right at the short cooldown boundary is suppressed", false, now.Add(-badCredentialsNoticeRetryCooldown + time.Second), false, "retry_cooldown"},
+		{"failed attempt retried after the short cooldown elapses proceeds", false, now.Add(-badCredentialsNoticeRetryCooldown - time.Second), true, ""},
+		{"successful attempt resent within the long cooldown is suppressed", true, now.Add(-10 * time.Minute), false, "resend_cooldown"},
+		{"successful attempt right at the long cooldown boundary is suppressed", true, now.Add(-badCredentialsNoticeResendCooldown + time.Second), false, "resend_cooldown"},
+		{"successful attempt resent after the long cooldown elapses proceeds (Sentry regression)", true, now.Add(-badCredentialsNoticeResendCooldown - time.Second), true, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
