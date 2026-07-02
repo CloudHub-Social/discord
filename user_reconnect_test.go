@@ -146,3 +146,29 @@ func TestDisarmReadyWatchdog_BumpsEpochSoLateStableFiringIsIgnored(t *testing.T)
 
 	assert.Equal(t, 3, u.reconnectAttempts, "a stale onConnectionStable firing after disarmReadyWatchdog must not reset attempts")
 }
+
+// TestOnConnectionStable_DoesNotResetWhilePendingReconnect is the direct
+// regression test for a gap both automated reviewers on PR #31 flagged: a
+// stale onConnectionEstablished can run for a READY/RESUMED whose dispatch was
+// delayed until after disconnectedHandler already processed that same
+// connection's drop (event handlers can run on a goroutine that lags behind
+// actual gateway state). In that case the stale event captures the
+// *already-bumped* epoch when arming its stability timer -- an epoch match
+// alone would then incorrectly look legitimate 30 seconds later. This
+// simulates exactly that: the epoch matches (no *further* disconnect happened
+// after the stale timer was armed), but a reconnect is currently pending
+// (reconnectTimer != nil), which can only be true if we are not actually in a
+// stable connected state right now -- reconnectAttempts must not reset.
+func TestOnConnectionStable_DoesNotResetWhilePendingReconnect(t *testing.T) {
+	u := newTestUser()
+	u.reconnectAttempts = 3
+	// A pending backoff reconnect -- only its nil-ness is checked, so any live
+	// timer works as a stand-in.
+	u.reconnectTimer = time.NewTimer(time.Hour)
+	defer u.reconnectTimer.Stop()
+
+	u.onConnectionStable(u.connectionEpoch) // epoch matches; no disconnect happened
+
+	assert.Equal(t, 3, u.reconnectAttempts, "must not reset the backoff counter while a reconnect is pending, even with a matching epoch")
+	assert.Nil(t, u.stableTimer, "the timer reference should still be cleared even when the reset itself is skipped")
+}

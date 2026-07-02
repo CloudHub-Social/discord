@@ -2029,16 +2029,33 @@ func (user *User) onConnectionEstablished() {
 // before dying again. Only then is it safe to clear reconnectAttempts, so a
 // flapping connection keeps escalating its backoff instead of restarting from
 // the base delay every cycle.
+//
+// The epoch check alone isn't sufficient: onConnectionEstablished can run for a
+// READY/RESUMED whose dispatch was delayed until after disconnectedHandler
+// already processed that same connection's drop (event handlers can run on a
+// goroutine that lags behind the actual gateway state). In that case the
+// stale event captures the *current* (already-bumped) epoch when it arms this
+// timer, so an epoch match alone would wrongly look legitimate. Gating on
+// reconnectTimer == nil closes this: a non-nil reconnectTimer means a backoff
+// reconnect is currently scheduled, which can only be true if we are not
+// presently in a genuinely stable, connected state, regardless of how this
+// particular timer came to be armed.
 func (user *User) onConnectionStable(epoch uint64) {
 	user.reconnectLock.Lock()
 	defer user.reconnectLock.Unlock()
+	user.stableTimer = nil
 	if epoch != user.connectionEpoch {
 		// A disconnect bumped the epoch since this timer was armed -- the
 		// connection it was tracking didn't stay up. Do not touch the backoff
 		// counter on its behalf.
 		return
 	}
-	user.stableTimer = nil
+	if user.reconnectTimer != nil {
+		// A backoff reconnect is currently scheduled, so we are not actually in
+		// a stable connected state right now -- this timer must have been armed
+		// by a stale/delayed event. Leave reconnectAttempts alone.
+		return
+	}
 	user.reconnectAttempts = 0
 }
 
