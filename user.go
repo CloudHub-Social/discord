@@ -2175,10 +2175,11 @@ func (user *User) sendBadCredentialsNotice(errorCode, message string) {
 	user.sentBadCredentialsNotice = true
 	user.bridgeStateLock.Unlock()
 
+	// No command prefix here: this is always sent to user.ManagementRoom, and
+	// commands there never require one (see the bridge's own !discord help text).
 	content := &event.MessageEventContent{
 		MsgType: event.MsgNotice,
-		Body: fmt.Sprintf("⚠ Your Discord session was signed out: %s\n\nRun `%s login` to reconnect.",
-			message, user.bridge.Config.Bridge.CommandPrefix),
+		Body:    fmt.Sprintf("\u26a0 Your Discord session was signed out: %s\n\nRun `login` to reconnect.", message),
 	}
 	_, err := user.bridge.Bot.SendMessageEvent(user.ManagementRoom, event.EventMessage, content)
 	if err != nil {
