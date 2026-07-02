@@ -17,10 +17,14 @@
 package main
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -48,35 +52,92 @@ func TestBadCredentialsNoticeSkipReason(t *testing.T) {
 	}
 }
 
-// TestSentBadCredentialsNoticeDedup exercises the sentBadCredentialsNotice
-// check-and-set pattern that sendBadCredentialsNotice uses to ensure a notice
-// fires at most once per invalidation, not once per call (handlePossible40002
-// in particular can be hit repeatedly by retried REST calls while the account
-// stays broken). This mirrors sendBadCredentialsNotice's locking exactly, but
-// does not call the function itself, since doing so requires a live Matrix
-// intent (user.bridge.Bot) this repo has no test double for yet -- see the
-// spec's Testing Strategy section for the coverage gap this leaves.
-func TestSentBadCredentialsNoticeDedup(t *testing.T) {
-	u := newTestUser()
+// TestBadCredentialsNoticeAttemptDecision covers requirement P0-A.2 (fire at
+// most once per invalidation, not once per call) and the retry-cooldown
+// hardening added on review: a burst of handlePossible40002 calls while the
+// homeserver send keeps failing must back off rather than retrying on every
+// single call.
+func TestBadCredentialsNoticeAttemptDecision(t *testing.T) {
+	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
 
-	assert.False(t, u.sentBadCredentialsNotice, "starts unset")
+	tests := []struct {
+		name           string
+		alreadySent    bool
+		lastAttempt    time.Time
+		wantAttempt    bool
+		wantSkipReason string
+	}{
+		{"first ever attempt proceeds", false, time.Time{}, true, ""},
+		{"already sent this invalidation is suppressed", true, time.Time{}, false, "already_sent"},
+		{"already_sent wins even if the cooldown would also allow a retry", true, now.Add(-time.Hour), false, "already_sent"},
+		{"retry within the cooldown window is suppressed", false, now.Add(-30 * time.Second), false, "retry_cooldown"},
+		{"retry right at the cooldown boundary is suppressed", false, now.Add(-badCredentialsNoticeRetryCooldown + time.Second), false, "retry_cooldown"},
+		{"retry after the cooldown has elapsed proceeds", false, now.Add(-badCredentialsNoticeRetryCooldown - time.Second), true, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attempt, reason := badCredentialsNoticeAttemptDecision(tt.alreadySent, tt.lastAttempt, now)
+			assert.Equal(t, tt.wantAttempt, attempt)
+			assert.Equal(t, tt.wantSkipReason, reason)
+		})
+	}
+}
 
-	u.bridgeStateLock.Lock()
-	firstCall := !u.sentBadCredentialsNotice
-	u.sentBadCredentialsNotice = true
-	u.bridgeStateLock.Unlock()
-	assert.True(t, firstCall, "first call should proceed to send")
+// fakeNoticeSender is a test double for noticeSender that records every call
+// it receives instead of talking to a real Matrix homeserver. failNext, if
+// set, is returned as the error for exactly the next call, then cleared.
+type fakeNoticeSender struct {
+	calls    []fakeNoticeSenderCall
+	failNext error
+}
 
-	u.bridgeStateLock.Lock()
-	secondCall := !u.sentBadCredentialsNotice
-	u.bridgeStateLock.Unlock()
-	assert.False(t, secondCall, "second call for the same invalidation must be suppressed")
+type fakeNoticeSenderCall struct {
+	RoomID    id.RoomID
+	EventType event.Type
+	Content   interface{}
+}
 
-	// A fresh Login resets the flag, allowing a future invalidation to notify again.
-	u.wasLoggedOut = true
-	u.bridgeStateLock.Lock()
-	u.wasLoggedOut = false
-	u.sentBadCredentialsNotice = false
-	u.bridgeStateLock.Unlock()
-	assert.False(t, u.sentBadCredentialsNotice, "Login resets the dedup flag for the next invalidation")
+func (f *fakeNoticeSender) SendMessageEvent(roomID id.RoomID, eventType event.Type, contentJSON interface{}) (*mautrix.RespSendEvent, error) {
+	f.calls = append(f.calls, fakeNoticeSenderCall{roomID, eventType, contentJSON})
+	if f.failNext != nil {
+		err := f.failNext
+		f.failNext = nil
+		return nil, err
+	}
+	return &mautrix.RespSendEvent{EventID: "$fake"}, nil
+}
+
+// TestSendBadCredentialsNoticeContent is the integration-style test the first
+// pass of this PR flagged as a coverage gap: it exercises the actual dispatch
+// path (room targeting, event type, message body) against a real noticeSender
+// implementation, not just the gating logic around it.
+func TestSendBadCredentialsNoticeContent(t *testing.T) {
+	sender := &fakeNoticeSender{}
+	roomID := id.RoomID("!management:example.com")
+
+	err := sendBadCredentialsNoticeContent(sender, roomID, "token is dead")
+
+	assert.NoError(t, err)
+	assert.Len(t, sender.calls, 1)
+	call := sender.calls[0]
+	assert.Equal(t, roomID, call.RoomID)
+	assert.Equal(t, event.EventMessage, call.EventType)
+	content, ok := call.Content.(*event.MessageEventContent)
+	assert.True(t, ok, "content should be a *event.MessageEventContent")
+	assert.Equal(t, event.MsgNotice, content.MsgType)
+	assert.Contains(t, content.Body, "token is dead")
+	assert.Contains(t, content.Body, "login", "the notice must tell the user how to reconnect")
+	assert.NotContains(t, content.Body, "!discord login", "commands in the management room never need the bridge's command prefix")
+}
+
+// TestSendBadCredentialsNoticeContent_PropagatesSendError confirms a failed
+// send is surfaced to the caller (sendBadCredentialsNotice relies on this to
+// know when to release the dedup flag for a retry).
+func TestSendBadCredentialsNoticeContent_PropagatesSendError(t *testing.T) {
+	wantErr := errors.New("connection refused")
+	sender := &fakeNoticeSender{failNext: wantErr}
+
+	err := sendBadCredentialsNoticeContent(sender, "!management:example.com", "token is dead")
+
+	assert.ErrorIs(t, err, wantErr)
 }
