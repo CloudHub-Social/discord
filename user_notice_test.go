@@ -53,33 +53,42 @@ func TestBadCredentialsNoticeSkipReason(t *testing.T) {
 // most once per invalidation, not once per call), the retry-cooldown hardening
 // added on review (a burst of handlePossible40002 calls while the homeserver
 // send keeps failing must back off rather than retrying on every single
-// call), and the regression Sentry flagged on a later review pass: since
+// call), the regression Sentry flagged on a later review pass (since
 // handlePossible40002 never logs the user out, sentBadCredentialsNotice has no
 // natural "issue resolved" signal to reset on besides the next Login -- a
 // permanent block would silently suppress every later bad-credentials event
-// for the rest of a long-running session. alreadySent must therefore be a
-// cooldown, not a permanent latch.
+// for the rest of a long-running session, so alreadySent must be a cooldown,
+// not a permanent latch), and the regression Codex flagged on yet another pass:
+// the cooldowns must only apply to a *repeat* of the same error code -- a
+// different code (e.g. a real 4004 full logout arriving shortly after a 40002
+// notice that explicitly said not to log in) needs to get through immediately
+// regardless of the other code's cooldown, since it may need opposite advice.
 func TestBadCredentialsNoticeAttemptDecision(t *testing.T) {
 	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	const codeA, codeB = "dc-http-40002", "dc-websocket-disconnect-4004"
 
 	tests := []struct {
 		name           string
 		alreadySent    bool
+		errorCode      string
+		lastErrorCode  string
 		lastAttempt    time.Time
 		wantAttempt    bool
 		wantSkipReason string
 	}{
-		{"first ever attempt proceeds", false, time.Time{}, true, ""},
-		{"failed attempt retried within the short cooldown is suppressed", false, now.Add(-30 * time.Second), false, "retry_cooldown"},
-		{"failed attempt right at the short cooldown boundary is suppressed", false, now.Add(-badCredentialsNoticeRetryCooldown + time.Second), false, "retry_cooldown"},
-		{"failed attempt retried after the short cooldown elapses proceeds", false, now.Add(-badCredentialsNoticeRetryCooldown - time.Second), true, ""},
-		{"successful attempt resent within the long cooldown is suppressed", true, now.Add(-10 * time.Minute), false, "resend_cooldown"},
-		{"successful attempt right at the long cooldown boundary is suppressed", true, now.Add(-badCredentialsNoticeResendCooldown + time.Second), false, "resend_cooldown"},
-		{"successful attempt resent after the long cooldown elapses proceeds (Sentry regression)", true, now.Add(-badCredentialsNoticeResendCooldown - time.Second), true, ""},
+		{"first ever attempt proceeds", false, codeA, "", time.Time{}, true, ""},
+		{"failed attempt retried within the short cooldown is suppressed", false, codeA, codeA, now.Add(-30 * time.Second), false, "retry_cooldown"},
+		{"failed attempt right at the short cooldown boundary is suppressed", false, codeA, codeA, now.Add(-badCredentialsNoticeRetryCooldown + time.Second), false, "retry_cooldown"},
+		{"failed attempt retried after the short cooldown elapses proceeds", false, codeA, codeA, now.Add(-badCredentialsNoticeRetryCooldown - time.Second), true, ""},
+		{"successful attempt resent within the long cooldown is suppressed", true, codeA, codeA, now.Add(-10 * time.Minute), false, "resend_cooldown"},
+		{"successful attempt right at the long cooldown boundary is suppressed", true, codeA, codeA, now.Add(-badCredentialsNoticeResendCooldown + time.Second), false, "resend_cooldown"},
+		{"successful attempt resent after the long cooldown elapses proceeds (Sentry regression)", true, codeA, codeA, now.Add(-badCredentialsNoticeResendCooldown - time.Second), true, ""},
+		{"a different error code bypasses an active resend cooldown (Codex regression)", true, codeB, codeA, now.Add(-time.Second), true, ""},
+		{"a different error code bypasses an active retry cooldown too", false, codeB, codeA, now.Add(-time.Second), true, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			attempt, reason := badCredentialsNoticeAttemptDecision(tt.alreadySent, tt.lastAttempt, now)
+			attempt, reason := badCredentialsNoticeAttemptDecision(tt.alreadySent, tt.errorCode, tt.lastErrorCode, tt.lastAttempt, now)
 			assert.Equal(t, tt.wantAttempt, attempt)
 			assert.Equal(t, tt.wantSkipReason, reason)
 		})

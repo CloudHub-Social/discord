@@ -98,6 +98,14 @@ type User struct {
 	// badCredentialsNoticeResendCooldown (after a success). Zero value means no
 	// attempt yet; reset alongside sentBadCredentialsNotice on the next Login.
 	lastBadCredentialsNoticeAttempt time.Time
+	// lastBadCredentialsErrorCode is the errorCode (e.g. "dc-http-40002",
+	// "dc-websocket-disconnect-4004") of the last notice attempt. Both cooldowns
+	// above only apply when a new event has the *same* error code as the last
+	// one -- a different code means a materially different situation (possibly
+	// with opposite recovery instructions, e.g. a 4004 full logout arriving
+	// shortly after a 40002 notice that explicitly said not to log in) and must
+	// always get through regardless of how recently the other kind fired.
+	lastBadCredentialsErrorCode string
 
 	// Gateway reconnection is owned by the bridge rather than discordgo
 	// (session.ShouldReconnectOnError is disabled in Connect). reconnectLock
@@ -672,6 +680,7 @@ func (user *User) Login(token string) error {
 	user.wasLoggedOut = false
 	user.sentBadCredentialsNotice = false
 	user.lastBadCredentialsNoticeAttempt = time.Time{}
+	user.lastBadCredentialsErrorCode = ""
 	user.bridgeStateLock.Unlock()
 	user.DiscordToken = token
 	var err error
@@ -2295,8 +2304,15 @@ type noticeSender interface {
 //
 // alreadySent means the most recent attempt succeeded, not "ever sent" --
 // deliberately not a permanent block, see badCredentialsNoticeResendCooldown.
-func badCredentialsNoticeAttemptDecision(alreadySent bool, lastAttempt, now time.Time) (attempt bool, skipReason string) {
-	if lastAttempt.IsZero() {
+//
+// Both cooldowns only apply when errorCode matches lastErrorCode: a different
+// code is a materially different situation (invalidAuthHandler's 4004 and
+// handlePossible40002's 40002 even carry opposite recovery instructions -- one
+// says to log in again, the other says not to) and must always get through
+// regardless of how recently the other kind of event fired, or the user could
+// be stuck seeing stale advice for a problem that no longer applies.
+func badCredentialsNoticeAttemptDecision(alreadySent bool, errorCode, lastErrorCode string, lastAttempt, now time.Time) (attempt bool, skipReason string) {
+	if lastAttempt.IsZero() || errorCode != lastErrorCode {
 		return true, ""
 	}
 	cooldown, reason := badCredentialsNoticeRetryCooldown, "retry_cooldown"
@@ -2355,7 +2371,7 @@ func (user *User) sendBadCredentialsNotice(errorCode, message, recovery string) 
 	}
 
 	user.bridgeStateLock.Lock()
-	attempt, skipReason := badCredentialsNoticeAttemptDecision(user.sentBadCredentialsNotice, user.lastBadCredentialsNoticeAttempt, time.Now())
+	attempt, skipReason := badCredentialsNoticeAttemptDecision(user.sentBadCredentialsNotice, errorCode, user.lastBadCredentialsErrorCode, user.lastBadCredentialsNoticeAttempt, time.Now())
 	if !attempt {
 		user.bridgeStateLock.Unlock()
 		log.Debug().Bool("notice_sent", false).Msg("Bad credentials event (" + skipReason + ")")
@@ -2363,6 +2379,7 @@ func (user *User) sendBadCredentialsNotice(errorCode, message, recovery string) 
 	}
 	user.sentBadCredentialsNotice = true
 	user.lastBadCredentialsNoticeAttempt = time.Now()
+	user.lastBadCredentialsErrorCode = errorCode
 	user.bridgeStateLock.Unlock()
 
 	if err := sendBadCredentialsNoticeContent(user.bridge.Bot, managementRoom, message, recovery); err != nil {
