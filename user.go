@@ -108,6 +108,12 @@ type User struct {
 	// watchdog firing, so a valid session is never closed. Reset to false when a
 	// new connect arms the watchdog.
 	sessionReady bool
+	// stableTimer fires stableConnectionThreshold after READY/RESUMED and is what
+	// actually clears reconnectAttempts (via onConnectionStable) — reaching READY
+	// alone no longer resets the backoff. A connection that dies again within the
+	// threshold never reaches this timer, so scheduleReconnect keeps escalating
+	// instead of restarting from the base delay every cycle.
+	stableTimer *time.Timer
 
 	markedOpened     map[string]time.Time
 	markedOpenedLock sync.Mutex
@@ -1928,7 +1934,32 @@ const (
 	// already routes through the backoff path; this is the backstop for when it
 	// doesn't.
 	readyTimeout = 20 * time.Second
+	// stableConnectionThreshold is how long a connection must stay up past
+	// READY/RESUMED before it's considered recovered and reconnectAttempts is
+	// cleared. Reaching READY is not enough on its own: a session can be accepted
+	// by the handshake and still be killed a second or two later (Discord
+	// rejecting something the bridge sends over the now-authenticated
+	// connection), and without this threshold every such cycle would reset the
+	// backoff counter to 0, so scheduleReconnect never escalates past its base
+	// delay no matter how many times this happens in a row.
+	stableConnectionThreshold = 30 * time.Second
 )
+
+// reconnectDelay computes the backoff delay for the given number of consecutive
+// reconnect attempts since the last stable connection (see
+// stableConnectionThreshold): 2^(attempts-1) * reconnectBackoffBase, capped at
+// reconnectBackoffMax. attempts is expected to be >= 1.
+func reconnectDelay(attempts int) time.Duration {
+	shift := attempts - 1
+	if shift > 9 {
+		shift = 9
+	}
+	delay := reconnectBackoffBase << shift
+	if delay > reconnectBackoffMax {
+		delay = reconnectBackoffMax
+	}
+	return delay
+}
 
 // armReadyWatchdog (re)starts the READY watchdog for the current session. Called
 // after a successful Open(); cancelled by readyHandler on success or by
@@ -1954,29 +1985,73 @@ func (user *User) armReadyWatchdog() {
 }
 
 // onConnectionEstablished runs the success cleanup shared by READY and RESUMED:
-// it marks the session ready, disarms the watchdog, and resets the backoff
-// counter. It deliberately does NOT stop reconnectTimer — because gateway events
-// dispatch on separate goroutines, a stale READY can run after a Disconnect from
-// the same connection has already scheduled a retry, and cancelling that timer
-// would leave the bridge disconnected with no pending reconnect. An intentional
-// Connect() supersedes a pending timer instead (see connect()).
+// it marks the session ready, disarms the READY watchdog, and arms the stability
+// timer that will clear the backoff counter — but only after the connection has
+// actually stayed up for stableConnectionThreshold (see onConnectionStable). It
+// deliberately does NOT stop reconnectTimer — because gateway events dispatch on
+// separate goroutines, a stale READY can run after a Disconnect from the same
+// connection has already scheduled a retry, and cancelling that timer would leave
+// the bridge disconnected with no pending reconnect. An intentional Connect()
+// supersedes a pending timer instead (see connect()).
 func (user *User) onConnectionEstablished() {
+	// READY/RESUMED dispatch on discordgo's listen() goroutine, not the goroutine
+	// running connect() (which only holds user.Lock() through the synchronous
+	// part of Open(), before the read loop is spawned) — so user.Session must be
+	// read under user.Lock() here rather than assumed stable, unlike
+	// armReadyWatchdog which genuinely does run inline within connect().
+	user.Lock()
+	guarded := user.Session
+	user.Unlock()
+
 	user.reconnectLock.Lock()
 	user.sessionReady = true
-	user.reconnectAttempts = 0
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
 	}
+	if user.stableTimer != nil {
+		user.stableTimer.Stop()
+	}
+	// Capture the session this timer guards so a stale timer for an old session
+	// can't clear the backoff counter on behalf of a newer, unrelated session.
+	user.stableTimer = time.AfterFunc(stableConnectionThreshold, func() { user.onConnectionStable(guarded) })
 	user.reconnectLock.Unlock()
 }
 
-// disarmReadyWatchdog cancels the READY watchdog if armed.
+// onConnectionStable fires stableConnectionThreshold after a READY/RESUMED that
+// wasn't superseded by another disconnect/reconnect cycle in the meantime — i.e.
+// the connection actually recovered rather than just briefly reaching READY
+// before dying again. Only then is it safe to clear reconnectAttempts, so a
+// flapping connection keeps escalating its backoff instead of restarting from
+// the base delay every cycle.
+func (user *User) onConnectionStable(guarded *discordgo.Session) {
+	user.Lock()
+	current := user.Session
+	user.Unlock()
+	if current != guarded {
+		// A newer session has since replaced this one (the connection this timer
+		// was armed for didn't stay up) — do not touch the backoff counter on its
+		// behalf.
+		return
+	}
+	user.reconnectLock.Lock()
+	user.stableTimer = nil
+	user.reconnectAttempts = 0
+	user.reconnectLock.Unlock()
+}
+
+// disarmReadyWatchdog cancels the READY watchdog and the stability timer, if
+// armed. Called when a connection drops: whichever of the two was pending is now
+// moot, since the connection it was tracking is gone.
 func (user *User) disarmReadyWatchdog() {
 	user.reconnectLock.Lock()
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
+	}
+	if user.stableTimer != nil {
+		user.stableTimer.Stop()
+		user.stableTimer = nil
 	}
 	user.reconnectLock.Unlock()
 }
@@ -2021,14 +2096,7 @@ func (user *User) scheduleReconnect() {
 		return
 	}
 	user.reconnectAttempts++
-	shift := user.reconnectAttempts - 1
-	if shift > 9 {
-		shift = 9
-	}
-	delay := reconnectBackoffBase << shift
-	if delay > reconnectBackoffMax {
-		delay = reconnectBackoffMax
-	}
+	delay := reconnectDelay(user.reconnectAttempts)
 	user.log.Warn().
 		Int("attempt", user.reconnectAttempts).
 		Dur("delay", delay).
@@ -2092,6 +2160,10 @@ func (user *User) stopReconnecting() {
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
+	}
+	if user.stableTimer != nil {
+		user.stableTimer.Stop()
+		user.stableTimer = nil
 	}
 	user.reconnectLock.Unlock()
 }
