@@ -114,6 +114,19 @@ type User struct {
 	// threshold never reaches this timer, so scheduleReconnect keeps escalating
 	// instead of restarting from the base delay every cycle.
 	stableTimer *time.Timer
+	// connectionEpoch increments every time a connection drops (see
+	// disarmReadyWatchdog), independent of whether user.Session has been
+	// replaced by a new object yet. onConnectionEstablished captures the epoch
+	// when arming stableTimer; onConnectionStable only clears reconnectAttempts
+	// if the epoch is unchanged when the timer fires. This closes a race where
+	// time.Timer.Stop() can return too late for a timer that's already begun
+	// executing: a session-pointer check alone can't tell "this connection
+	// dropped, but the next connect() hasn't run yet" from "this connection is
+	// still the current one", since user.Session doesn't change until the next
+	// connect() attempt. The epoch changes at the moment of disconnect instead,
+	// and both the bump and the check happen under reconnectLock, so whichever
+	// runs first is deterministic rather than a real-time race.
+	connectionEpoch uint64
 
 	markedOpened     map[string]time.Time
 	markedOpenedLock sync.Mutex
@@ -1994,15 +2007,6 @@ func (user *User) armReadyWatchdog() {
 // the bridge disconnected with no pending reconnect. An intentional Connect()
 // supersedes a pending timer instead (see connect()).
 func (user *User) onConnectionEstablished() {
-	// READY/RESUMED dispatch on discordgo's listen() goroutine, not the goroutine
-	// running connect() (which only holds user.Lock() through the synchronous
-	// part of Open(), before the read loop is spawned) — so user.Session must be
-	// read under user.Lock() here rather than assumed stable, unlike
-	// armReadyWatchdog which genuinely does run inline within connect().
-	user.Lock()
-	guarded := user.Session
-	user.Unlock()
-
 	user.reconnectLock.Lock()
 	user.sessionReady = true
 	if user.readyWatchdog != nil {
@@ -2012,9 +2016,10 @@ func (user *User) onConnectionEstablished() {
 	if user.stableTimer != nil {
 		user.stableTimer.Stop()
 	}
-	// Capture the session this timer guards so a stale timer for an old session
-	// can't clear the backoff counter on behalf of a newer, unrelated session.
-	user.stableTimer = time.AfterFunc(stableConnectionThreshold, func() { user.onConnectionStable(guarded) })
+	// Capture the current epoch so onConnectionStable can tell, when it fires,
+	// whether a disconnect happened in the meantime (see connectionEpoch).
+	epoch := user.connectionEpoch
+	user.stableTimer = time.AfterFunc(stableConnectionThreshold, func() { user.onConnectionStable(epoch) })
 	user.reconnectLock.Unlock()
 }
 
@@ -2024,25 +2029,24 @@ func (user *User) onConnectionEstablished() {
 // before dying again. Only then is it safe to clear reconnectAttempts, so a
 // flapping connection keeps escalating its backoff instead of restarting from
 // the base delay every cycle.
-func (user *User) onConnectionStable(guarded *discordgo.Session) {
-	user.Lock()
-	current := user.Session
-	user.Unlock()
-	if current != guarded {
-		// A newer session has since replaced this one (the connection this timer
-		// was armed for didn't stay up) — do not touch the backoff counter on its
-		// behalf.
+func (user *User) onConnectionStable(epoch uint64) {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	if epoch != user.connectionEpoch {
+		// A disconnect bumped the epoch since this timer was armed -- the
+		// connection it was tracking didn't stay up. Do not touch the backoff
+		// counter on its behalf.
 		return
 	}
-	user.reconnectLock.Lock()
 	user.stableTimer = nil
 	user.reconnectAttempts = 0
-	user.reconnectLock.Unlock()
 }
 
 // disarmReadyWatchdog cancels the READY watchdog and the stability timer, if
-// armed. Called when a connection drops: whichever of the two was pending is now
-// moot, since the connection it was tracking is gone.
+// armed, and bumps connectionEpoch. Called when a connection drops: whichever
+// timer was pending is now moot, since the connection it was tracking is gone,
+// and the epoch bump tells any in-flight onConnectionStable for that connection
+// not to clear the backoff counter even if it fired concurrently with Stop().
 func (user *User) disarmReadyWatchdog() {
 	user.reconnectLock.Lock()
 	if user.readyWatchdog != nil {
@@ -2053,6 +2057,7 @@ func (user *User) disarmReadyWatchdog() {
 		user.stableTimer.Stop()
 		user.stableTimer = nil
 	}
+	user.connectionEpoch++
 	user.reconnectLock.Unlock()
 }
 
@@ -2165,6 +2170,7 @@ func (user *User) stopReconnecting() {
 		user.stableTimer.Stop()
 		user.stableTimer = nil
 	}
+	user.connectionEpoch++
 	user.reconnectLock.Unlock()
 }
 

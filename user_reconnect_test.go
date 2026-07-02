@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 )
@@ -64,35 +63,34 @@ func TestReconnectDelayStrictlyEscalates(t *testing.T) {
 	assert.Equal(t, reconnectBackoffMax, reconnectDelay(50), "delay must never exceed the cap regardless of attempt count")
 }
 
-// TestOnConnectionStable_MatchingSessionResetsAttempts covers the intended
+// TestOnConnectionStable_MatchingEpochResetsAttempts covers the intended
 // behavior: once a connection has stayed up long enough for onConnectionStable
-// to fire for the session that's still current, the backoff counter clears.
-func TestOnConnectionStable_MatchingSessionResetsAttempts(t *testing.T) {
+// to fire with no intervening disconnect (connectionEpoch unchanged since the
+// timer was armed), the backoff counter clears.
+func TestOnConnectionStable_MatchingEpochResetsAttempts(t *testing.T) {
 	u := newTestUser()
-	sess := &discordgo.Session{}
-	u.Session = sess
 	u.reconnectAttempts = 5
 
-	u.onConnectionStable(sess)
+	u.onConnectionStable(u.connectionEpoch)
 
 	assert.Equal(t, 0, u.reconnectAttempts)
 	assert.Nil(t, u.stableTimer)
 }
 
-// TestOnConnectionStable_StaleSessionDoesNotResetAttempts is the regression
-// guard for the core fix: a stability timer armed for a session that has since
-// been replaced (i.e. the connection it was tracking did not actually stay up)
-// must not clear the backoff counter on behalf of the newer session.
-func TestOnConnectionStable_StaleSessionDoesNotResetAttempts(t *testing.T) {
+// TestOnConnectionStable_StaleEpochDoesNotResetAttempts is the regression guard
+// for the core fix: a disconnect between arming the stability timer and it
+// firing bumps connectionEpoch (see disarmReadyWatchdog), so a stale timer that
+// fires anyway -- e.g. racing past time.Timer.Stop() -- must not clear the
+// backoff counter on behalf of a connection that didn't actually stay up.
+func TestOnConnectionStable_StaleEpochDoesNotResetAttempts(t *testing.T) {
 	u := newTestUser()
-	oldSession := &discordgo.Session{}
-	newSession := &discordgo.Session{}
-	u.Session = newSession
 	u.reconnectAttempts = 5
+	staleEpoch := u.connectionEpoch
+	u.connectionEpoch++ // simulates disarmReadyWatchdog running after the timer was armed
 
-	u.onConnectionStable(oldSession)
+	u.onConnectionStable(staleEpoch)
 
-	assert.Equal(t, 5, u.reconnectAttempts, "a stale session's stability timer must not touch a newer session's backoff counter")
+	assert.Equal(t, 5, u.reconnectAttempts, "a stale epoch must not touch the backoff counter after a disconnect bumped it")
 }
 
 // TestOnConnectionEstablished_DoesNotResetAttemptsImmediately is the regression
@@ -102,7 +100,6 @@ func TestOnConnectionStable_StaleSessionDoesNotResetAttempts(t *testing.T) {
 // may do that.
 func TestOnConnectionEstablished_DoesNotResetAttemptsImmediately(t *testing.T) {
 	u := newTestUser()
-	u.Session = &discordgo.Session{}
 	u.reconnectAttempts = 3
 
 	u.onConnectionEstablished()
@@ -120,7 +117,6 @@ func TestOnConnectionEstablished_DoesNotResetAttemptsImmediately(t *testing.T) {
 // keeps escalating instead of restarting from the base delay.
 func TestDisarmReadyWatchdog_ClearsStableTimerWithoutResettingAttempts(t *testing.T) {
 	u := newTestUser()
-	u.Session = &discordgo.Session{}
 	u.reconnectAttempts = 3
 	u.onConnectionEstablished()
 	assert.NotNil(t, u.stableTimer)
@@ -129,4 +125,24 @@ func TestDisarmReadyWatchdog_ClearsStableTimerWithoutResettingAttempts(t *testin
 
 	assert.Nil(t, u.stableTimer)
 	assert.Equal(t, 3, u.reconnectAttempts)
+}
+
+// TestDisarmReadyWatchdog_BumpsEpochSoLateStableFiringIsIgnored is the direct
+// regression test for the Stop()-vs-fire race this epoch exists to close: even
+// if onConnectionStable's timer callback is already running when
+// disarmReadyWatchdog runs (Stop() returning too late to prevent it), the epoch
+// bump means that stale callback -- once it does run -- sees a mismatched epoch
+// and leaves reconnectAttempts alone.
+func TestDisarmReadyWatchdog_BumpsEpochSoLateStableFiringIsIgnored(t *testing.T) {
+	u := newTestUser()
+	u.reconnectAttempts = 3
+	u.onConnectionEstablished()
+	armedEpoch := u.connectionEpoch
+
+	u.disarmReadyWatchdog() // simulates a disconnect landing first
+
+	// Simulate the stale timer callback running anyway, after the disconnect.
+	u.onConnectionStable(armedEpoch)
+
+	assert.Equal(t, 3, u.reconnectAttempts, "a stale onConnectionStable firing after disarmReadyWatchdog must not reset attempts")
 }
