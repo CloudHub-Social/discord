@@ -128,6 +128,11 @@ bridge:
     message_status_events: false
     # Whether the bridge should send error notices via m.notice events when a message fails to bridge.
     message_error_notices: true
+    # Whether the bridge should send an m.notice to the user's management room when their Discord
+    # session is signed out (invalid/expired token, or an account action is required). BridgeState
+    # already reports this to clients that render it, but most Matrix clients don't -- this makes it
+    # visible directly in chat too. Fires at most once per invalidation event.
+    token_invalidation_notices: true
     # Should the bridge use space-restricted join rules instead of invite-only for guild rooms?
     # This can avoid unnecessary invite events in guild rooms when members are synced in.
     restricted_rooms: false

@@ -43,6 +43,7 @@ type BridgeConfig struct {
 	DeliveryReceipts            bool `yaml:"delivery_receipts"`
 	MessageStatusEvents         bool `yaml:"message_status_events"`
 	MessageErrorNotices         bool `yaml:"message_error_notices"`
+	TokenInvalidationNotices    bool `yaml:"token_invalidation_notices"`
 	RestrictedRooms             bool `yaml:"restricted_rooms"`
 	AutojoinThreadOnOpen        bool `yaml:"autojoin_thread_on_open"`
 	EmbedFieldsAsTables         bool `yaml:"embed_fields_as_tables"`
