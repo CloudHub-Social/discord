@@ -21,16 +21,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
-func newTestUser() *User {
-	return &User{log: zerolog.Nop()}
-}
+// newTestUser is defined in user_reconnect_test.go (PR #31, merged into main).
 
 func TestBadCredentialsNoticeSkipReason(t *testing.T) {
 	tests := []struct {
