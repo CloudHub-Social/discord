@@ -2124,7 +2124,9 @@ func (user *User) invalidAuthHandler(_ *discordgo.InvalidAuth) {
 	user.bridgeStateLock.Unlock()
 	message := "Discord access token is no longer valid, please log in again"
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "dc-websocket-disconnect-4004", Message: message})
-	user.sendBadCredentialsNotice("dc-websocket-disconnect-4004", message)
+	// invalidAuthHandler calls Logout below, which clears DiscordToken, so
+	// `login` is the correct recovery step here.
+	user.sendBadCredentialsNotice("dc-websocket-disconnect-4004", message, "Run `login` to reconnect.")
 	go user.Logout(false)
 }
 
@@ -2134,7 +2136,12 @@ func (user *User) handlePossible40002(err error) bool {
 		return false
 	}
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "dc-http-40002", Message: restErr.Message.Message})
-	user.sendBadCredentialsNotice("dc-http-40002", restErr.Message.Message)
+	// Unlike invalidAuthHandler, this path does not log the user out or clear
+	// DiscordToken -- the bridge still considers them logged in, so `login`
+	// would just refuse with "You're already logged in". The actual fix lives
+	// on Discord's side; recovery here is "resolve it there", not "log in again".
+	user.sendBadCredentialsNotice("dc-http-40002", restErr.Message.Message,
+		"Resolve the requested action on Discord (check your email or the Discord app) -- bridging will resume automatically once it's done. You do not need to run `login`.")
 	return true
 }
 
@@ -2188,16 +2195,16 @@ func badCredentialsNoticeAttemptDecision(alreadySent bool, lastAttempt, now time
 }
 
 // sendBadCredentialsNoticeContent builds and sends the actual notice via
-// sender. Separated from sendBadCredentialsNotice (which owns the
+// sender. recovery is the specific next step the user should take -- it
+// differs by trigger reason (see the two callers of sendBadCredentialsNotice),
+// since "run `login`" is actively wrong advice for a 40002 event that never
+// logged the user out. Separated from sendBadCredentialsNotice (which owns the
 // gating/dedup/logging) purely so this part -- the thing that actually talks
 // to Matrix -- is testable with a fake noticeSender.
-func sendBadCredentialsNoticeContent(sender noticeSender, roomID id.RoomID, message string) error {
-	// No command prefix here: this is always sent to the user's management
-	// room, and commands there never require one (see the bridge's own
-	// !discord help text).
+func sendBadCredentialsNoticeContent(sender noticeSender, roomID id.RoomID, message, recovery string) error {
 	content := &event.MessageEventContent{
 		MsgType: event.MsgNotice,
-		Body:    fmt.Sprintf("\u26a0 Your Discord session was signed out: %s\n\nRun `login` to reconnect.", message),
+		Body:    fmt.Sprintf("\u26a0 %s\n\n%s", message, recovery),
 	}
 	_, err := sender.SendMessageEvent(roomID, event.EventMessage, content)
 	return err
@@ -2219,10 +2226,15 @@ func sendBadCredentialsNoticeContent(sender noticeSender, roomID id.RoomID, mess
 // being notified for this invalidation, but retries are rate-limited by
 // badCredentialsNoticeRetryCooldown so a burst of failing calls can't turn
 // into a tight retry loop against the homeserver.
-func (user *User) sendBadCredentialsNotice(errorCode, message string) {
+func (user *User) sendBadCredentialsNotice(errorCode, message, recovery string) {
 	log := user.log.With().Str("error_code", errorCode).Str("discord_id", user.DiscordID).Logger()
 
-	if reason, skip := badCredentialsNoticeSkipReason(user.bridge.Config.Bridge.TokenInvalidationNotices, user.ManagementRoom); skip {
+	// Read ManagementRoom once and reuse it for both the gating check and the
+	// send below -- SetManagementRoom can change it concurrently with no lock
+	// shared with this function, so re-reading user.ManagementRoom a second
+	// time could send to a different room than the one that was just checked.
+	managementRoom := user.ManagementRoom
+	if reason, skip := badCredentialsNoticeSkipReason(user.bridge.Config.Bridge.TokenInvalidationNotices, managementRoom); skip {
 		log.Debug().Bool("notice_sent", false).Msg("Bad credentials event (" + reason + ")")
 		return
 	}
@@ -2238,7 +2250,7 @@ func (user *User) sendBadCredentialsNotice(errorCode, message string) {
 	user.lastBadCredentialsNoticeAttempt = time.Now()
 	user.bridgeStateLock.Unlock()
 
-	if err := sendBadCredentialsNoticeContent(user.bridge.Bot, user.ManagementRoom, message); err != nil {
+	if err := sendBadCredentialsNoticeContent(user.bridge.Bot, managementRoom, message, recovery); err != nil {
 		user.bridgeStateLock.Lock()
 		user.sentBadCredentialsNotice = false
 		user.bridgeStateLock.Unlock()

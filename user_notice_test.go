@@ -115,7 +115,7 @@ func TestSendBadCredentialsNoticeContent(t *testing.T) {
 	sender := &fakeNoticeSender{}
 	roomID := id.RoomID("!management:example.com")
 
-	err := sendBadCredentialsNoticeContent(sender, roomID, "token is dead")
+	err := sendBadCredentialsNoticeContent(sender, roomID, "token is dead", "Run `login` to reconnect.")
 
 	assert.NoError(t, err)
 	assert.Len(t, sender.calls, 1)
@@ -130,6 +130,22 @@ func TestSendBadCredentialsNoticeContent(t *testing.T) {
 	assert.NotContains(t, content.Body, "!discord login", "commands in the management room never need the bridge's command prefix")
 }
 
+// TestSendBadCredentialsNoticeContent_UsesCallerProvidedRecovery confirms the
+// recovery instructions are exactly what the caller passed, not a hardcoded
+// "run login" -- that's wrong for the 40002 path, which never logs the user
+// out, so `login` would just refuse with "You're already logged in".
+func TestSendBadCredentialsNoticeContent_UsesCallerProvidedRecovery(t *testing.T) {
+	sender := &fakeNoticeSender{}
+
+	err := sendBadCredentialsNoticeContent(sender, "!management:example.com", "verification required",
+		"Resolve the requested action on Discord -- no need to run `login`.")
+
+	assert.NoError(t, err)
+	content := sender.calls[0].Content.(*event.MessageEventContent)
+	assert.Contains(t, content.Body, "Resolve the requested action on Discord")
+	assert.NotContains(t, content.Body, "Run `login` to reconnect", "must not use the 4004 wording for a 40002-style recovery message")
+}
+
 // TestSendBadCredentialsNoticeContent_PropagatesSendError confirms a failed
 // send is surfaced to the caller (sendBadCredentialsNotice relies on this to
 // know when to release the dedup flag for a retry).
@@ -137,7 +153,7 @@ func TestSendBadCredentialsNoticeContent_PropagatesSendError(t *testing.T) {
 	wantErr := errors.New("connection refused")
 	sender := &fakeNoticeSender{failNext: wantErr}
 
-	err := sendBadCredentialsNoticeContent(sender, "!management:example.com", "token is dead")
+	err := sendBadCredentialsNoticeContent(sender, "!management:example.com", "token is dead", "Run `login` to reconnect.")
 
 	assert.ErrorIs(t, err, wantErr)
 }

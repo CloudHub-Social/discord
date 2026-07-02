@@ -50,6 +50,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "delivery_receipts")
 	helper.Copy(up.Bool, "bridge", "message_status_events")
 	helper.Copy(up.Bool, "bridge", "message_error_notices")
+	helper.Copy(up.Bool, "bridge", "token_invalidation_notices")
 	helper.Copy(up.Bool, "bridge", "restricted_rooms")
 	helper.Copy(up.Bool, "bridge", "autojoin_thread_on_open")
 	helper.Copy(up.Bool, "bridge", "embed_fields_as_tables")
