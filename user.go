@@ -84,6 +84,13 @@ type User struct {
 	bridgeStateLock sync.Mutex
 	wasDisconnected bool
 	wasLoggedOut    bool
+	// sentBadCredentialsNotice guards the management-room notice sent alongside
+	// StateBadCredentials (see sendBadCredentialsNotice): both invalidAuthHandler
+	// and handlePossible40002 can report bad credentials, and the latter can be
+	// hit repeatedly by retried REST calls while the account stays broken, so
+	// this must fire at most once per invalidation rather than once per trigger.
+	// Reset to false on the next successful Login, same lifecycle as wasLoggedOut.
+	sentBadCredentialsNotice bool
 
 	// Gateway reconnection is owned by the bridge rather than discordgo
 	// (session.ShouldReconnectOnError is disabled in Connect). reconnectLock
@@ -637,6 +644,7 @@ func (user *User) NextDiscordUploadID() string {
 func (user *User) Login(token string) error {
 	user.bridgeStateLock.Lock()
 	user.wasLoggedOut = false
+	user.sentBadCredentialsNotice = false
 	user.bridgeStateLock.Unlock()
 	user.DiscordToken = token
 	var err error
@@ -2098,10 +2106,12 @@ func (user *User) stopReconnecting() {
 
 func (user *User) invalidAuthHandler(_ *discordgo.InvalidAuth) {
 	user.bridgeStateLock.Lock()
-	defer user.bridgeStateLock.Unlock()
 	user.log.Info().Msg("Got logged out from Discord due to invalid token")
 	user.wasLoggedOut = true
-	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "dc-websocket-disconnect-4004", Message: "Discord access token is no longer valid, please log in again"})
+	user.bridgeStateLock.Unlock()
+	message := "Discord access token is no longer valid, please log in again"
+	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "dc-websocket-disconnect-4004", Message: message})
+	user.sendBadCredentialsNotice("dc-websocket-disconnect-4004", message)
 	go user.Logout(false)
 }
 
@@ -2111,7 +2121,74 @@ func (user *User) handlePossible40002(err error) bool {
 		return false
 	}
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "dc-http-40002", Message: restErr.Message.Message})
+	user.sendBadCredentialsNotice("dc-http-40002", restErr.Message.Message)
 	return true
+}
+
+// badCredentialsNoticeSkipReason reports whether sendBadCredentialsNotice
+// should skip sending (and why), given the config toggle and whether the user
+// has a management room. Kept separate from sendBadCredentialsNotice so this
+// gating logic is testable without a live Matrix client. Does not cover the
+// per-invalidation dedup check (sentBadCredentialsNotice), which needs
+// bridgeStateLock for an atomic check-and-set and is checked separately.
+func badCredentialsNoticeSkipReason(noticesEnabled bool, managementRoom id.RoomID) (reason string, skip bool) {
+	if !noticesEnabled {
+		return "token_invalidation_notices disabled", true
+	}
+	if managementRoom == "" {
+		// No management room to post into (e.g. a user provisioned purely through
+		// the provisioning API who never DMed the bridge bot) -- the BridgeState
+		// push is the only signal available for these users today.
+		return "no management room", true
+	}
+	return "", false
+}
+
+// sendBadCredentialsNotice posts an m.notice to the user's management room the
+// first time a bad-credentials event fires since the last successful Login,
+// telling them bridging has stopped and how to fix it. This is in addition to,
+// not instead of, the BridgeState push both callers already send: most Matrix
+// clients don't render BridgeState, so without this a user has no in-chat
+// signal that their session was signed out until they notice messages have
+// stopped syncing.
+//
+// invalidAuthHandler and handlePossible40002 can both report bad credentials --
+// the latter can be hit repeatedly by retried REST calls while the account
+// stays broken -- so this dedupes on sentBadCredentialsNotice rather than
+// sending once per call. If the send itself fails, the flag is released so a
+// later bad-credentials event can retry instead of the user silently never
+// being notified for this invalidation.
+func (user *User) sendBadCredentialsNotice(errorCode, message string) {
+	log := user.log.With().Str("error_code", errorCode).Str("discord_id", user.DiscordID).Logger()
+
+	if reason, skip := badCredentialsNoticeSkipReason(user.bridge.Config.Bridge.TokenInvalidationNotices, user.ManagementRoom); skip {
+		log.Debug().Bool("notice_sent", false).Msg("Bad credentials event (" + reason + ")")
+		return
+	}
+
+	user.bridgeStateLock.Lock()
+	if user.sentBadCredentialsNotice {
+		user.bridgeStateLock.Unlock()
+		log.Debug().Bool("notice_sent", false).Msg("Bad credentials event (already_sent)")
+		return
+	}
+	user.sentBadCredentialsNotice = true
+	user.bridgeStateLock.Unlock()
+
+	content := &event.MessageEventContent{
+		MsgType: event.MsgNotice,
+		Body: fmt.Sprintf("⚠ Your Discord session was signed out: %s\n\nRun `%s login` to reconnect.",
+			message, user.bridge.Config.Bridge.CommandPrefix),
+	}
+	_, err := user.bridge.Bot.SendMessageEvent(user.ManagementRoom, event.EventMessage, content)
+	if err != nil {
+		user.bridgeStateLock.Lock()
+		user.sentBadCredentialsNotice = false
+		user.bridgeStateLock.Unlock()
+		log.Err(err).Bool("notice_sent", false).Msg("Failed to send bad credentials notice to management room")
+		return
+	}
+	log.Info().Bool("notice_sent", true).Msg("Sent bad credentials notice to management room")
 }
 
 func (user *User) guildCreateHandler(g *discordgo.GuildCreate) {
