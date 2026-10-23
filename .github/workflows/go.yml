@@ -33,3 +33,6 @@ jobs:
 
       - name: Lint
         run: pre-commit run -a
+
+      - name: Test
+        run: go test -race -count=1 ./...
