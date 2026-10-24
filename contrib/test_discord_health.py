@@ -68,6 +68,21 @@ class ParseTests(unittest.TestCase):
         with self.assertRaises(ProbeError):
             parse_record(value, INV)
 
+    def test_console_caller_with_function_heartbeat(self):
+        data = row('unused')
+        data['MESSAGE'] = '2026-10-24T15:45:23Z INF wsapi.go:874:onEvent() > gateway_health heartbeat_ack=true component=discordgo user_id=@user:example.test'
+        result = parse_record(data, INV)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['kind'], 'ack')
+
+    def test_console_caller_with_function_diagnostic(self):
+        data = row('unused')
+        data['MESSAGE'] = '2026-10-24T15:45:23Z WRN gateway_diagnostics.go:39:logGatewayDiagnostic() > gateway_diagnostic kind=read_error close_code=4002 error_class=websocket_close component=discordgo user_id=@user:example.test'
+        result = parse_record(data, INV)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['cause'], 'read_error')
+        self.assertEqual(result['close_code'], 4002)
+
 
 class AssessTests(unittest.TestCase):
     def report(self, events, started=500, expected=2):
