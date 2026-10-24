@@ -1,4 +1,5 @@
 import contextlib
+import http.client
 import io
 import json
 import pathlib
@@ -120,6 +121,32 @@ class SentryTests(unittest.TestCase):
             with self.assertRaises(adapter.MonitorError) as caught:
                 adapter.send_checkin(ENDPOINT, "ok", "b" * 32)
         self.assertEqual(str(caught.exception), "sentry_delivery_failed")
+
+    def test_protocol_errors_are_redacted(self):
+        for error in (http.client.BadStatusLine("PRIVATE_DETAILS"),
+                      http.client.LineTooLong("PRIVATE_DETAILS"),
+                      http.client.UnknownProtocol("PRIVATE_DETAILS")):
+            with self.subTest(error=type(error).__name__):
+                opener = mock.Mock()
+                opener.open.side_effect = error
+                with mock.patch.object(adapter.urllib.request, "build_opener", return_value=opener):
+                    with self.assertRaises(adapter.MonitorError) as caught:
+                        adapter.send_checkin(ENDPOINT, "ok", "b" * 32)
+                self.assertEqual(str(caught.exception), "sentry_delivery_failed")
+
+    def test_protocol_failure_still_checks_real_probe_and_reports_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            probe = pathlib.Path(directory) / "probe.py"
+            probe.write_text('import json; print(json.dumps({"status":"healthy","needs_attention":False}))')
+            opener = mock.Mock()
+            opener.open.side_effect = http.client.BadStatusLine("PRIVATE_DETAILS")
+            with mock.patch.object(adapter.urllib.request, "build_opener", return_value=opener):
+                report, code = adapter.run(ENDPOINT, str(probe), 2)
+            self.assertEqual(code, 2)
+            self.assertEqual(report["delivery"], "failed")
+            self.assertFalse(report["start_accepted"])
+            self.assertEqual(report["probe_outcome"], "quiet")
+            self.assertNotIn("PRIVATE_DETAILS", json.dumps(report))
 
     def test_non_success_http_status_is_failure(self):
         response = mock.MagicMock()

@@ -113,7 +113,7 @@ https://docs.sentry.io/api/crons/create-a-monitor/
 
 ## Verification record: 2026-10-24
 
-- All 60 Python health tests pass, including two added regression tests for
+- All 62 Python health tests pass, including two added regression tests for
   missing, unknown, malformed, or inconsistent probe status. Those regressions
   failed before the classifier fix and pass afterward.
 - The full pinned Discord dependency race suite passes with live-test
@@ -134,3 +134,12 @@ https://docs.sentry.io/api/crons/create-a-monitor/
 
 Do not activate the timer, claim notification delivery, or retire the existing
 health consumer until the Sentry verification steps above actually succeed.
+
+### Protocol-error review follow-up
+
+Sentry's PR review identified an uncaught HTTP protocol-error path. Reproduced
+BadStatusLine, LineTooLong and UnknownProtocol escaping the adapter, including
+an aborted real-probe execution. Two new regression methods failed before the
+minimal HTTPException catch and pass afterward. These failures now produce
+only the fixed delivery-failure code while retaining the local probe result.
+The full Python suite now contains 62 tests.

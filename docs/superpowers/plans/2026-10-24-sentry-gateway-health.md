@@ -40,7 +40,7 @@ retain rollback/old consumer during the handover.
 Owner confirmed Sentry sign-in and explicitly requested activation and
 verification. Reused the existing isolated feature worktree and branch.
 
-- Completed: 60/60 health tests; pinned dependency race suite; target-host unit
+- Completed: 62/62 health tests; pinned dependency race suite; target-host unit
   validation; read-only probe under the intended service sandbox.
 - Fixed: classifier ignored status and could map unknown/missing/inconsistent
   evidence to success. Two new regression methods failed (eight cases), then
@@ -58,3 +58,12 @@ verification. Reused the existing isolated feature worktree and branch.
   readback, and actual notification delivery observation.
 - Preserve the existing Discord Bridge Health automation and all unrelated
   reminders, monitoring, subscriptions, bridge runtime and configuration.
+
+### Protocol-error review follow-up
+
+Sentry's PR review identified an uncaught HTTP protocol-error path. Reproduced
+BadStatusLine, LineTooLong and UnknownProtocol escaping the adapter, including
+an aborted real-probe execution. Two new regression methods failed before the
+minimal HTTPException catch and pass afterward. These failures now produce
+only the fixed delivery-failure code while retaining the local probe result.
+The full Python suite now contains 62 tests.

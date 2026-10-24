@@ -5,6 +5,7 @@ No gateway payloads, account identifiers, credentials, or exception text leave
 this adapter. Installing it does not create a Sentry monitor or an alert rule.
 """
 import argparse
+import http.client
 import json
 import os
 import pathlib
@@ -85,7 +86,7 @@ def send_checkin(endpoint, status, check_in_id):
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=5) as response:
             if not 200 <= response.status < 300:
                 raise MonitorError("sentry_delivery_failed")
-    except (OSError, urllib.error.URLError, ValueError):
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
         raise MonitorError("sentry_delivery_failed") from None
 
 
