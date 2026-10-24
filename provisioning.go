@@ -174,7 +174,8 @@ var upgrader = websocket.Upgrader{
 func (p *ProvisioningAPI) disconnect(w http.ResponseWriter, r *http.Request) {
 	user := r.Context().Value("user").(*User)
 
-	if !user.Connected() {
+	err := user.Disconnect()
+	if errors.Is(err, ErrNotConnected) {
 		jsonResponse(w, http.StatusConflict, Error{
 			Error:   "You're not connected to discord",
 			ErrCode: ErrCodeNotConnected,
@@ -182,7 +183,7 @@ func (p *ProvisioningAPI) disconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := user.Disconnect(); err != nil {
+	if err != nil {
 		p.log.Errorfln("Failed to disconnect %s: %v", user.MXID, err)
 		jsonResponse(w, http.StatusInternalServerError, Error{
 			Error:   "Failed to disconnect from discord",
