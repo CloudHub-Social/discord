@@ -61,20 +61,21 @@ type BridgeConfig struct {
 
 	// Presence vs status. Throughout the config "presence" means the online
 	// state (online/idle/dnd/offline) and "status" means the custom status
-	// text. On Discord both are carried by the same gateway opcode-3 update, so
-	// the four flags below interact: see HandleMatrixPresence / applyPresence.
+	// text. User custom status uses REST independently of gateway presence;
+	// bot activities require a presence update. See HandleMatrixPresence.
 
 	// SyncMatrixPresenceToDiscord controls whether Matrix presence STATE is
-	// forwarded to Discord (opcode 3). Discord rate-limits presence updates to
-	// 5/min and penalizes user tokens that exceed it (close code 4004), so this
-	// defaults to off. When enabled, updates are deduplicated and rate-limited.
+	// forwarded to Discord (opcode 3). This defaults to off. When enabled,
+	// updates are deduplicated and rate-limited. The bridge user session sends
+	// an empty activities list and never replays other clients' activities.
 	SyncMatrixPresenceToDiscord bool `yaml:"sync_matrix_presence_to_discord"`
 
 	// SyncMatrixStatusToDiscord controls whether the Matrix status message (the
-	// custom status TEXT) is forwarded to Discord. Because opcode 3 carries state
-	// and text together, with presence sync off this asserts an "online" state to
-	// deliver the text; with status sync off but presence sync on, the user's
-	// existing Discord custom status is preserved rather than cleared.
+	// custom status TEXT) is forwarded to Discord. User text-only updates use
+	// REST without changing gateway state, AFK, or activities. When this flag is
+	// off, the user's REST custom status is left unchanged. Bots have no such
+	// REST endpoint, so forwarding their status activity also requires presence
+	// sync; a bot presence update sends the requested activity or an empty list.
 	SyncMatrixStatusToDiscord bool `yaml:"sync_matrix_status_to_discord"`
 
 	// SyncDiscordPresenceToMatrix controls whether Discord presence/status is

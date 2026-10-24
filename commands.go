@@ -301,16 +301,28 @@ var cmdPing = &commands.FullHandler{
 }
 
 func fnPing(ce *WrappedCommandEvent) {
-	if ce.User.Session == nil {
-		if ce.User.DiscordToken == "" {
-			ce.Reply("You're not logged in")
-		} else {
-			ce.Reply("You have a Discord token stored, but are not connected for some reason 🤔")
-		}
-	} else if ce.User.wasDisconnected {
+	ce.User.Lock()
+	loggedIn := ce.User.DiscordToken != ""
+	session, discordID := ce.User.Session, ce.User.DiscordID
+	ce.User.Unlock()
+	if !loggedIn {
+		ce.Reply("You're not logged in")
+	} else if !ce.User.Connected() {
 		ce.Reply("You're logged in, but the Discord connection seems to be dead 💥")
 	} else {
-		ce.Reply("You're logged in as @%s (`%s`)", ce.User.Session.State.User.Username, ce.User.DiscordID)
+		var username string
+		if session != nil && session.State != nil {
+			session.State.RLock()
+			if session.State.User != nil {
+				username = session.State.User.Username
+			}
+			session.State.RUnlock()
+		}
+		if username == "" {
+			ce.Reply("You're connected to Discord (`%s`)", discordID)
+		} else {
+			ce.Reply("You're logged in as @%s (`%s`)", username, discordID)
+		}
 	}
 }
 
@@ -325,9 +337,10 @@ var cmdDisconnect = &commands.FullHandler{
 }
 
 func fnDisconnect(ce *WrappedCommandEvent) {
-	if !ce.User.Connected() {
+	err := ce.User.Disconnect()
+	if errors.Is(err, ErrNotConnected) {
 		ce.Reply("You're already not connected")
-	} else if err := ce.User.Disconnect(); err != nil {
+	} else if err != nil {
 		ce.Reply("Error while disconnecting: %v", err)
 	} else {
 		ce.Reply("Successfully disconnected")

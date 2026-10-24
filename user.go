@@ -110,8 +110,8 @@ type User struct {
 	// Gateway reconnection is owned by the bridge rather than discordgo
 	// (session.ShouldReconnectOnError is disabled in Connect). reconnectLock
 	// guards the fields below. reconnectAttempts counts consecutive failures
-	// since the last successful READY and drives the exponential backoff in
-	// scheduleReconnect; it resets to 0 on READY. reconnectTimer is the pending
+	// since the last stable connection and drives the exponential backoff in
+	// scheduleReconnect. reconnectTimer is the pending
 	// backoff timer, if any. manualDisconnect latches when the bridge tears the
 	// session down on purpose (logout / manual disconnect / shutdown) so the
 	// resulting Disconnect event does not trigger a reconnect.
@@ -119,6 +119,9 @@ type User struct {
 	reconnectAttempts int
 	reconnectTimer    *time.Timer
 	manualDisconnect  bool
+	// sessionGeneration identifies a connection attempt. Event handlers and
+	// retry callbacks capture it so work from a replaced session is ignored.
+	sessionGeneration uint64
 	// readyWatchdog force-closes a session that connects but never reaches
 	// READY within readyTimeout. discordgo answers a Discord Op9 Invalid Session
 	// by re-IDENTIFYing in-band (no close, no Disconnect event), so without this
@@ -180,17 +183,15 @@ type User struct {
 	lastDiscordStatusText string
 	matrixStatusEverSet   bool
 
-	// lastSentDiscordStatus and lastSentDiscordStatusText track what was most
-	// recently sent to Discord via UpdateStatusComplex. Used to suppress
-	// redundant WebSocket status updates when the effective status hasn't
-	// changed (Matrix clients send presence pings frequently, and each one
-	// would otherwise generate a Discord opcode-3 message).
+	// lastSentDiscordStatus and lastSentDiscordStatusText track the last outgoing
+	// intent for gateway presence and custom status. An empty status means that
+	// update had no gateway payload. These fields suppress redundant updates from
+	// frequent Matrix presence pings.
 	lastSentDiscordStatus     string
 	lastSentDiscordStatusText string
-	// lastSentDiscordClear records whether the last update explicitly cleared the
-	// custom status (sent an empty activities array) rather than preserving it
-	// (nil activities). It is part of the dedup key so a clear is not suppressed
-	// by a prior preserve that happened to carry the same empty text.
+	// lastSentDiscordClear distinguishes an explicit custom-status clear from
+	// an update with no text change. Both have empty text, but only the explicit
+	// clear should PATCH a user custom status to null.
 	lastSentDiscordClear bool
 
 	// presenceCache maps Discord user IDs to their last known non-offline
@@ -482,7 +483,7 @@ func (br *DiscordBridge) startUsers() {
 
 	usersWithToken := br.getAllUsersWithToken()
 	for _, u := range usersWithToken {
-		go u.startupTryConnect(0)
+		go u.startupTryConnect()
 	}
 	if len(usersWithToken) == 0 {
 		br.SendGlobalBridgeState(status.BridgeState{StateEvent: status.StateUnconfigured}.Fill(nil))
@@ -500,24 +501,13 @@ func (br *DiscordBridge) startUsers() {
 	}
 }
 
-func (user *User) startupTryConnect(retryCount int) {
-	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
-	err := user.Connect()
-	if err != nil {
-		user.log.Error().Err(err).Msg("Error connecting on startup")
-		closeErr := &websocket.CloseError{}
-		if errors.As(err, &closeErr) && closeErr.Code == 4004 {
-			user.invalidAuthHandler(nil)
-		} else if retryCount < 6 {
-			user.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "dc-unknown-websocket-error", Message: err.Error()})
-			retryInSeconds := 2 << retryCount
-			user.log.Debug().Int("retry_in_seconds", retryInSeconds).Msg("Sleeping and retrying connection")
-			time.Sleep(time.Duration(retryInSeconds) * time.Second)
-			user.startupTryConnect(retryCount + 1)
-		} else {
-			user.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Error: "dc-unknown-websocket-error", Message: err.Error()})
-		}
-	}
+func (user *User) startupTryConnect() {
+	user.reconnectLock.Lock()
+	generation, epoch := user.sessionGeneration, user.connectionEpoch
+	user.reconnectLock.Unlock()
+	// Startup uses the same persistent, cancellable recovery as a later drop.
+	// It must not clear a manual disconnect requested while startup was queued.
+	user.doReconnect(generation, epoch)
 }
 
 func (user *User) SetManagementRoom(roomID id.RoomID) {
@@ -720,7 +710,12 @@ func (user *User) IsLoggedIn() bool {
 func (user *User) Logout(isOverwriting bool) {
 	user.Lock()
 	defer user.Unlock()
+	user.logout(isOverwriting)
+}
 
+// logout requires user.Lock. The invalid-auth path checks the session
+// generation under the same lock before clearing credentials.
+func (user *User) logout(isOverwriting bool) {
 	if user.DiscordID != "" {
 		puppet := user.bridge.GetPuppetByID(user.DiscordID)
 		if puppet.CustomMXID != "" {
@@ -810,10 +805,10 @@ func (user *User) reconstructRelationships(relationships []*discordgo.Relationsh
 }
 
 func (user *User) Connected() bool {
-	user.Lock()
-	defer user.Unlock()
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
 
-	return user.Session != nil
+	return user.sessionReady && !user.manualDisconnect
 }
 
 const BotIntents = discordgo.IntentGuilds |
@@ -838,11 +833,11 @@ const BotIntents = discordgo.IntentGuilds |
 	//discordgo.IntentGuildPresences |
 	discordgo.IntentGuildMembers
 
-// Connect establishes the Discord gateway connection on purpose (startup,
-// login, or an explicit reconnect command). It clears the manual-disconnect
+// Connect establishes the Discord gateway connection on purpose (login or an
+// explicit reconnect command). It clears the manual-disconnect
 // latch so future drops reconnect normally.
 func (user *User) Connect() error {
-	return user.connect(true)
+	return user.connect(true, 0, 0)
 }
 
 // connect performs the actual gateway connection. When intentional is true the
@@ -850,11 +845,8 @@ func (user *User) Connect() error {
 // when false the caller is the backoff-driven auto-reconnect, which must abort
 // if a manual teardown latched concurrently (otherwise it could race a manual
 // Disconnect and revive a session the user just closed).
-func (user *User) connect(intentional bool) error {
+func (user *User) connect(intentional bool, generation, epoch uint64) error {
 	user.Lock()
-	// Clear our in-memory relationship cache as it might've changed while
-	// offline; READY will repopulate it.
-	user.reconstructRelationships(nil)
 	defer user.Unlock()
 
 	if user.DiscordToken == "" {
@@ -864,7 +856,7 @@ func (user *User) connect(intentional bool) error {
 	user.reconnectLock.Lock()
 	if intentional {
 		user.manualDisconnect = false
-		// A deliberate connect (startup / login / reconnect command) supersedes
+		// A deliberate connect (login / reconnect command) supersedes
 		// any pending auto-reconnect: cancel its timer and reset the backoff so a
 		// stale retry doesn't fire a second session on top of this one.
 		user.reconnectAttempts = 0
@@ -872,13 +864,28 @@ func (user *User) connect(intentional bool) error {
 			user.reconnectTimer.Stop()
 			user.reconnectTimer = nil
 		}
-	} else if user.manualDisconnect {
+	} else if user.manualDisconnect || generation != user.sessionGeneration || epoch != user.connectionEpoch {
 		// A manual disconnect/logout latched while this auto-reconnect was in
 		// flight; honor it and do not revive the session.
 		user.reconnectLock.Unlock()
 		return nil
 	}
+	user.sessionGeneration++
+	generation = user.sessionGeneration
+	user.disarmReadyWatchdogLocked()
+	epoch = user.connectionEpoch
+	if !intentional {
+		// Queue this only after accepting the attempt: a stale retry that lost
+		// user.Lock to manual teardown must not report that it is connecting.
+		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
+	}
 	user.reconnectLock.Unlock()
+	// Invalidate the previous attempt before closing it: its Disconnect must
+	// not clear the new attempt's state or schedule another connection.
+	if user.Session != nil {
+		_ = user.Session.Close()
+	}
+	user.reconstructRelationships(nil)
 
 	user.log.Debug().Msg("Connecting to discord")
 
@@ -934,7 +941,7 @@ func (user *User) connect(intentional bool) error {
 	if !session.IsUser {
 		session.Identify.Intents = BotIntents
 	}
-	session.EventHandler = user.eventHandlerSync
+	session.EventHandler = func(evt any) { user.eventHandlerSync(generation, epoch, evt) }
 
 	if session.IsUser {
 		err = session.LoadMainPage(context.TODO())
@@ -945,44 +952,73 @@ func (user *User) connect(intentional bool) error {
 
 	user.Session = session
 
-	// New attempt: clear the ready flag before Open() so a stale value from a
-	// previous session can't suppress this attempt's watchdog.
-	user.reconnectLock.Lock()
-	user.sessionReady = false
-	user.reconnectLock.Unlock()
-
-	for {
-		err = user.Session.Open()
-		if errors.Is(err, discordgo.ErrImmediateDisconnect) {
-			// Op7 during the handshake. On an auto-reconnect, let it escape so the
-			// scheduler backs off instead of looping here every 5s while holding
-			// user.Lock (which would also block Logout/Disconnect).
-			if !intentional {
-				return err
-			}
-			user.log.Warn().Err(err).Msg("Retrying initial connection in 5 seconds")
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		break
-	}
+	// Every attempt, including an initial Op7 response, returns to its caller
+	// for recovery instead of sleeping/retrying while holding user.Lock.
+	err = session.Open()
 	if err == nil {
 		// Socket is up. Arm the READY watchdog now — AFTER Open() — so its budget
 		// measures time spent waiting for READY rather than the (possibly slow)
 		// handshake itself; a large account or a slow proxy must not let the timer
 		// expire mid-handshake and close a session that is about to succeed.
 		// armReadyWatchdog skips arming if READY was already processed during
-		// Open() (sessionReady set by readyHandler), avoiding a false close.
+		// Open() (sessionReady set by the synchronous callback), avoiding a false close.
 		// discordgo's Open() returns success even when the handshake got Op9
 		// Invalid Session instead of READY, so without this a rejected session
 		// would re-IDENTIFY in-band forever; the watchdog force-closes it and
 		// routes the failure through the backoff path.
-		user.armReadyWatchdog()
+		user.armReadyWatchdog(generation, epoch)
+	} else {
+		// READY can be dispatched before Open ultimately returns an error.
+		// Invalidate that readiness and any queued work from the failed attempt.
+		user.disarmReadyWatchdog()
+		if isInvalidAuthError(err) {
+			user.invalidAuthHandler(generation)
+		}
 	}
 	return err
 }
 
-func (user *User) eventHandlerSync(rawEvt any) {
+func (user *User) eventHandlerSync(generation, epoch uint64, rawEvt any) {
+	// discordgo emits lifecycle events in gateway order. Apply their small
+	// state transitions here, before dispatching potentially slow bridge work.
+	// Session.Open and Close may hold both the session and user locks here, so
+	// this path must not acquire user.Lock or call back into the session.
+	user.bridgeStateLock.Lock()
+	user.reconnectLock.Lock()
+	if generation != user.sessionGeneration || user.manualDisconnect {
+		user.reconnectLock.Unlock()
+		user.bridgeStateLock.Unlock()
+		return
+	}
+	if _, invalid := rawEvt.(*discordgo.InvalidAuth); invalid {
+		// InvalidAuth follows Disconnect, which already advanced the epoch.
+		user.reconnectLock.Unlock()
+		user.bridgeStateLock.Unlock()
+		user.invalidAuthHandler(generation)
+		return
+	}
+	if epoch != user.connectionEpoch {
+		user.reconnectLock.Unlock()
+		user.bridgeStateLock.Unlock()
+		return
+	}
+	switch rawEvt.(type) {
+	case *discordgo.Ready, *discordgo.Resumed:
+		user.wasLoggedOut = false
+		user.wasDisconnected = false
+		user.onConnectionEstablishedLocked()
+	case *discordgo.Connect:
+		user.reconnectLock.Unlock()
+		user.bridgeStateLock.Unlock()
+		return
+	case *discordgo.Disconnect:
+		user.disconnectedLocked()
+		user.reconnectLock.Unlock()
+		user.bridgeStateLock.Unlock()
+		return
+	}
+	user.reconnectLock.Unlock()
+	user.bridgeStateLock.Unlock()
 	// Reset the friend-presence seeding-ready flag synchronously here (discordgo
 	// calls eventHandlerSync in gateway order) so it happens BEFORE the following
 	// READY_SUPPLEMENTAL event's handler goroutine runs. Doing it inside the async
@@ -993,10 +1029,10 @@ func (user *User) eventHandlerSync(rawEvt any) {
 		user.readyComplete = false
 		user.presenceLock.Unlock()
 	}
-	go user.eventHandler(rawEvt)
+	go user.eventHandler(generation, epoch, rawEvt)
 }
 
-func (user *User) eventHandler(rawEvt any) {
+func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 	defer func() {
 		err := recover()
 		if err != nil {
@@ -1006,17 +1042,19 @@ func (user *User) eventHandler(rawEvt any) {
 				Msg("Panic in Discord event handler")
 		}
 	}()
+	// Open may emit READY before returning an error. Wait for that attempt's
+	// user lock before running setup work, then reject its invalidated epoch.
+	user.Lock()
+	current := user.isCurrentConnection(generation, epoch)
+	user.Unlock()
+	if !current {
+		return
+	}
 	switch evt := rawEvt.(type) {
 	case *discordgo.Ready:
-		user.readyHandler(evt)
+		user.readyHandler(evt, generation, epoch)
 	case *discordgo.Resumed:
-		user.resumeHandler(evt)
-	case *discordgo.Connect:
-		user.connectedHandler(evt)
-	case *discordgo.Disconnect:
-		user.disconnectedHandler(evt)
-	case *discordgo.InvalidAuth:
-		user.invalidAuthHandler(evt)
+		user.resumeHandler(evt, generation, epoch)
 	case *discordgo.GuildCreate:
 		user.guildCreateHandler(evt)
 	case *discordgo.GuildDelete:
@@ -1156,13 +1194,18 @@ func (user *User) eventHandler(rawEvt any) {
 func (user *User) Disconnect() error {
 	user.Lock()
 	defer user.Unlock()
+	user.reconnectLock.Lock()
+	hadRetry := user.reconnectTimer != nil
+	user.stopReconnectingLocked()
+	user.reconnectLock.Unlock()
 	if user.Session == nil {
+		if hadRetry {
+			return nil
+		}
 		return ErrNotConnected
 	}
 
 	user.log.Info().Msg("Disconnecting session manually")
-	// Latch before Close() so the resulting Disconnect event does not reconnect.
-	user.stopReconnecting()
 	user.reconstructRelationships(nil)
 	if err := user.Session.Close(); err != nil {
 		return err
@@ -1203,12 +1246,8 @@ func (s ChannelSlice) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
-func (user *User) readyHandler(r *discordgo.Ready) {
+func (user *User) readyHandler(r *discordgo.Ready, generation, epoch uint64) {
 	user.log.Debug().Msg("Discord connection ready")
-	user.bridgeStateLock.Lock()
-	user.wasLoggedOut = false
-	user.bridgeStateLock.Unlock()
-	user.onConnectionEstablished()
 	// Clear the sent-presence dedup cache so the first Matrix presence ping
 	// after a reconnect always reaches Discord (the new gateway session starts
 	// without this Matrix-derived status).
@@ -1307,7 +1346,7 @@ func (user *User) readyHandler(r *discordgo.Ready) {
 		go user.seedMergedPresences(stashed)
 	}
 
-	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+	user.sendConnectedState(generation, epoch)
 }
 
 // discordReadEnabled reports whether any Discord→Matrix sync is enabled. Both
@@ -1696,13 +1735,8 @@ func (user *User) sleepGuildSub(ctx context.Context) {
 	}
 }
 
-func (user *User) resumeHandler(_ *discordgo.Resumed) {
+func (user *User) resumeHandler(_ *discordgo.Resumed, generation, epoch uint64) {
 	user.log.Debug().Msg("Discord connection resumed")
-	// A RESUMED is a successful reconnect just like READY (the bridge copies
-	// HeartbeatSession onto each session, so discordgo may resume). Run the same
-	// success cleanup so the watchdog is disarmed and the backoff is reset —
-	// otherwise the watchdog would close this healthy resumed session at 60s.
-	user.onConnectionEstablished()
 	// Clear the dedup cache so the first presence ping after a resume re-sends
 	// the current status to Discord (the resumed session may have lost it).
 	user.presenceLock.Lock()
@@ -1717,7 +1751,7 @@ func (user *User) resumeHandler(_ *discordgo.Resumed) {
 	// — risking a 4008 rate-limit close and reconnect churn. Run it in a
 	// goroutine so the resume handler isn't blocked for the duration.
 	go user.subscribeGuilds(2 * time.Second)
-	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+	user.sendConnectedState(generation, epoch)
 }
 
 func (user *User) addPrivateChannelToSpace(portal *Portal) bool {
@@ -1918,28 +1952,37 @@ func (user *User) handleGuild(meta *discordgo.Guild, timestamp time.Time, isInSp
 	user.addGuildToSpace(guild, isInSpace, timestamp)
 }
 
-func (user *User) connectedHandler(_ *discordgo.Connect) {
-	user.bridgeStateLock.Lock()
-	defer user.bridgeStateLock.Unlock()
-	user.log.Debug().Msg("Connected to Discord")
-	if user.wasDisconnected {
-		user.wasDisconnected = false
+func (user *User) isCurrentConnection(generation, epoch uint64) bool {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	return generation == user.sessionGeneration && epoch == user.connectionEpoch && !user.manualDisconnect
+}
+
+func (user *User) sendConnectedState(generation, epoch uint64) {
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	if generation == user.sessionGeneration && epoch == user.connectionEpoch && user.sessionReady && !user.manualDisconnect {
+		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 	}
 }
 
 func (user *User) disconnectedHandler(_ *discordgo.Disconnect) {
 	user.bridgeStateLock.Lock()
 	defer user.bridgeStateLock.Unlock()
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	user.disconnectedLocked()
+}
+
+// disconnectedLocked requires bridgeStateLock and reconnectLock.
+func (user *User) disconnectedLocked() {
 	if user.wasLoggedOut {
 		user.log.Debug().Msg("Disconnected from Discord (not updating bridge state as user was just logged out)")
 		return
 	}
 	// A teardown the bridge initiated (manual disconnect / shutdown) must not
 	// trigger a reconnect.
-	user.reconnectLock.Lock()
-	manual := user.manualDisconnect
-	user.reconnectLock.Unlock()
-	if manual {
+	if user.manualDisconnect {
 		user.log.Debug().Msg("Disconnected from Discord (manual disconnect, not reconnecting)")
 		return
 	}
@@ -1948,9 +1991,9 @@ func (user *User) disconnectedHandler(_ *discordgo.Disconnect) {
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "dc-transient-disconnect", Message: "Temporarily disconnected from Discord, trying to reconnect"})
 	// The dropped session's READY watchdog is moot now; the next connect arms a
 	// fresh one. Disarm it so it can't fire during the backoff window.
-	user.disarmReadyWatchdog()
+	user.disarmReadyWatchdogLocked()
 	// discordgo's auto-reconnect is disabled; drive it ourselves with backoff.
-	user.scheduleReconnect()
+	user.scheduleReconnectLocked()
 }
 
 // reconnectBackoffBase and reconnectBackoffMax bound the exponential backoff
@@ -2000,17 +2043,20 @@ func reconnectDelay(attempts int) time.Duration {
 }
 
 // armReadyWatchdog (re)starts the READY watchdog for the current session. Called
-// after a successful Open(); cancelled by readyHandler on success or by
+// after a successful Open(); cancelled by the READY callback on success or by
 // stopReconnecting on teardown.
-func (user *User) armReadyWatchdog() {
+func (user *User) armReadyWatchdog(generation, epoch uint64) {
 	user.reconnectLock.Lock()
 	defer user.reconnectLock.Unlock()
+	if generation != user.sessionGeneration || epoch != user.connectionEpoch {
+		return
+	}
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
 	}
 	// Skip arming if the bridge is tearing down, or if READY was already
-	// processed during Open() (readyHandler set sessionReady) — in that case
+	// processed during Open() (the callback set sessionReady) — in that case
 	// there is nothing to watch for.
 	if user.manualDisconnect || user.sessionReady {
 		return
@@ -2019,20 +2065,22 @@ func (user *User) armReadyWatchdog() {
 	// session can't close a newer one that has since replaced it. armReadyWatchdog
 	// is called from connect() under user.Lock, so user.Session is stable here.
 	guarded := user.Session
-	user.readyWatchdog = time.AfterFunc(readyTimeout, func() { user.onReadyTimeout(guarded) })
+	user.readyWatchdog = time.AfterFunc(readyTimeout, func() { user.onReadyTimeout(guarded, generation, epoch) })
 }
 
 // onConnectionEstablished runs the success cleanup shared by READY and RESUMED:
 // it marks the session ready, disarms the READY watchdog, and arms the stability
 // timer that will clear the backoff counter — but only after the connection has
-// actually stayed up for stableConnectionThreshold (see onConnectionStable). It
-// deliberately does NOT stop reconnectTimer — because gateway events dispatch on
-// separate goroutines, a stale READY can run after a Disconnect from the same
-// connection has already scheduled a retry, and cancelling that timer would leave
-// the bridge disconnected with no pending reconnect. An intentional Connect()
-// supersedes a pending timer instead (see connect()).
+// actually stayed up for stableConnectionThreshold (see onConnectionStable).
+// The synchronous callback validates the generation and epoch before calling
+// this. Only an intentional Connect supersedes a pending recovery timer.
 func (user *User) onConnectionEstablished() {
 	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	user.onConnectionEstablishedLocked()
+}
+
+func (user *User) onConnectionEstablishedLocked() {
 	user.sessionReady = true
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
@@ -2045,7 +2093,6 @@ func (user *User) onConnectionEstablished() {
 	// whether a disconnect happened in the meantime (see connectionEpoch).
 	epoch := user.connectionEpoch
 	user.stableTimer = time.AfterFunc(stableConnectionThreshold, func() { user.onConnectionStable(epoch) })
-	user.reconnectLock.Unlock()
 }
 
 // onConnectionStable fires stableConnectionThreshold after a READY/RESUMED that
@@ -2055,26 +2102,18 @@ func (user *User) onConnectionEstablished() {
 // flapping connection keeps escalating its backoff instead of restarting from
 // the base delay every cycle.
 //
-// The epoch check alone isn't sufficient: onConnectionEstablished can run for a
-// READY/RESUMED whose dispatch was delayed until after disconnectedHandler
-// already processed that same connection's drop (event handlers can run on a
-// goroutine that lags behind the actual gateway state). In that case the
-// stale event captures the *current* (already-bumped) epoch when it arms this
-// timer, so an epoch match alone would wrongly look legitimate. Gating on
-// reconnectTimer == nil closes this: a non-nil reconnectTimer means a backoff
-// reconnect is currently scheduled, which can only be true if we are not
-// presently in a genuinely stable, connected state, regardless of how this
-// particular timer came to be armed.
+// A pending recovery timer also prevents a reset: it means the connection has
+// not settled into stable operation, regardless of when this timer was armed.
 func (user *User) onConnectionStable(epoch uint64) {
 	user.reconnectLock.Lock()
 	defer user.reconnectLock.Unlock()
-	user.stableTimer = nil
 	if epoch != user.connectionEpoch {
 		// A disconnect bumped the epoch since this timer was armed -- the
 		// connection it was tracking didn't stay up. Do not touch the backoff
 		// counter on its behalf.
 		return
 	}
+	user.stableTimer = nil
 	if user.reconnectTimer != nil {
 		// A backoff reconnect is currently scheduled, so we are not actually in
 		// a stable connected state right now -- this timer must have been armed
@@ -2091,6 +2130,12 @@ func (user *User) onConnectionStable(epoch uint64) {
 // not to clear the backoff counter even if it fired concurrently with Stop().
 func (user *User) disarmReadyWatchdog() {
 	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	user.disarmReadyWatchdogLocked()
+}
+
+func (user *User) disarmReadyWatchdogLocked() {
+	user.sessionReady = false
 	if user.readyWatchdog != nil {
 		user.readyWatchdog.Stop()
 		user.readyWatchdog = nil
@@ -2100,46 +2145,43 @@ func (user *User) disarmReadyWatchdog() {
 		user.stableTimer = nil
 	}
 	user.connectionEpoch++
-	user.reconnectLock.Unlock()
 }
 
-// onReadyTimeout fires when a session opened but never reached READY. It closes
-// the session so discordgo emits a Disconnect, which routes the failure through
-// disconnectedHandler -> scheduleReconnect (capped backoff).
-func (user *User) onReadyTimeout(guarded *discordgo.Session) {
-	user.reconnectLock.Lock()
-	user.readyWatchdog = nil
-	// Bail if the handshake completed (READY/RESUMED) concurrently with this
-	// timer firing, or if the bridge is tearing down — never close a valid
-	// session. Both this check and onConnectionEstablished's set are under
-	// reconnectLock, so whichever ran first wins deterministically.
-	bail := user.sessionReady || user.manualDisconnect
-	user.reconnectLock.Unlock()
-	if bail {
-		return
-	}
-	// Only close the session this watchdog was armed for. If a newer session has
-	// since replaced it (reconnect after this one dropped), the stale timer must
-	// not touch the new, possibly-healthy session.
+// onReadyTimeout fires when a session opened but never reached READY. It marks
+// the attempt disconnected, schedules capped recovery, then closes its socket.
+func (user *User) onReadyTimeout(guarded *discordgo.Session, generation, epoch uint64) {
 	user.Lock()
-	current := user.Session
-	user.Unlock()
-	if current != guarded {
+	defer user.Unlock()
+	user.bridgeStateLock.Lock()
+	user.reconnectLock.Lock()
+	if user.Session != guarded || generation != user.sessionGeneration || epoch != user.connectionEpoch || user.sessionReady || user.manualDisconnect {
+		user.reconnectLock.Unlock()
+		user.bridgeStateLock.Unlock()
 		return
 	}
+	// Withdraw this attempt before closing it so a late READY cannot revive
+	// it between the timeout decision and the actual socket close.
+	user.disconnectedLocked()
+	user.reconnectLock.Unlock()
+	user.bridgeStateLock.Unlock()
 	user.log.Warn().Msg("No READY received after connect; closing session to trigger backoff reconnect")
 	_ = guarded.Close()
 }
 
 // scheduleReconnect arms a single backoff timer to reconnect the gateway. The
-// delay grows as 2^(failures-since-last-READY), capped at reconnectBackoffMax.
+// delay grows with failures since the last stable connection and is capped at
+// reconnectBackoffMax.
 // Safe to call from the disconnect handler and from a failed reconnect attempt;
 // it coalesces (one pending timer at a time) and is a no-op after a manual
 // disconnect.
 func (user *User) scheduleReconnect() {
 	user.reconnectLock.Lock()
 	defer user.reconnectLock.Unlock()
-	if user.manualDisconnect || user.reconnectTimer != nil {
+	user.scheduleReconnectLocked()
+}
+
+func (user *User) scheduleReconnectLocked() {
+	if user.manualDisconnect || user.sessionReady || user.reconnectTimer != nil {
 		return
 	}
 	user.reconnectAttempts++
@@ -2148,21 +2190,22 @@ func (user *User) scheduleReconnect() {
 		Int("attempt", user.reconnectAttempts).
 		Dur("delay", delay).
 		Msg("Scheduling Discord gateway reconnect with backoff")
-	user.reconnectTimer = time.AfterFunc(delay, user.doReconnect)
+	generation, epoch := user.sessionGeneration, user.connectionEpoch
+	user.reconnectTimer = time.AfterFunc(delay, func() { user.doReconnect(generation, epoch) })
 }
 
 // doReconnect is the backoff timer callback. It performs one reconnect attempt
 // and, on failure, reschedules with a longer backoff. On success it returns and
-// lets the normal lifecycle take over: readyHandler resets the attempt counter,
-// or a fresh Disconnect reschedules.
-func (user *User) doReconnect() {
+// lets the normal lifecycle take over: a stable connection resets the attempt
+// counter, or a fresh Disconnect reschedules.
+func (user *User) doReconnect(generation, epoch uint64) {
 	user.reconnectLock.Lock()
-	user.reconnectTimer = nil
-	manual := user.manualDisconnect
-	user.reconnectLock.Unlock()
-	if manual {
+	if generation != user.sessionGeneration || epoch != user.connectionEpoch || user.manualDisconnect || user.sessionReady {
+		user.reconnectLock.Unlock()
 		return
 	}
+	user.reconnectTimer = nil
+	user.reconnectLock.Unlock()
 	user.bridgeStateLock.Lock()
 	loggedOut := user.wasLoggedOut
 	user.bridgeStateLock.Unlock()
@@ -2171,26 +2214,30 @@ func (user *User) doReconnect() {
 	}
 
 	user.log.Info().Msg("Attempting Discord gateway reconnect")
-	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 	// connect(false): an auto-reconnect must not clear the manual-disconnect
 	// latch, so a manual teardown racing this attempt still wins.
-	err := user.connect(false)
+	err := user.connect(false, generation, epoch)
 	if err == nil {
-		// Connected. Either READY fires and clears the backoff, or Discord rejects
-		// the session and a Disconnect reschedules with a longer delay.
+		// A stable READY/RESUMED clears the backoff; a rejected session's
+		// Disconnect or watchdog reschedules with a longer delay.
 		return
 	}
 	if errors.Is(err, ErrNotLoggedIn) {
 		// Nothing to reconnect to; stop.
 		return
 	}
-	closeErr := &websocket.CloseError{}
-	if errors.As(err, &closeErr) && closeErr.Code == 4004 {
-		user.invalidAuthHandler(nil)
+	if isInvalidAuthError(err) {
 		return
 	}
 	user.log.Warn().Err(err).Msg("Discord gateway reconnect attempt failed")
-	user.scheduleReconnect()
+	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	// connect advanced the generation when it started this attempt. A manual
+	// replacement after that attempt returned must not inherit its retry.
+	if user.sessionGeneration == generation+1 && !user.manualDisconnect {
+		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "dc-unknown-websocket-error", Message: err.Error()})
+		user.scheduleReconnectLocked()
+	}
 }
 
 // stopReconnecting latches manualDisconnect and cancels any pending backoff
@@ -2198,40 +2245,54 @@ func (user *User) doReconnect() {
 // disconnect, shutdown) so the resulting Disconnect event is not reconnected.
 func (user *User) stopReconnecting() {
 	user.reconnectLock.Lock()
+	defer user.reconnectLock.Unlock()
+	user.stopReconnectingLocked()
+}
+
+func (user *User) stopReconnectingLocked() {
 	user.manualDisconnect = true
 	user.reconnectAttempts = 0
 	if user.reconnectTimer != nil {
 		user.reconnectTimer.Stop()
 		user.reconnectTimer = nil
 	}
-	if user.readyWatchdog != nil {
-		user.readyWatchdog.Stop()
-		user.readyWatchdog = nil
-	}
-	if user.stableTimer != nil {
-		user.stableTimer.Stop()
-		user.stableTimer = nil
-	}
-	user.connectionEpoch++
-	user.reconnectLock.Unlock()
+	user.disarmReadyWatchdogLocked()
 }
 
-func (user *User) invalidAuthHandler(_ *discordgo.InvalidAuth) {
+func isInvalidAuthError(err error) bool {
+	var closeErr *websocket.CloseError
+	return errors.As(err, &closeErr) && closeErr.Code == 4004
+}
+
+func (user *User) invalidAuthHandler(generation uint64) {
 	user.bridgeStateLock.Lock()
+	user.reconnectLock.Lock()
+	if generation != user.sessionGeneration || user.wasLoggedOut {
+		user.reconnectLock.Unlock()
+		user.bridgeStateLock.Unlock()
+		return
+	}
 	user.log.Info().Msg("Got logged out from Discord due to invalid token")
 	user.wasLoggedOut = true
-	// Unlocked explicitly (not deferred) before BridgeState.Send/
-	// sendBadCredentialsNotice below: sendBadCredentialsNotice takes this same
-	// lock itself, and holding it here across that call would deadlock. This
-	// also brings invalidAuthHandler in line with handlePossible40002, which
-	// never held bridgeStateLock around its own BridgeState.Send either.
+	user.stopReconnectingLocked()
+	user.reconnectLock.Unlock()
 	user.bridgeStateLock.Unlock()
+	go user.logoutInvalidSession(generation)
+}
+
+func (user *User) logoutInvalidSession(generation uint64) {
+	user.Lock()
+	defer user.Unlock()
+	user.reconnectLock.Lock()
+	current := generation == user.sessionGeneration
+	user.reconnectLock.Unlock()
+	if !current {
+		return
+	}
 	message := "Discord access token is no longer valid, please log in again"
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "dc-websocket-disconnect-4004", Message: message})
-	// invalidAuthHandler calls Logout below, which clears DiscordToken, so
-	// `login` is the correct recovery step here.
 	user.sendBadCredentialsNotice("dc-websocket-disconnect-4004", message, "Run `login` to reconnect.")
-	go user.Logout(false)
+	user.logout(false)
 }
 
 func (user *User) handlePossible40002(err error) bool {
@@ -2890,7 +2951,7 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			//     non-empty text): require an exact match. After a clear we sent ""
 			//     to Discord, so a genuine new status ("X") will not match and is
 			//     correctly applied.
-			//   - We last sent a *preserve* (nil activities — lastSentToDiscordText
+			//   - We last left custom status unchanged (lastSentToDiscordText
 			//     "" and not a clear): Discord's echo carries whatever custom status
 			//     it already had, which we don't know, so treat empty as a wildcard
 			//     to suppress our own presence-only echo.
@@ -2950,19 +3011,17 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 // by a single trailing timer when the cooldown expires. Must be called without
 // presenceLock held; sess must be non-nil.
 //
-// clearStatus selects the activities behavior: false leaves activities untouched
-// (nil — keeps any game/Spotify session and existing custom status), true with an
-// empty statusText clears the custom status (empty activities array), and a
-// non-empty statusText sets it. See sendPresenceToDiscord.
+// An empty status means no gateway presence update. clearStatus distinguishes
+// clearing custom status from leaving it unchanged; it does not mean that a nil
+// activities slice will preserve activities. See sendPresenceToDiscord.
 func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
 	user.presenceLock.Lock()
 	// A preserve update (no status change: empty text, not a clear) must not cancel
 	// a status change that is already queued but not yet flushed. If there is an
 	// unsent queued status intent (pending differs from what was last sent), inherit
 	// it so a presence-only ping arriving before the debounce timer fires doesn't
-	// downgrade a pending clear/set back to "leave activities alone". When nothing
-	// is queued, keep this a genuine preserve (nil activities) so we don't re-send
-	// an already-applied custom status — which would wipe a game/Spotify session.
+	// downgrade a pending clear/set back to "leave custom status alone". When
+	// nothing is queued, do not re-send an already-applied custom status.
 	if statusText == "" && !clearStatus {
 		queuedUnsent := user.pendingDiscordStatusText != user.lastSentDiscordStatusText ||
 			user.pendingDiscordClear != user.lastSentDiscordClear
@@ -3031,51 +3090,56 @@ func (user *User) flushPendingDiscordPresence() {
 	user.sendPresenceToDiscord(sess, status, statusText, clearStatus)
 }
 
-// sendPresenceToDiscord performs the actual opcode-3 UpdateStatusComplex call
-// and, on success, records what was sent for dedup and for the echo
-// suppression that applyPresence and HandleMatrixPresence rely on. Must be
-// called without presenceLock held.
+// sendPresenceToDiscord sends gateway presence when status is non-empty and
+// independently updates user custom status over REST. It records outgoing
+// changes for dedup and echo suppression. Must be called without presenceLock.
 func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
+	// Recheck the flags at dispatch, including deferred sends queued before a
+	// configuration change. Neither a pending timer nor a status-only update
+	// may assert gateway presence when presence forwarding is disabled.
+	pSync := user.bridge.Config.Bridge.SyncMatrixPresenceToDiscord
+	sSync := user.bridge.Config.Bridge.SyncMatrixStatusToDiscord
+	if !pSync {
+		if !sSync || !sess.IsUser {
+			return
+		}
+		status = ""
+	}
+	if !sSync {
+		statusText = ""
+		clearStatus = false
+	}
+	if status == "" && statusText == "" && !clearStatus {
+		return
+	}
+
 	// The custom-status TEXT and the presence STATE (online/idle/dnd/invisible)
 	// are delivered through two different channels, and the choice depends on the
 	// token type:
 	//
-	//   - User tokens (sess.IsUser): custom status is NOT a gateway activity. A
-	//     real Discord client sets it via REST (PATCH users/@me/settings ->
-	//     custom_status). If we instead stuff a Custom Status activity into the
-	//     opcode-3 payload, Discord rejects the whole presence update — which
-	//     silently drops the online/idle/dnd state change too. That is the root
-	//     cause of "set DND with a custom message in Charm and nothing applies".
-	//     So for user tokens we send STATE over opcode 3 with NO activity, and
-	//     set the TEXT over REST below.
-	//
-	//   - Bot tokens: bots have no custom status; the historical opcode-3 Custom
-	//     Status activity is the only path. Keep that behavior to avoid regressing
-	//     bot setups (the activity is harmless for bots even though it does little).
-	var activities []*discordgo.Activity
+	//   - User tokens (sess.IsUser): send state over opcode 3 only when requested,
+	//     and set custom_status text via PATCH users/@me/settings below.
+	//   - Bot tokens: retain the existing opcode-3 Custom Status activity path,
+	//     which requires presence forwarding to be enabled.
+	// This bridge user session publishes no gateway activities. An empty slice
+	// is an explicit session payload, not a request to preserve aggregate account
+	// activities: discordgo converts nil to [] too. Never replay activities from
+	// other sessions (games, Spotify, etc.) into this bridge session.
+	activities := []*discordgo.Activity{}
 	if !sess.IsUser {
-		// Bot path: three-way activities behavior, because opcode 3 rewrites
-		// state and activities together:
-		//   - statusText != ""     → set the custom status to that text.
-		//   - clearStatus == true  → empty slice ([]) explicitly clears it.
-		//   - otherwise (nil)      → "don't change activities", preserving a
-		//                            game/Spotify session and existing status.
+		// Bot activities are carried in opcode 3. Publish the requested Matrix
+		// custom-status activity or an empty session list; nil cannot preserve it.
 		if statusText != "" {
 			activities = []*discordgo.Activity{{
 				Name:  "Custom Status",
 				Type:  discordgo.ActivityTypeCustom,
 				State: statusText,
 			}}
-		} else if clearStatus {
-			activities = []*discordgo.Activity{}
 		}
 	}
-	// Render idle/away. Discord only displays a session as idle when the
-	// opcode-3 payload carries afk=true and a non-nil "since" (epoch ms);
-	// without these, StatusIdle alone is treated as active. Note this is
-	// best-effort for "away even while active": Discord aggregates presence
-	// across a user's clients, so another active client of the same account can
-	// still mask this session-level idle in what others observe.
+	// Render this session's idle/away intent with afk=true and a "since" timestamp
+	// in epoch milliseconds. Other states leave AFK false and since null. This
+	// payload does not control presence on the account's other Discord sessions.
 	usd := discordgo.UpdateStatusData{
 		Status:     status,
 		Activities: activities,
@@ -3127,20 +3191,22 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 	user.lastSentDiscordClear = clearStatus
 	user.presenceLock.Unlock()
 
-	if err := sess.UpdateStatusComplex(usd); err != nil {
-		user.log.Warn().Err(err).
-			Str("discord_status", status).
-			Msg("Failed to update Discord status from Matrix presence")
-		// Roll back the armed state so a retry isn't deduped away.
-		user.presenceLock.Lock()
-		user.matrixPresenceSetAt = prevMatrixPresenceSetAt
-		user.lastSentToDiscordStatus = prevSentToStatus
-		user.lastSentToDiscordText = prevSentToText
-		user.lastSentDiscordStatus = prevSentStatus
-		user.lastSentDiscordStatusText = prevSentText
-		user.lastSentDiscordClear = prevClear
-		user.presenceLock.Unlock()
-		return
+	if status != "" {
+		if err := sess.UpdateStatusComplex(usd); err != nil {
+			user.log.Warn().Err(err).
+				Str("discord_status", status).
+				Msg("Failed to update Discord status from Matrix presence")
+			// Roll back the armed state so a retry isn't deduped away.
+			user.presenceLock.Lock()
+			user.matrixPresenceSetAt = prevMatrixPresenceSetAt
+			user.lastSentToDiscordStatus = prevSentToStatus
+			user.lastSentToDiscordText = prevSentToText
+			user.lastSentDiscordStatus = prevSentStatus
+			user.lastSentDiscordStatusText = prevSentText
+			user.lastSentDiscordClear = prevClear
+			user.presenceLock.Unlock()
+			return
+		}
 	}
 
 	// User-token custom status goes over REST, decoupled from the state update
@@ -3161,9 +3227,9 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 		if _, restErr := sess.RequestWithBucketID(
 			"PATCH", discordgo.EndpointUserSettings("@me"), body,
 			discordgo.EndpointUserSettings("")); restErr != nil {
-			// Warn but keep the armed dedup state: the presence STATE already
-			// applied above, and not rolling back means we don't hammer a
-			// persistently-failing endpoint on every subsequent ping.
+			// Keep the armed dedup state so subsequent presence pings do not
+			// repeatedly PATCH a persistently failing settings endpoint. Any
+			// gateway state sent above has already been applied independently.
 			user.log.Warn().Err(restErr).
 				Str("status_text", statusText).
 				Bool("clear", clearStatus).

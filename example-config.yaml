@@ -180,15 +180,17 @@ bridge:
     # considers this to be a "risky" action. Note that the bridge will conservatively reject all outgoing DMs from users
     # until it has synced that user's relationships from Discord.
     forbid_dming_strangers: true
-    # Should Matrix presence and status be forwarded to Discord (gateway opcode 3)?
-    # Discord rate-limits presence updates to 5/min and may invalidate user tokens
-    # (close code 4004) that exceed it, so this is off by default. When enabled,
-    # updates are deduplicated and rate-limited before being sent to Discord.
+    # Should Matrix presence STATE be forwarded to Discord (gateway opcode 3)?
+    # Updates are deduplicated and rate-limited. User presence packets publish an
+    # empty activities list for this bridge session; they do not replay activities
+    # observed on other clients. This is off by default.
     sync_matrix_presence_to_discord: false
     # Should the Matrix status message (custom status TEXT) be forwarded to Discord?
-    # Discord carries state and text in one update, so: with presence sync off this
-    # shows you as "online" to deliver the text; with this off but presence sync on,
-    # your existing Discord custom status is preserved rather than cleared.
+    # User status text is updated over REST independently of presence. Text-only
+    # updates do not change gateway status, AFK, or activities. With this off,
+    # the user's REST custom status is unchanged. Bots can only forward a status
+    # activity when presence sync is also on; bot presence updates publish that
+    # activity or an empty list, not activities observed from other sessions.
     sync_matrix_status_to_discord: false
     # Should Discord presence and status be reflected onto Matrix? Receiving presence
     # requires subscribing to every bridged guild via gateway opcode 14, which upstream
