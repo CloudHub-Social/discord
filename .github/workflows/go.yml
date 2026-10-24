@@ -37,5 +37,12 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
-      - name: Test Discord gateway handshake
-        run: go test -race -count=1 -timeout 60s -run "^TestGatewayHandshake" github.com/bwmarrin/discordgo
+      - name: Test full pinned Discord dependency
+        env:
+          DG_OAUTH2_TOKEN: ""
+          DGB_TOKEN: ""
+          DGU_TOKEN: ""
+        run: go test -race -count=1 -timeout 180s github.com/bwmarrin/discordgo/...
+
+      - name: Test quiet health probe and notification deduplication
+        run: python3 -m unittest discover -s contrib -p "test_discord_health*.py" -v
