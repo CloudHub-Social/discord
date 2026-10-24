@@ -180,17 +180,15 @@ type User struct {
 	lastDiscordStatusText string
 	matrixStatusEverSet   bool
 
-	// lastSentDiscordStatus and lastSentDiscordStatusText track what was most
-	// recently sent to Discord via UpdateStatusComplex. Used to suppress
-	// redundant WebSocket status updates when the effective status hasn't
-	// changed (Matrix clients send presence pings frequently, and each one
-	// would otherwise generate a Discord opcode-3 message).
+	// lastSentDiscordStatus and lastSentDiscordStatusText track the last outgoing
+	// intent for gateway presence and custom status. An empty status means that
+	// update had no gateway payload. These fields suppress redundant updates from
+	// frequent Matrix presence pings.
 	lastSentDiscordStatus     string
 	lastSentDiscordStatusText string
-	// lastSentDiscordClear records whether the last update explicitly cleared the
-	// custom status (sent an empty activities array) rather than preserving it
-	// (nil activities). It is part of the dedup key so a clear is not suppressed
-	// by a prior preserve that happened to carry the same empty text.
+	// lastSentDiscordClear distinguishes an explicit custom-status clear from
+	// an update with no text change. Both have empty text, but only the explicit
+	// clear should PATCH a user custom status to null.
 	lastSentDiscordClear bool
 
 	// presenceCache maps Discord user IDs to their last known non-offline
@@ -2890,7 +2888,7 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 			//     non-empty text): require an exact match. After a clear we sent ""
 			//     to Discord, so a genuine new status ("X") will not match and is
 			//     correctly applied.
-			//   - We last sent a *preserve* (nil activities — lastSentToDiscordText
+			//   - We last left custom status unchanged (lastSentToDiscordText
 			//     "" and not a clear): Discord's echo carries whatever custom status
 			//     it already had, which we don't know, so treat empty as a wildcard
 			//     to suppress our own presence-only echo.
@@ -2950,19 +2948,17 @@ func (user *User) applyPresence(userID string, status discordgo.Status, customSt
 // by a single trailing timer when the cooldown expires. Must be called without
 // presenceLock held; sess must be non-nil.
 //
-// clearStatus selects the activities behavior: false leaves activities untouched
-// (nil — keeps any game/Spotify session and existing custom status), true with an
-// empty statusText clears the custom status (empty activities array), and a
-// non-empty statusText sets it. See sendPresenceToDiscord.
+// An empty status means no gateway presence update. clearStatus distinguishes
+// clearing custom status from leaving it unchanged; it does not mean that a nil
+// activities slice will preserve activities. See sendPresenceToDiscord.
 func (user *User) forwardPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
 	user.presenceLock.Lock()
 	// A preserve update (no status change: empty text, not a clear) must not cancel
 	// a status change that is already queued but not yet flushed. If there is an
 	// unsent queued status intent (pending differs from what was last sent), inherit
 	// it so a presence-only ping arriving before the debounce timer fires doesn't
-	// downgrade a pending clear/set back to "leave activities alone". When nothing
-	// is queued, keep this a genuine preserve (nil activities) so we don't re-send
-	// an already-applied custom status — which would wipe a game/Spotify session.
+	// downgrade a pending clear/set back to "leave custom status alone". When
+	// nothing is queued, do not re-send an already-applied custom status.
 	if statusText == "" && !clearStatus {
 		queuedUnsent := user.pendingDiscordStatusText != user.lastSentDiscordStatusText ||
 			user.pendingDiscordClear != user.lastSentDiscordClear
@@ -3031,51 +3027,56 @@ func (user *User) flushPendingDiscordPresence() {
 	user.sendPresenceToDiscord(sess, status, statusText, clearStatus)
 }
 
-// sendPresenceToDiscord performs the actual opcode-3 UpdateStatusComplex call
-// and, on success, records what was sent for dedup and for the echo
-// suppression that applyPresence and HandleMatrixPresence rely on. Must be
-// called without presenceLock held.
+// sendPresenceToDiscord sends gateway presence when status is non-empty and
+// independently updates user custom status over REST. It records outgoing
+// changes for dedup and echo suppression. Must be called without presenceLock.
 func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusText string, clearStatus bool) {
+	// Recheck the flags at dispatch, including deferred sends queued before a
+	// configuration change. Neither a pending timer nor a status-only update
+	// may assert gateway presence when presence forwarding is disabled.
+	pSync := user.bridge.Config.Bridge.SyncMatrixPresenceToDiscord
+	sSync := user.bridge.Config.Bridge.SyncMatrixStatusToDiscord
+	if !pSync {
+		if !sSync || !sess.IsUser {
+			return
+		}
+		status = ""
+	}
+	if !sSync {
+		statusText = ""
+		clearStatus = false
+	}
+	if status == "" && statusText == "" && !clearStatus {
+		return
+	}
+
 	// The custom-status TEXT and the presence STATE (online/idle/dnd/invisible)
 	// are delivered through two different channels, and the choice depends on the
 	// token type:
 	//
-	//   - User tokens (sess.IsUser): custom status is NOT a gateway activity. A
-	//     real Discord client sets it via REST (PATCH users/@me/settings ->
-	//     custom_status). If we instead stuff a Custom Status activity into the
-	//     opcode-3 payload, Discord rejects the whole presence update — which
-	//     silently drops the online/idle/dnd state change too. That is the root
-	//     cause of "set DND with a custom message in Charm and nothing applies".
-	//     So for user tokens we send STATE over opcode 3 with NO activity, and
-	//     set the TEXT over REST below.
-	//
-	//   - Bot tokens: bots have no custom status; the historical opcode-3 Custom
-	//     Status activity is the only path. Keep that behavior to avoid regressing
-	//     bot setups (the activity is harmless for bots even though it does little).
-	var activities []*discordgo.Activity
+	//   - User tokens (sess.IsUser): send state over opcode 3 only when requested,
+	//     and set custom_status text via PATCH users/@me/settings below.
+	//   - Bot tokens: retain the existing opcode-3 Custom Status activity path,
+	//     which requires presence forwarding to be enabled.
+	// This bridge user session publishes no gateway activities. An empty slice
+	// is an explicit session payload, not a request to preserve aggregate account
+	// activities: discordgo converts nil to [] too. Never replay activities from
+	// other sessions (games, Spotify, etc.) into this bridge session.
+	activities := []*discordgo.Activity{}
 	if !sess.IsUser {
-		// Bot path: three-way activities behavior, because opcode 3 rewrites
-		// state and activities together:
-		//   - statusText != ""     → set the custom status to that text.
-		//   - clearStatus == true  → empty slice ([]) explicitly clears it.
-		//   - otherwise (nil)      → "don't change activities", preserving a
-		//                            game/Spotify session and existing status.
+		// Bot activities are carried in opcode 3. Publish the requested Matrix
+		// custom-status activity or an empty session list; nil cannot preserve it.
 		if statusText != "" {
 			activities = []*discordgo.Activity{{
 				Name:  "Custom Status",
 				Type:  discordgo.ActivityTypeCustom,
 				State: statusText,
 			}}
-		} else if clearStatus {
-			activities = []*discordgo.Activity{}
 		}
 	}
-	// Render idle/away. Discord only displays a session as idle when the
-	// opcode-3 payload carries afk=true and a non-nil "since" (epoch ms);
-	// without these, StatusIdle alone is treated as active. Note this is
-	// best-effort for "away even while active": Discord aggregates presence
-	// across a user's clients, so another active client of the same account can
-	// still mask this session-level idle in what others observe.
+	// Render this session's idle/away intent with afk=true and a "since" timestamp
+	// in epoch milliseconds. Other states leave AFK false and since null. This
+	// payload does not control presence on the account's other Discord sessions.
 	usd := discordgo.UpdateStatusData{
 		Status:     status,
 		Activities: activities,
@@ -3127,20 +3128,22 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 	user.lastSentDiscordClear = clearStatus
 	user.presenceLock.Unlock()
 
-	if err := sess.UpdateStatusComplex(usd); err != nil {
-		user.log.Warn().Err(err).
-			Str("discord_status", status).
-			Msg("Failed to update Discord status from Matrix presence")
-		// Roll back the armed state so a retry isn't deduped away.
-		user.presenceLock.Lock()
-		user.matrixPresenceSetAt = prevMatrixPresenceSetAt
-		user.lastSentToDiscordStatus = prevSentToStatus
-		user.lastSentToDiscordText = prevSentToText
-		user.lastSentDiscordStatus = prevSentStatus
-		user.lastSentDiscordStatusText = prevSentText
-		user.lastSentDiscordClear = prevClear
-		user.presenceLock.Unlock()
-		return
+	if status != "" {
+		if err := sess.UpdateStatusComplex(usd); err != nil {
+			user.log.Warn().Err(err).
+				Str("discord_status", status).
+				Msg("Failed to update Discord status from Matrix presence")
+			// Roll back the armed state so a retry isn't deduped away.
+			user.presenceLock.Lock()
+			user.matrixPresenceSetAt = prevMatrixPresenceSetAt
+			user.lastSentToDiscordStatus = prevSentToStatus
+			user.lastSentToDiscordText = prevSentToText
+			user.lastSentDiscordStatus = prevSentStatus
+			user.lastSentDiscordStatusText = prevSentText
+			user.lastSentDiscordClear = prevClear
+			user.presenceLock.Unlock()
+			return
+		}
 	}
 
 	// User-token custom status goes over REST, decoupled from the state update
@@ -3161,9 +3164,9 @@ func (user *User) sendPresenceToDiscord(sess *discordgo.Session, status, statusT
 		if _, restErr := sess.RequestWithBucketID(
 			"PATCH", discordgo.EndpointUserSettings("@me"), body,
 			discordgo.EndpointUserSettings("")); restErr != nil {
-			// Warn but keep the armed dedup state: the presence STATE already
-			// applied above, and not rolling back means we don't hammer a
-			// persistently-failing endpoint on every subsequent ping.
+			// Keep the armed dedup state so subsequent presence pings do not
+			// repeatedly PATCH a persistently failing settings endpoint. Any
+			// gateway state sent above has already been applied independently.
 			user.log.Warn().Err(restErr).
 				Str("status_text", statusText).
 				Bool("clear", clearStatus).

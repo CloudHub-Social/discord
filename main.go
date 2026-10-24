@@ -133,10 +133,8 @@ const charmDNDPrefix = "[dnd]"
 const discordCustomStatusMaxRunes = 128
 
 func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
-	// Forwarding to Discord (opcode 3) is opt-in per component: presence STATE and
-	// custom status TEXT have independent flags. If neither is enabled there is
-	// nothing to send. (Opt-in matters because Discord penalizes user tokens that
-	// emit opcode-3 updates too aggressively — close code 4004.)
+	// Presence state and custom status text are independently opt-in. User
+	// custom status uses REST; only presence state requires gateway opcode 3.
 	pSync := br.Config.Bridge.SyncMatrixPresenceToDiscord
 	sSync := br.Config.Bridge.SyncMatrixStatusToDiscord
 	if !pSync && !sSync {
@@ -215,18 +213,15 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 	//    rather than directly by a Charm user action, so a clear from Charm after
 	//    a Discord-originated status is still forwarded correctly.
 	//  - otherwise (never set, or raw had content that stripped to empty e.g. bare
-	//    "[dnd]"): fall back to the last Discord-side status so we don't clobber it.
-	// Resolve the custom-status text to send and how it should affect Discord's
-	// activities. clearStatus distinguishes an explicit clear (empty activities
-	// array) from a preserve (nil activities — leave games/Spotify and any existing
-	// custom status untouched); see sendPresenceToDiscord.
+	//    "[dnd]"): leave the user custom status unchanged.
+	// clearStatus distinguishes an explicit custom-status clear from no text
+	// change. User custom status is separate from gateway session activities;
+	// see sendPresenceToDiscord for the bot activity behavior.
 	user.presenceLock.Lock()
 	var textToSend string
 	var clearStatus bool
 	if !sSync {
-		// Status sync disabled: never change the custom status text. Preserve
-		// (textToSend == "" && !clearStatus → nil activities), which keeps both the
-		// existing Discord custom status and any game/Spotify session.
+		// Status sync disabled: do not PATCH the user's Discord custom status.
 		textToSend = ""
 	} else if statusText != "" {
 		user.lastMatrixStatusText = statusText
@@ -250,23 +245,19 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 		textToSend = string(runes[:discordCustomStatusMaxRunes])
 	}
 
-	// Presence sync disabled (status-only mode): don't mirror the Matrix online
-	// state. opcode 3 still requires a state, so we assert "online" — but only when
-	// there is actually a status change to carry (new text or an explicit clear).
-	// A pure presence ping with nothing to say is dropped so it can't make an
-	// invisible/offline account visible.
+	// Status-only user updates use REST without changing gateway status, AFK,
+	// or activities. Bots have no independent custom-status endpoint, so their
+	// activity can only be forwarded when presence sync is also enabled.
 	if !pSync {
-		if textToSend == "" && !clearStatus {
+		if !sess.IsUser || (textToSend == "" && !clearStatus) {
 			return
 		}
-		discordStatus = string(discordgo.StatusOnline)
+		discordStatus = ""
 	}
 
 	// Forward to Discord with content dedup and trailing-debounce rate limiting.
-	// HandleMatrixPresence fires often as Matrix clients oscillate online/idle,
-	// and Discord invalidates user-account tokens that emit opcode-3 presence
-	// updates at machine cadence, so the actual gateway send is throttled to at
-	// most one per presenceMinInterval. forwardPresenceToDiscord skips the send
+	// Matrix clients emit frequent presence events, so updates are throttled to
+	// at most one per presenceMinInterval. forwardPresenceToDiscord skips the send
 	// entirely when the effective status/text is unchanged, and records what was
 	// sent so applyPresence can suppress the resulting gateway echo.
 	user.forwardPresenceToDiscord(sess, discordStatus, textToSend, clearStatus)
