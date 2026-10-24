@@ -1,0 +1,19 @@
+[Unit]
+Description=Report Matrix-Discord gateway health to Sentry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+LoadCredential=sentry-cron-url:/etc/matrix-discord-health/sentry-cron-url
+ExecStart=/usr/bin/python3 /usr/local/libexec/matrix-discord-health-sentry.py --expected-sessions 2
+TimeoutStartSec=45s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
