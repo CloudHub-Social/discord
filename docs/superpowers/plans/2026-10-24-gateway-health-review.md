@@ -5,7 +5,7 @@ Scope: dependency compatibility repairs, safe gateway diagnostics, bounded read-
 ## Verified implementation
 - Full dependency race suite and example compilation pass without live credentials; go vet passes.
 - Full bridge race suite and full pinned dependency suite pass on the Mac.
-- All 41 health assessment/collector/consumer tests pass on the Mac.
+- All 43 health assessment/collector/consumer tests pass on the Mac.
 - The live pre-deployment probe successfully reads the running revision and both sessions; it correctly reports heartbeat evidence missing on the old image rather than calling old READY events healthy.
 
 ## Review
@@ -23,3 +23,9 @@ Separate author self-review; no independent reviewer tool was available.
 - Existing brief disconnects have not yet been attributed to a verified root cause. Diagnostics improve future evidence; they do not justify claiming the historical cause is fixed.
 
 Deployment and scheduled-consumer verification are recorded separately after actual execution; tests alone do not establish that the live service or scheduled notifications work.
+
+## Live collector follow-up
+The production console caller format is `file.go:line:function() >`, not only
+`file.go:line >`. Two fixtures reproduced the missed heartbeat/diagnostic parsing
+and now pass after accepting the optional function suffix. The host probe is
+updated independently; no second bridge restart is needed for this parser fix.

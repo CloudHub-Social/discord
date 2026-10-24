@@ -99,7 +99,7 @@ def parse_record(row, invocation):
         level = LEVEL.search(clean[:200])
         if not level:
             return None
-        body = re.sub(r'^\S+\.go:\d+\s*(?:>\s*)?', '', clean[level.end():].lstrip())
+        body = re.sub(r'^\S+\.go:\d+(?::[^\s]+)?\s*(?:>\s*)?', '', clean[level.end():].lstrip())
         if body.startswith('> '):
             body = body[2:]
         match = IDENTITY.search(clean)
