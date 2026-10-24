@@ -36,3 +36,6 @@ jobs:
 
       - name: Test
         run: go test -race -count=1 ./...
+
+      - name: Test Discord gateway handshake
+        run: go test -race -count=1 -timeout 60s -run "^TestGatewayHandshake" github.com/bwmarrin/discordgo
