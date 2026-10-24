@@ -19,6 +19,7 @@ require (
 	go.mau.fi/util v0.2.2-0.20231228160422-22fdd4bbddeb
 	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc
 	golang.org/x/sync v0.16.0
+	gopkg.in/yaml.v3 v3.0.1
 	maunium.net/go/maulogger/v2 v2.4.1
 	maunium.net/go/mautrix v0.16.3-0.20250810202616-6bc5698125c2
 )
@@ -39,8 +40,7 @@ require (
 	golang.org/x/net v0.42.0 // indirect
 	golang.org/x/sys v0.34.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	maunium.net/go/mauflag v1.0.0 // indirect
 )
 
-replace github.com/bwmarrin/discordgo => github.com/CloudHub-Social/discordgo v0.0.0-20261024002034-0505d3fa1f9f
+replace github.com/bwmarrin/discordgo => github.com/CloudHub-Social/discordgo v0.0.0-20261024152628-9caeac8a6ad7

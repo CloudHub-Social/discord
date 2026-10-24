@@ -1,7 +1,5 @@
-github.com/CloudHub-Social/discordgo v0.0.0-20261023233015-3dbbdc2eb350 h1:t0Y1acujp+da0d+CWfj5QjA/HbtuZDquPDp8A+Vev9c=
-github.com/CloudHub-Social/discordgo v0.0.0-20261023233015-3dbbdc2eb350/go.mod h1:lioivnibvB8j1KcF5TVpLdRLKCKHtcl8A03GpxRCre4=
-github.com/CloudHub-Social/discordgo v0.0.0-20261024002034-0505d3fa1f9f h1:lEJyV9w0TwCDKEtVMhtZEANDM6OlHLYMBsrbo95NDAo=
-github.com/CloudHub-Social/discordgo v0.0.0-20261024002034-0505d3fa1f9f/go.mod h1:lioivnibvB8j1KcF5TVpLdRLKCKHtcl8A03GpxRCre4=
+github.com/CloudHub-Social/discordgo v0.0.0-20261024152628-9caeac8a6ad7 h1:g7XRkQ6p/sCf3hNy5CCZ1b7omz1njB70qk12ORmsR5M=
+github.com/CloudHub-Social/discordgo v0.0.0-20261024152628-9caeac8a6ad7/go.mod h1:lioivnibvB8j1KcF5TVpLdRLKCKHtcl8A03GpxRCre4=
 github.com/DATA-DOG/go-sqlmock v1.5.0 h1:Shsta01QNfFxHCfpW6YH2STWB0MudeXXEWMr20OEh60=
 github.com/DATA-DOG/go-sqlmock v1.5.0/go.mod h1:f/Ixk793poVmq4qj/V1dPUg2JEAKC73Q5eFN3EC/SaM=
 github.com/coreos/go-systemd/v22 v22.5.0 h1:RrqgGjYQKalulkV8NGVIfkXQf6YYmOyiJKk8iXXhfZs=
