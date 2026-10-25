@@ -139,6 +139,20 @@ class AssessTests(unittest.TestCase):
         self.assertEqual(result['status'], 'recovering')
         self.assertEqual(result['sessions']['user']['outage_age_seconds'], 10)
 
+    def test_brief_ready_does_not_clear_invalid_credentials(self):
+        entries = [event('invalid_auth', 9991), event('ready', 9992), event('ack', 9993)]
+        self.assertIn('invalid_credentials', [f['reason'] for f in self.report(entries, expected=1)['findings']])
+
+    def test_brief_ack_does_not_clear_prior_stale_heartbeat(self):
+        entries = [event('ready', 1000), event('ack', 9000), event('connecting', 9990),
+                   event('ready', 9991), event('ack', 9992)]
+        self.assertIn('heartbeat_stale', [f['reason'] for f in self.report(entries, expected=1)['findings']])
+
+    def test_late_ack_on_old_ready_requires_sustained_heartbeat_recovery(self):
+        entries = [event('ready', 1000), event('ack', 9000), event('ack', 9960)]
+        self.assertTrue(self.report(entries, expected=1)['needs_attention'])
+        self.assertFalse(self.report(entries + [event('ack', 9990)], expected=1)['needs_attention'])
+
     def test_stale_heartbeat_not_hidden_by_old_ready(self):
         result = self.report([event('ready', 1000), event('ack', 9600)], expected=1)
         self.assertIn('heartbeat_stale', [f['reason'] for f in result['findings']])

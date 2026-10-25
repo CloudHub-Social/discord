@@ -148,26 +148,41 @@ def assess(events, now, started, expected=2):
         last = {}
         failure_since = None
         ready_since = None
+        auth_failed = heartbeat_failed = False
+        heartbeat_recovery_since = None
         for item in items:
             kind, stamp = item['kind'], item['timestamp']
+            if last.get('ack') is not None and stamp - last['ack'] >= STALE_SECONDS:
+                heartbeat_failed = True
+                heartbeat_recovery_since = None
             if kind == 'manual':
                 failure_since = ready_since = None
+                auth_failed = heartbeat_failed = False
+                heartbeat_recovery_since = None
+                last.pop('ack', None)
             elif kind in ('disconnect', 'connecting', 'connect_failed', 'invalid_auth'):
                 if failure_since is None:
                     failure_since = stamp
                 ready_since = None
             elif kind == 'ready':
                 ready_since = stamp
-            elif kind == 'ack' and ready_since is not None and stamp - ready_since >= STABLE_SECONDS:
-                # A short READY/ACK burst is not recovery. Require an ACK
-                # after the bridge's stability window without an intervening
-                # failure; preserve the original outage across backoff cycles.
-                failure_since = None
+            elif kind == 'ack' and ready_since is not None:
+                if heartbeat_failed and heartbeat_recovery_since is None:
+                    heartbeat_recovery_since = stamp
+                stable_since = max(ready_since, heartbeat_recovery_since or ready_since)
+                if stamp - stable_since >= STABLE_SECONDS:
+                    # Require current-session ACK evidence after the stability
+                    # window; a stale-heartbeat episode also needs ACKs spanning
+                    # that window, not one late ACK on an old READY.
+                    failure_since = None
+                    auth_failed = heartbeat_failed = False
+                    heartbeat_recovery_since = None
+            if kind == 'invalid_auth' or item.get('close_code') == 4004:
+                auth_failed = True
+                ready_since = None
             last[item['kind']] = item['timestamp']
             if item.get('close_code') == 4004:
                 last['invalid_auth'] = item['timestamp']
-        ready = last.get('ready', 0)
-        manual = last.get('manual', 0)
         ack = last.get('ack', 0)
         lifecycle = [v for v in items if v['kind'] in ('ready', 'manual', 'disconnect', 'connecting', 'connect_failed', 'invalid_auth')]
         current = lifecycle[-1]['kind'] if lifecycle else None
@@ -181,7 +196,7 @@ def assess(events, now, started, expected=2):
         if current == 'manual':
             state['status'] = 'intentionally_disconnected'
             continue
-        if last.get('invalid_auth', 0) > max(ready, manual):
+        if auth_failed:
             finding(session, 'invalid_credentials')
             state['status'] = 'unhealthy'
         if storms >= STORM_COUNT:
@@ -195,7 +210,7 @@ def assess(events, now, started, expected=2):
                 state['status'] = 'unhealthy'
             elif state['status'] == 'healthy':
                 state['status'] = 'recovering'
-        if ack and now - ack >= STALE_SECONDS:
+        if heartbeat_failed or (ack and now - ack >= STALE_SECONDS):
             finding(session, 'heartbeat_stale')
             state['status'] = 'unhealthy'
         elif not ack:
