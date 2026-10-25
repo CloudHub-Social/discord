@@ -2,7 +2,7 @@
 Description=Check Matrix-Discord gateway health every minute
 
 [Timer]
-OnCalendar=*-*-* *:*:00
+OnCalendar=*-*-* *:*:00 UTC
 AccuracySec=5s
 Persistent=true
 Unit=matrix-discord-sentry-health.service
