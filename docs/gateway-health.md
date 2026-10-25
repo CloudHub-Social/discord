@@ -24,6 +24,11 @@ the Docker image and must be reapplied when rebuilding the host.
 * Allow five minutes for initial startup or a brief ongoing recovery. Alert
   for recovery stalled at least five minutes, a heartbeat stale at least five
   minutes, invalid credentials, or a stopped service.
+  Brief READY/ACK bursts do not reset an ongoing failure: recovery requires
+  an ACK at least 30 seconds after READY with no intervening failure, matching
+  the bridge's stability window. Until then, outage age continues from the
+  original failure, including across reconnect backoff. Intentional disconnect
+  resets that episode. The existing storm and stale-heartbeat thresholds remain.
 * Six or more disconnects for one account within fifteen minutes constitute a
   reconnect storm, even when individual reconnects succeed. Different accounts
   are not combined to manufacture a storm.

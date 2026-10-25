@@ -22,6 +22,7 @@ CONFIG = pathlib.Path('/matrix/mautrix-discord/config/config.yaml')
 STALE_SECONDS = 300
 STORM_SECONDS = 900
 STORM_COUNT = 6
+STABLE_SECONDS = 30
 ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])')
 LEVEL = re.compile(r'(?:^|\s)(DBG|DEBUG|INF|INFO|WRN|WARN|ERR|ERROR|FTL|FATAL|PNC|PANIC)(?:\s|\])')
 IDENTITY = re.compile(r'(?:^|\s)user_id=(?:"([^"\r\n]+)"|([^\s]+))')
@@ -145,7 +146,23 @@ def assess(events, now, started, expected=2):
 
     for session, items in grouped.items():
         last = {}
+        failure_since = None
+        ready_since = None
         for item in items:
+            kind, stamp = item['kind'], item['timestamp']
+            if kind == 'manual':
+                failure_since = ready_since = None
+            elif kind in ('disconnect', 'connecting', 'connect_failed', 'invalid_auth'):
+                if failure_since is None:
+                    failure_since = stamp
+                ready_since = None
+            elif kind == 'ready':
+                ready_since = stamp
+            elif kind == 'ack' and ready_since is not None and stamp - ready_since >= STABLE_SECONDS:
+                # A short READY/ACK burst is not recovery. Require an ACK
+                # after the bridge's stability window without an intervening
+                # failure; preserve the original outage across backoff cycles.
+                failure_since = None
             last[item['kind']] = item['timestamp']
             if item.get('close_code') == 4004:
                 last['invalid_auth'] = item['timestamp']
@@ -170,9 +187,8 @@ def assess(events, now, started, expected=2):
         if storms >= STORM_COUNT:
             finding(session, 'reconnect_storm')
             state['status'] = 'unhealthy'
-        failures = [v['timestamp'] for v in items if v['kind'] in ('disconnect', 'connecting', 'connect_failed') and v['timestamp'] > max(ready, manual)]
-        if current in ('disconnect', 'connecting', 'connect_failed') and failures:
-            age = now - min(failures)
+        if failure_since is not None:
+            age = now - failure_since
             state['outage_age_seconds'] = round(age, 1)
             if age >= STALE_SECONDS:
                 finding(session, 'recovery_stalled')
