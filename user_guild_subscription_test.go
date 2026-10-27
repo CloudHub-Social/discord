@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/stretchr/testify/require"
@@ -105,4 +107,41 @@ func TestGuildMemberListSubscriptionWire(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGuildMemberListReconcileReleasesChangedSample(t *testing.T) {
+	br, user, capture := newPresenceTestBridge(t, true, false, false)
+	br.DB = newGuildSubscriptionTestDB(t)
+	guild := br.DB.Guild.GetByID("100")
+	guild.MXID = "!guild:example.com"
+	br.guildsByID = map[string]*Guild{"100": {Guild: guild}}
+	for i := 10; i < 15; i++ {
+		addGuildSubscriptionTestPortal(br.DB, fmt.Sprint(i), "100", discordgo.ChannelTypeGuildText, true)
+	}
+	previous := user.guildChannelIDs("100")
+	require.True(t, user.sendGuildPresenceSubscribe(user.Session, "100"))
+	capture.snapshot(t, user.Session)
+	user.activeGuildSubs = map[string]time.Time{"100": time.Now()}
+	user.subscribedGuilds = map[string][]string{"100": previous}
+	addGuildSubscriptionTestPortal(br.DB, "09", "100", discordgo.ChannelTypeGuildText, true)
+
+	user.reconcileGuildSubs(context.Background())
+	frames, _ := capture.snapshot(t, user.Session)
+	require.Len(t, frames, 2, "release the previous sample before subscribing its replacement")
+	var release, subscribe discordgo.GuildSubscribeData
+	require.NoError(t, json.Unmarshal(frames[0].D, &release))
+	require.NoError(t, json.Unmarshal(frames[1].D, &subscribe))
+	require.Equal(t, releaseRanges(previous), release.Channels)
+	require.Equal(t, subscribeRanges([]string{"09", "10", "11", "12", "13"}), subscribe.Channels)
+	require.Equal(t, []string{"09", "10", "11", "12", "13"}, user.subscribedGuilds["100"])
+
+	// Once the guild expires, release the current bounded sample as well.
+	delete(user.activeGuildSubs, "100")
+	user.reconcileGuildSubs(context.Background())
+	frames, _ = capture.snapshot(t, user.Session)
+	require.Len(t, frames, 1)
+	var finalRelease discordgo.GuildSubscribeData
+	require.NoError(t, json.Unmarshal(frames[0].D, &finalRelease))
+	require.Equal(t, releaseRanges([]string{"09", "10", "11", "12", "13"}), finalRelease.Channels)
+	require.Empty(t, user.subscribedGuilds)
 }

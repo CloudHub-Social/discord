@@ -1704,6 +1704,36 @@ func (user *User) reconcileGuildSubs(ctx context.Context) {
 		if sess == nil {
 			return
 		}
+		// A changed sample must release the previous member lists before we
+		// forget them. Use separate paced commands so the request never combines
+		// five old and five new channel IDs into another oversized channel set.
+		user.guildSubLock.Lock()
+		previous := user.subscribedGuilds[gid]
+		user.guildSubLock.Unlock()
+		if len(previous) > 0 {
+			sent, abort := user.sendGuildRelease(sess, gid, previous)
+			if abort {
+				return
+			}
+			if sent {
+				user.guildSubLock.Lock()
+				delete(user.subscribedGuilds, gid)
+				user.guildSubLock.Unlock()
+			}
+			user.sleepGuildSub(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if !sent {
+				continue
+			}
+			user.guildSubLock.Lock()
+			_, desiredNow = user.activeGuildSubs[gid]
+			user.guildSubLock.Unlock()
+			if !desiredNow || user.sessionForGuildSub() != sess {
+				continue
+			}
+		}
 		user.log.Debug().Str("guild_id", gid).Msg("Subscribing to guild on demand")
 		sent, abort := user.sendGuildSubscribe(sess, gid, subscribeRanges(targets[gid]))
 		if abort {
