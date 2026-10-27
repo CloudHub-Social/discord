@@ -1418,19 +1418,28 @@ const guildPresenceActiveTTL = 10 * time.Minute
 // unset (<= 0): the most guilds kept subscribed at once in on-demand mode.
 const defaultDiscordPresenceActiveLimit = 10
 
-// guildChannelIDs returns the sorted Discord channel IDs of a guild's bridged
-// portals. Discord suppresses presence for large guilds (~250+ members) unless
-// you subscribe to specific channels with member-list ranges, so these are the
-// channels we subscribe. Sorted so the slice can be compared for equality to
-// detect when a guild's bridged channel set changed (newly bridged room, etc.).
+// guildMemberListChannelLimit bounds the member-sidebars requested in one guild
+// subscription, following the Discord client's five-channel sampling pattern.
+// Sending every bridged portal (including category spaces) caused 4002 closes
+// and a reconnect loop. These are presence samples, not message subscriptions:
+// the guild-level Typing flag keeps message/edit events enabled for the guild.
+const guildMemberListChannelLimit = 5
+
+// guildChannelIDs selects a stable, bounded sample of bridged text/news channel
+// member lists. Category spaces, voice rooms and threads are not text-channel
+// sidebars. Sort before limiting so reconciliation and release track exactly the
+// same set even when database row order or unselected portals change.
 func (user *User) guildChannelIDs(guildID string) []string {
 	var ids []string
 	for _, p := range user.bridge.DB.Portal.GetAllInGuild(guildID) {
-		if p.MXID != "" {
+		if p.MXID != "" && (p.Type == discordgo.ChannelTypeGuildText || p.Type == discordgo.ChannelTypeGuildNews) {
 			ids = append(ids, p.Key.ChannelID)
 		}
 	}
 	sort.Strings(ids)
+	if len(ids) > guildMemberListChannelLimit {
+		ids = ids[:guildMemberListChannelLimit]
+	}
 	return ids
 }
 
