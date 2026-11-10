@@ -10,11 +10,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/stretchr/testify/require"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 func TestTrustedComponentMediaURL(t *testing.T) {
@@ -126,4 +129,41 @@ func TestCanAggregateGalleryAvoidsSeparateMedia(t *testing.T) {
 	msg.Components = []discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/new.png"}}}
 	require.False(t, canAggregateDiscordGallery(msg, false, true))
 	require.True(t, canAggregateDiscordGallery(msg, true, true))
+}
+
+func TestPrepareAttachmentPresentationEdit(t *testing.T) {
+	part := &ConvertedMessage{Content: &event.MessageEventContent{MsgType: event.MsgImage, Body: "image.png", URL: "mxc://example.org/image"}, Extra: map[string]any{"other": "value"}}
+	prepareAttachmentPresentationEdit(part, "$old", true)
+	require.Equal(t, event.RelReplace, part.Content.RelatesTo.Type)
+	require.Equal(t, id.EventID("$old"), part.Content.RelatesTo.EventID)
+	require.Equal(t, true, part.Extra[gallerySpoilerKey])
+	nested, ok := part.Extra["m.new_content"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, true, nested[gallerySpoilerKey])
+	require.Equal(t, "value", nested["other"])
+	encoded, err := json.Marshal(&event.Content{Parsed: part.Content, Raw: part.Extra})
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &payload))
+	require.Equal(t, true, payload["m.new_content"].(map[string]any)[gallerySpoilerKey])
+}
+
+func TestAttachmentPresentationEditCanClearSpoiler(t *testing.T) {
+	part := &ConvertedMessage{Content: &event.MessageEventContent{MsgType: event.MsgImage, Body: "image.png", URL: "mxc://example.org/image"}, Extra: map[string]any{gallerySpoilerKey: true}}
+	prepareAttachmentPresentationEdit(part, "$old", false)
+	data, err := json.Marshal(&event.Content{Parsed: part.Content, Raw: part.Extra})
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(data, &payload))
+	require.Equal(t, false, payload["m.new_content"].(map[string]any)[gallerySpoilerKey])
+}
+
+func TestMergePartialDiscordMessage(t *testing.T) {
+	original := &discordgo.Message{Content: "old", Attachments: []*discordgo.MessageAttachment{{ID: "1"}}, Components: []discordgo.MessageComponent{&discordgo.Button{Label: "old"}}}
+	updated := &discordgo.Message{Content: "new", Components: []discordgo.MessageComponent{}}
+	mergePartialDiscordMessage(original, updated)
+	require.Equal(t, "new", original.Content)
+	require.Len(t, original.Attachments, 1)
+	require.NotNil(t, original.Components)
+	require.Empty(t, original.Components)
 }

@@ -819,6 +819,41 @@ func (portal *Portal) sendThreadCreationNotice(ctx context.Context, thread *Thre
 	}
 }
 
+// prepareAttachmentPresentationEdit copies the spoiler marker into both the
+// replacement and fallback content so clients cannot retain an old flag.
+func prepareAttachmentPresentationEdit(part *ConvertedMessage, target id.EventID, spoiler bool) {
+	if part.Extra == nil {
+		part.Extra = make(map[string]any)
+	}
+	part.Extra[gallerySpoilerKey] = spoiler
+	part.Content.SetEdit(target)
+	part.Content.Mentions = &event.Mentions{}
+	part.Extra = galleryEditExtra(part.Extra)
+}
+
+// mergePartialDiscordMessage preserves omitted fields while applying explicit
+// slices. Empty content is ambiguous with absence in discordgo's message type.
+func mergePartialDiscordMessage(cached, update *discordgo.Message) {
+	if update.Content != "" {
+		cached.Content = update.Content
+	}
+	if update.EditedTimestamp != nil {
+		cached.EditedTimestamp = update.EditedTimestamp
+	}
+	if update.MessageSnapshots != nil {
+		cached.MessageSnapshots = update.MessageSnapshots
+	}
+	if len(update.Embeds) > 0 {
+		cached.Embeds = update.Embeds
+	}
+	if update.Attachments != nil {
+		cached.Attachments = update.Attachments
+	}
+	if update.Components != nil {
+		cached.Components = update.Components
+	}
+}
+
 // retainForwardSnapshotAttachments removes existing snapshot items from the redaction set.
 // Nil means Discord omitted the snapshot; an empty slice explicitly removes it.
 func retainForwardSnapshotAttachments(attachmentMap map[string]*database.Message, snapshots []discordgo.MessageSnapshot) {
@@ -883,6 +918,38 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 		return
 	}
 
+	// Component updates can omit the attachment list. Fetch an authoritative
+	// snapshot before changing attachment presentation; absent is not empty.
+	componentSnapshotFailed := false
+	if msg.Components != nil && msg.Attachments == nil {
+		hasMappedAttachment := false
+		for _, part := range existing {
+			if part.AttachmentID != "" && isNumber(part.AttachmentID) {
+				hasMappedAttachment = true
+				break
+			}
+		}
+		if hasMappedAttachment {
+			if user == nil || user.Session == nil {
+				componentSnapshotFailed = true
+			} else {
+				fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				opts := portal.RefererOptIfUser(user.Session, existing[0].ThreadID)
+				opts = append(opts, discordgo.WithContext(fetchCtx), discordgo.WithRetryOnRatelimit(false), discordgo.WithRestRetries(0))
+				full, err := fetchGalleryMessage(user.Session, existing[0].DiscordProtoChannelID(), msg.ID, existing[0].SenderID, opts...)
+				cancel()
+				if err != nil || !galleryMessageIsCurrent(full, msg) {
+					componentSnapshotFailed = true
+				} else {
+					msg = full
+				}
+			}
+			if componentSnapshotFailed {
+				log.Warn().Msg("Cannot refresh attachment presentation for component update")
+			}
+		}
+	}
+
 	if msg.Author == nil {
 		creationMessage, ok := portal.recentMessages.Get(msg.ID)
 		if !ok {
@@ -893,16 +960,7 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 			return
 		}
 		log.Debug().Msg("Found original message in cache for edit without author")
-		if len(msg.Embeds) > 0 {
-			creationMessage.Embeds = msg.Embeds
-		}
-		if len(msg.Attachments) > 0 {
-			creationMessage.Attachments = msg.Attachments
-		}
-		if msg.Components != nil {
-			creationMessage.Components = msg.Components
-		}
-		// TODO are there other fields that need copying?
+		mergePartialDiscordMessage(creationMessage, msg)
 		msg = creationMessage
 	} else {
 		portal.recentMessages.Replace(msg.ID, msg)
@@ -924,11 +982,45 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 	}
 	// Reconcile media independently of the text edit. Failed media remains
 	// retryable; removed or newly-spoilered old parts must not stay visible.
-	componentUpdateFailed := false
+	componentUpdateFailed := componentSnapshotFailed
 	if msg.Components != nil {
 		known := make(map[string]bool, len(existing))
 		for _, part := range existing {
 			known[part.AttachmentID] = true
+		}
+		// Existing attachment events also need their replacement metadata updated:
+		// they do not use component-derived IDs, so hashing metadata is not enough.
+		spoilers := componentSpoilers(msg.Components)
+		for _, att := range msg.Attachments {
+			if componentSnapshotFailed {
+				break
+			}
+			if att == nil {
+				continue
+			}
+			var mapped *database.Message
+			for _, previous := range existing {
+				if previous.AttachmentID == att.ID {
+					mapped = previous
+					break
+				}
+			}
+			if mapped == nil {
+				continue
+			}
+			part := portal.convertDiscordAttachment(ctx, intent, msg.ID, att)
+			if part == nil || part.Content.MsgType == event.MsgNotice {
+				componentUpdateFailed = true
+				continue
+			}
+			spoiler := strings.HasPrefix(att.Filename, "SPOILER_") || attachmentHasComponentSpoiler(att, spoilers)
+			puppet.addWebhookMeta(part, msg)
+			puppet.addMemberMeta(part, msg)
+			prepareAttachmentPresentationEdit(part, mapped.MXID, spoiler)
+			if _, err := portal.sendMatrixMessage(intent, event.EventMessage, part.Content, part.Extra, 0); err != nil {
+				log.Err(err).Msg("Failed to update attachment presentation")
+				componentUpdateFailed = true
+			}
 		}
 		for _, media := range newComponentMedia(msg.Components, msg.Attachments, known) {
 			part := portal.convertComponentMedia(intent, media)
@@ -965,6 +1057,13 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 	for _, existingPart := range existing {
 		if existingPart.AttachmentID != "" {
 			attachmentMap[existingPart.AttachmentID] = existingPart
+		}
+	}
+	if componentSnapshotFailed {
+		for attachmentID := range attachmentMap {
+			if isNumber(attachmentID) {
+				delete(attachmentMap, attachmentID)
+			}
 		}
 	}
 	for _, remainingAttachment := range msg.Attachments {
@@ -1030,6 +1129,34 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 	puppet.addWebhookMeta(converted, msg)
 	puppet.addMemberMeta(converted, msg)
 	converted.Content.Mentions = portal.convertDiscordMentions(msg, false)
+	// A legacy media-only message has no caption event. Creating one avoids
+	// replacing the media event with text when components are added later.
+	if msg.Components != nil && existing[0].AttachmentID != "" {
+		if existing[0].ThreadID != "" {
+			thread := portal.bridge.GetThreadByID(existing[0].ThreadID, nil)
+			if thread == nil || thread.RootMXID == "" {
+				log.Warn().Msg("Cannot map component caption to thread")
+				return
+			}
+			converted.Content.RelatesTo = &event.RelatesTo{}
+			converted.Content.RelatesTo.SetThread(thread.RootMXID, thread.RootMXID)
+		}
+		converted.Content.Mentions = &event.Mentions{}
+		resp, err := portal.sendMatrixMessage(intent, event.EventMessage, converted.Content, converted.Extra, 0)
+		if err != nil {
+			log.Err(err).Msg("Failed to send component caption")
+			return
+		}
+		existing[0].MassInsertParts([]database.MessagePart{{AttachmentID: "", MXID: resp.EventID}})
+		if msg.EditedTimestamp != nil && !componentUpdateFailed {
+			caption := portal.bridge.DB.Message.GetByMXID(portal.Key, resp.EventID)
+			if caption != nil {
+				caption.UpdateEditTimestamp(*msg.EditedTimestamp)
+			}
+		}
+		portal.sendDeliveryReceipt(resp.EventID)
+		return
+	}
 	converted.Content.SetEdit(existing[0].MXID)
 	// Never actually mention new users of edits, only include mentions inside m.new_content
 	converted.Content.Mentions = &event.Mentions{}
