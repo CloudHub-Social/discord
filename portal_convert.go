@@ -422,7 +422,7 @@ func (puppet *Puppet) addWebhookMeta(part *ConvertedMessage, msg *discordgo.Mess
 	hasFallback := false
 	if msg.ApplicationID == "" &&
 		puppet.bridge.Config.Bridge.PrefixWebhookMessages &&
-		(part.Content.MsgType == event.MsgText || part.Content.MsgType == event.MsgNotice || (part.Content.FileName != "" && part.Content.FileName != part.Content.Body)) {
+		(part.Content.MsgType == event.MsgText || part.Content.MsgType == event.MsgNotice || part.Content.MsgType == galleryMessageType || (part.Content.FileName != "" && part.Content.FileName != part.Content.Body)) {
 		part.Content.EnsureHasHTML()
 		part.Content.Body = fmt.Sprintf("%s: %s", msg.Author.Username, part.Content.Body)
 		part.Content.FormattedBody = fmt.Sprintf("<strong data-mx-profile-fallback>%s: </strong>%s", html.EscapeString(msg.Author.Username), part.Content.FormattedBody)

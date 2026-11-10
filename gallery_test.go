@@ -255,3 +255,16 @@ func TestGalleryEchoReconcilesUnknownSend(t *testing.T) {
 	require.Nil(t, reservation)
 	require.False(t, portal.reconcileGalleryEcho(msg))
 }
+
+func TestGalleryWebhookProfileFallback(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Bridge.PrefixWebhookMessages = true
+	puppet := &Puppet{bridge: &DiscordBridge{Config: cfg}}
+	part := &ConvertedMessage{Content: &event.MessageEventContent{MsgType: galleryMessageType, Body: "caption"}}
+	msg := &discordgo.Message{WebhookID: "123", Author: &discordgo.User{ID: "456", Username: "Webhook"}}
+	puppet.addWebhookMeta(part, msg)
+	require.Equal(t, "Webhook: caption", part.Content.Body)
+	require.Contains(t, part.Content.FormattedBody, "data-mx-profile-fallback")
+	profile := part.Extra["com.beeper.per_message_profile"].(map[string]any)
+	require.Equal(t, true, profile["has_fallback"])
+}
