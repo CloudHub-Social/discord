@@ -269,6 +269,10 @@ func (br *DiscordBridge) convertLottie(data []byte) ([]byte, string, error) {
 }
 
 func (br *DiscordBridge) copyAttachmentToMatrix(intent *appservice.IntentAPI, url string, encrypt bool, meta AttachmentMeta) (returnDBFile *database.File, returnErr error) {
+	return br.copyAttachmentToMatrixWithClient(intent, url, encrypt, meta, http.DefaultClient)
+}
+
+func (br *DiscordBridge) copyAttachmentToMatrixWithClient(intent *appservice.IntentAPI, url string, encrypt bool, meta AttachmentMeta, client *http.Client) (returnDBFile *database.File, returnErr error) {
 	isCacheable := br.Config.Bridge.CacheMedia != "never" && (br.Config.Bridge.CacheMedia == "always" || !encrypt)
 	returnDBFile = br.DB.File.Get(url, encrypt)
 	if returnDBFile == nil {
@@ -300,7 +304,7 @@ func (br *DiscordBridge) copyAttachmentToMatrix(intent *appservice.IntentAPI, ur
 			}()
 
 			var data []byte
-			data, onceErr = downloadDiscordAttachment(http.DefaultClient, url, br.MediaConfig.UploadSize)
+			data, onceErr = downloadDiscordAttachment(client, url, br.MediaConfig.UploadSize)
 			if onceErr != nil {
 				return
 			}
