@@ -66,6 +66,7 @@ func (br *DiscordBridge) RegisterCommands() {
 		cmdSetRelay,
 		cmdUnsetRelay,
 		cmdGuilds,
+		cmdVoiceStatus,
 		cmdRejoinSpace,
 		cmdResyncMessage,
 		cmdDeleteAllPortals,
