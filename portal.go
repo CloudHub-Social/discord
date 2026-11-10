@@ -923,6 +923,9 @@ func (portal *Portal) queueComponentRefresh(user *User, update *discordgo.Messag
 // mergePartialDiscordMessage preserves omitted fields while applying explicit
 // slices. Empty content is ambiguous with absence in discordgo's message type.
 func mergePartialDiscordMessage(cached, update *discordgo.Message) {
+	if update.Poll != nil {
+		cached.Poll = update.Poll
+	}
 	if update.Content != "" {
 		cached.Content = update.Content
 	}
@@ -987,6 +990,7 @@ func retainForwardSnapshotAttachments(attachmentMap map[string]*database.Message
 		}
 		for _, media := range collectComponentMedia(snapshot.Message.Components) {
 			delete(attachmentMap, "forward_"+media.id)
+			delete(attachmentMap, "forward_"+failedComponentMediaID(media.id))
 		}
 	}
 }

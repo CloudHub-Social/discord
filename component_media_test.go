@@ -164,12 +164,24 @@ func TestAttachmentPresentationEditCanClearSpoiler(t *testing.T) {
 
 func TestMergePartialDiscordMessage(t *testing.T) {
 	original := &discordgo.Message{Content: "old", Attachments: []*discordgo.MessageAttachment{{ID: "1"}}, Components: []discordgo.MessageComponent{&discordgo.Button{Label: "old"}}}
-	updated := &discordgo.Message{Content: "new", Components: []discordgo.MessageComponent{}}
+	updated := &discordgo.Message{Content: "new", Components: []discordgo.MessageComponent{}, Poll: &discordgo.Poll{Question: discordgo.PollMedia{Text: "updated question"}}}
 	mergePartialDiscordMessage(original, updated)
 	require.Equal(t, "new", original.Content)
 	require.Len(t, original.Attachments, 1)
 	require.NotNil(t, original.Components)
 	require.Empty(t, original.Components)
+	require.Equal(t, "updated question", original.Poll.Question.Text)
+}
+
+func TestForwardSnapshotRetainsFailedMediaNotice(t *testing.T) {
+	components := []discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/a.png"}}}
+	media := collectComponentMedia(components)
+	require.Len(t, media, 1)
+	id := "forward_" + failedComponentMediaID(media[0].id)
+	pending := map[string]*database.Message{id: nil, "forward_unrelated": nil}
+	retainForwardSnapshotAttachments(pending, []discordgo.MessageSnapshot{{Message: &discordgo.Message{Components: components}}})
+	require.NotContains(t, pending, id)
+	require.Contains(t, pending, "forward_unrelated")
 }
 
 func TestComponentRemovalRequiresEncryption(t *testing.T) {
