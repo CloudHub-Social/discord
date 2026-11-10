@@ -942,6 +942,9 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 	}
 	if !session.IsUser {
 		session.Identify.Intents = BotIntents
+		if user.bridge.Config.Bridge.DiscordVoiceStatus {
+			session.Identify.Intents |= discordgo.IntentGuildVoiceStates
+		}
 	}
 	session.EventHandler = func(evt any) { user.eventHandlerSync(generation, epoch, evt) }
 

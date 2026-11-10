@@ -88,6 +88,7 @@ type BridgeConfig struct {
 	// it also disables Discord→Matrix typing notifications for large guilds, since
 	// both ride the same opcode-14 subscription.
 	SyncDiscordPresenceToMatrix bool `yaml:"sync_discord_presence_to_matrix"`
+	DiscordVoiceStatus          bool `yaml:"discord_voice_status"`
 
 	// SyncDiscordStatusToMatrix controls whether the Discord custom status TEXT is
 	// reflected onto Matrix (as the puppet's status message). Like the presence
