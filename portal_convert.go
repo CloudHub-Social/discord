@@ -363,14 +363,8 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 	// Render trusted card media through the same encryption-aware Matrix upload path.
 	// Discord attachment-backed component media is already handled above.
 	if !forceGallery {
-		attachmentURLs := map[string]bool{}
-		for _, attachment := range msg.Attachments {
-			if attachment != nil {
-				attachmentURLs[attachment.URL] = true
-			}
-		}
 		for _, media := range collectComponentMedia(msg.Components) {
-			if !attachmentURLs[media.url] {
+			if !componentMediaAlreadyAttached(media, msg.Attachments) {
 				parts = append(parts, portal.convertComponentMedia(intent, media))
 			}
 		}
@@ -412,6 +406,9 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 			}
 			if !forceGallery {
 				for _, media := range collectComponentMedia(snapshot.Message.Components) {
+					if componentMediaAlreadyAttached(media, snapshot.Message.Attachments) {
+						continue
+					}
 					part := portal.convertComponentMedia(intent, media)
 					part.AttachmentID = "forward_" + media.id
 					parts = append(parts, part)

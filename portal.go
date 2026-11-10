@@ -899,7 +899,7 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 		if len(msg.Attachments) > 0 {
 			creationMessage.Attachments = msg.Attachments
 		}
-		if len(msg.Components) > 0 {
+		if msg.Components != nil {
 			creationMessage.Components = msg.Components
 		}
 		// TODO are there other fields that need copying?
@@ -917,6 +917,44 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 
 	puppet := portal.bridge.GetPuppetByID(msg.Author.ID)
 	intent := puppet.IntentFor(portal)
+
+	if portal.Encrypted && portal.bridge.Crypto == nil && discordMessageHasNewContent(msg) {
+		log.Error().Msg("Cannot bridge new Discord content without room encryption")
+		return
+	}
+	// Add replacement component media before removing old parts. If any upload
+	// or send fails, retain the old parts so the card never loses its media.
+	if msg.Components != nil {
+		known := make(map[string]bool, len(existing))
+		for _, part := range existing {
+			known[part.AttachmentID] = true
+		}
+		for _, media := range newComponentMedia(msg.Components, msg.Attachments, known) {
+			part := portal.convertComponentMedia(intent, media)
+			if part == nil || part.Content.MsgType == event.MsgNotice {
+				log.Warn().Msg("Failed to convert updated component media")
+				return
+			}
+			if existing[0].ThreadID != "" {
+				thread := portal.bridge.GetThreadByID(existing[0].ThreadID, nil)
+				if thread == nil || thread.RootMXID == "" {
+					log.Warn().Msg("Cannot map updated component media to thread")
+					return
+				}
+				part.Content.RelatesTo = &event.RelatesTo{}
+				part.Content.RelatesTo.SetThread(thread.RootMXID, thread.RootMXID)
+			}
+			puppet.addWebhookMeta(part, msg)
+			puppet.addMemberMeta(part, msg)
+			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, 0)
+			if err != nil {
+				log.Err(err).Msg("Failed to send updated component media")
+				return
+			}
+			existing[0].MassInsertParts([]database.MessagePart{{AttachmentID: media.id, MXID: resp.EventID}})
+			known[media.id] = true
+		}
+	}
 
 	redactions := zerolog.Dict()
 	attachmentMap := map[string]*database.Message{}
@@ -965,8 +1003,8 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 				Msg("Failed to redact attachment")
 		} else {
 			redactions.Str(deletedAttachment.AttachmentID, resp.EventID.String())
+			deletedAttachment.Delete()
 		}
-		deletedAttachment.Delete()
 	}
 
 	var converted *ConvertedMessage

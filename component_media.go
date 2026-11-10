@@ -198,3 +198,37 @@ func attachmentHasComponentSpoiler(att *discordgo.MessageAttachment, spoilers ma
 	}
 	return false
 }
+
+func componentMediaAlreadyAttached(media componentMedia, attachments []*discordgo.MessageAttachment) bool {
+	u, err := url.Parse(media.url)
+	if err != nil {
+		return false
+	}
+	for _, att := range attachments {
+		if att == nil {
+			continue
+		}
+		if att.URL == media.url {
+			return true
+		}
+		if trustedComponentMediaURL(att.URL) {
+			a, err := url.Parse(att.URL)
+			if err == nil && a.EscapedPath() == u.EscapedPath() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// newComponentMedia selects unmapped card items, excluding Discord attachments
+// which already have their own Matrix event.
+func newComponentMedia(components []discordgo.MessageComponent, attachments []*discordgo.MessageAttachment, known map[string]bool) []componentMedia {
+	var pending []componentMedia
+	for _, media := range collectComponentMedia(components) {
+		if !known[media.id] && !componentMediaAlreadyAttached(media, attachments) {
+			pending = append(pending, media)
+		}
+	}
+	return pending
+}

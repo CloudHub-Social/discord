@@ -73,3 +73,22 @@ func TestAttachmentSpoilerMatchesRotatingSignedURL(t *testing.T) {
 	require.True(t, attachmentHasComponentSpoiler(att, map[string]bool{"attachment://a.png": true}))
 	require.False(t, attachmentHasComponentSpoiler(att, map[string]bool{"https://evil.invalid/attachments/1/a.png": true}))
 }
+
+func TestComponentMediaDeduplicatesAttachment(t *testing.T) {
+	media := componentMedia{url: "https://media.discordapp.net/attachments/1/a.png?new=1"}
+	require.True(t, componentMediaAlreadyAttached(media, []*discordgo.MessageAttachment{{URL: "https://cdn.discordapp.com/attachments/1/a.png?old=1"}}))
+	require.False(t, componentMediaAlreadyAttached(media, []*discordgo.MessageAttachment{{URL: "https://evil.invalid/attachments/1/a.png"}}))
+}
+
+func TestNewComponentMediaOnEdit(t *testing.T) {
+	old := &discordgo.MediaGallery{Items: []discordgo.MediaGalleryItem{{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/old.png"}}}}
+	next := &discordgo.MediaGallery{Items: []discordgo.MediaGalleryItem{{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/new.png"}}}}
+	oldMedia := collectComponentMedia([]discordgo.MessageComponent{old})
+	require.Len(t, oldMedia, 1)
+	known := map[string]bool{oldMedia[0].id: true}
+	require.Empty(t, newComponentMedia([]discordgo.MessageComponent{old}, nil, known))
+	add := newComponentMedia([]discordgo.MessageComponent{next}, nil, known)
+	require.Len(t, add, 1)
+	require.NotEqual(t, oldMedia[0].id, add[0].id)
+	require.Empty(t, newComponentMedia([]discordgo.MessageComponent{next}, []*discordgo.MessageAttachment{{URL: "https://media.discordapp.net/new.png?token=1"}}, known))
+}
