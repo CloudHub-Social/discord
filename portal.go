@@ -598,6 +598,8 @@ func (portal *Portal) handleDiscordMessages(msg portalDiscordMessage) {
 		portal.handleDiscordMessageUpdate(msg.user, convertedMsg.Message)
 	case *componentRefreshResult:
 		portal.handleDiscordMessageUpdateWithRefresh(msg.user, convertedMsg.message, true, convertedMsg.failed)
+	case *discordCallAlert:
+		portal.handleDiscordCallAlert(msg.user, convertedMsg)
 	case *discordgo.MessageDelete:
 		portal.handleDiscordMessageDelete(msg.user, convertedMsg.Message)
 	case *discordgo.MessageDeleteBulk:

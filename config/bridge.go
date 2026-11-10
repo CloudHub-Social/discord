@@ -89,6 +89,9 @@ type BridgeConfig struct {
 	// both ride the same opcode-14 subscription.
 	SyncDiscordPresenceToMatrix bool `yaml:"sync_discord_presence_to_matrix"`
 
+	// DiscordCallAlerts posts a link when Discord reports that this account is ringing.
+	DiscordCallAlerts bool `yaml:"discord_call_alerts"`
+
 	// SyncDiscordStatusToMatrix controls whether the Discord custom status TEXT is
 	// reflected onto Matrix (as the puppet's status message). Like the presence
 	// read, it needs the opcode-14 guild subscription, so enabling either this or

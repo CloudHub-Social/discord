@@ -202,6 +202,10 @@ bridge:
     # guild subscriptions. Note: disabling this also disables Discord→Matrix typing
     # notifications for large guilds, since both use the same opcode-14 subscription.
     sync_discord_presence_to_matrix: false
+
+    # Alert in an existing DM when this Discord account is being called.
+    # This opens Discord; it does not bridge or answer audio calls.
+    discord_call_alerts: false
     # Should the Discord custom status TEXT be reflected onto Matrix? Needs the same
     # guild subscription as presence, so enabling either one drives subscriptions.
     # With presence read off but this on, the puppet is shown "online" to carry the text.

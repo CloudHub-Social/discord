@@ -41,6 +41,7 @@ var (
 
 type User struct {
 	*database.User
+	callRings callRingTracker
 
 	sync.Mutex
 
@@ -1127,6 +1128,13 @@ func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 		// presence-relevant ones at debug so their schema can be captured and a
 		// proper handler written. Other unknown events are ignored.
 		switch evt.Type {
+		case "CALL_CREATE", "CALL_UPDATE", "CALL_DELETE":
+			if user.bridge.Config.Bridge.DiscordCallAlerts {
+				channelID, messageID, ring := user.callRings.accept(generation, epoch, evt.Sequence, evt.Type, evt.RawData, user.DiscordID)
+				if ring {
+					user.pushPortalMessage(&discordCallAlert{messageID: messageID}, "incoming call", channelID, "")
+				}
+			}
 		case "READY", "READY_SUPPLEMENTAL":
 			// discordgo's typed Ready does not parse merged_presences, where a user
 			// account's friend presences are delivered at connect (Discord's user
