@@ -58,6 +58,18 @@ func TestCallRingTrackerRetriesFailedDelivery(t *testing.T) {
 	require.False(t, notify)
 }
 
+func TestCallRingTrackerBoundsFailedDeliveryRetries(t *testing.T) {
+	var tracker callRingTracker
+	raw := json.RawMessage(`{"channel_id":"10","message_id":"20","ringing":["1"]}`)
+	for sequence := int64(1); sequence <= 3; sequence++ {
+		_, ring, notify := tracker.accept(1, 1, sequence, "CALL_UPDATE", raw, "1")
+		require.True(t, notify)
+		tracker.complete("10", ring, false)
+	}
+	_, _, notify := tracker.accept(1, 1, 4, "CALL_UPDATE", raw, "1")
+	require.False(t, notify)
+}
+
 func TestDiscordCallAlertContent(t *testing.T) {
 	content := discordCallAlertContent("10", "20", "@evie:example.org")
 	require.NotNil(t, content)

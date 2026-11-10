@@ -11,8 +11,10 @@ import (
 )
 
 type ringKey struct {
-	messageID string
-	serial    uint64
+	messageID  string
+	serial     uint64
+	generation uint64
+	epoch      uint64
 }
 type discordCallAlert struct{ ring ringKey }
 
@@ -40,7 +42,7 @@ func (portal *Portal) handleDiscordCallAlert(user *User, alert *discordCallAlert
 		portal.log.Warn().Msg("Cannot send Discord call alert without room encryption")
 		return
 	}
-	if !user.callRings.isRinging(portal.Key.ChannelID, alert.ring) {
+	if !user.isCurrentConnection(alert.ring.generation, alert.ring.epoch) || !user.callRings.isRinging(portal.Key.ChannelID, alert.ring) {
 		return
 	}
 	content := discordCallAlertContent(portal.Key.ChannelID, alert.ring.messageID, user.MXID)
@@ -80,6 +82,7 @@ type callRingTracker struct {
 	active       map[string]ringKey
 	pending      map[string]ringKey
 	delivered    map[string]ringKey
+	attempts     map[string]int
 	nextSerial   uint64
 }
 
@@ -117,6 +120,7 @@ func (tracker *callRingTracker) accept(generation, epoch uint64, sequence int64,
 		tracker.active = make(map[string]ringKey)
 		tracker.pending = make(map[string]ringKey)
 		tracker.delivered = make(map[string]ringKey)
+		tracker.attempts = make(map[string]int)
 	}
 	if tracker.lastSequence == nil {
 		tracker.lastSequence = make(map[string]int64)
@@ -134,10 +138,14 @@ func (tracker *callRingTracker) accept(generation, epoch uint64, sequence int64,
 	if tracker.delivered == nil {
 		tracker.delivered = make(map[string]ringKey)
 	}
+	if tracker.attempts == nil {
+		tracker.attempts = make(map[string]int)
+	}
 	if kind == "CALL_DELETE" || call.Unavailable {
 		delete(tracker.active, call.ChannelID)
 		delete(tracker.pending, call.ChannelID)
 		delete(tracker.delivered, call.ChannelID)
+		delete(tracker.attempts, call.ChannelID)
 		return "", ringKey{}, false
 	}
 	ringing := false
@@ -151,17 +159,20 @@ func (tracker *callRingTracker) accept(generation, epoch uint64, sequence int64,
 		delete(tracker.active, call.ChannelID)
 		delete(tracker.pending, call.ChannelID)
 		delete(tracker.delivered, call.ChannelID)
+		delete(tracker.attempts, call.ChannelID)
 		return "", ringKey{}, false
 	}
 	ring := tracker.active[call.ChannelID]
 	if ring.messageID != call.MessageID || ring.serial == 0 {
 		tracker.nextSerial++
-		ring = ringKey{messageID: call.MessageID, serial: tracker.nextSerial}
+		ring = ringKey{messageID: call.MessageID, serial: tracker.nextSerial, generation: generation, epoch: epoch}
 		tracker.active[call.ChannelID] = ring
+		tracker.attempts[call.ChannelID] = 0
 	}
-	if tracker.pending[call.ChannelID] == ring || tracker.delivered[call.ChannelID] == ring {
+	if tracker.pending[call.ChannelID] == ring || tracker.delivered[call.ChannelID] == ring || tracker.attempts[call.ChannelID] >= 3 {
 		return "", ringKey{}, false
 	}
 	tracker.pending[call.ChannelID] = ring
+	tracker.attempts[call.ChannelID]++
 	return call.ChannelID, ring, true
 }
