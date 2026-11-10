@@ -577,6 +577,9 @@ func (portal *Portal) handleDiscordMessages(msg portalDiscordMessage) {
 	if portal.MXID == "" {
 		msgCreate, ok := msg.msg.(*discordgo.MessageCreate)
 		if !ok {
+			if alert, isCall := msg.msg.(*discordCallAlert); isCall {
+				msg.user.callRings.complete(portal.Key.ChannelID, alert.ring, false)
+			}
 			portal.log.Warn().Msg("Can't create Matrix room from non new message event")
 			return
 		}

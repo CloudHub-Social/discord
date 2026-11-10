@@ -1133,7 +1133,10 @@ func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 		switch evt.Type {
 		case "CALL_CREATE", "CALL_UPDATE", "CALL_DELETE":
 			if user.bridge.Config.Bridge.DiscordCallAlerts {
-				channelID, ring, notify := user.callRings.accept(generation, epoch, evt.Sequence, evt.Type, evt.RawData, user.DiscordID)
+				user.Lock()
+				ownID := user.DiscordID
+				user.Unlock()
+				channelID, ring, notify := user.callRings.accept(generation, epoch, evt.Sequence, evt.Type, evt.RawData, ownID)
 				if notify {
 					if !user.pushPortalMessage(&discordCallAlert{ring: ring}, "incoming call", channelID, "") {
 						user.callRings.complete(channelID, ring, false)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"maunium.net/go/mautrix/id"
 )
@@ -68,6 +69,19 @@ func TestCallRingTrackerBoundsFailedDeliveryRetries(t *testing.T) {
 	}
 	_, _, notify := tracker.accept(1, 1, 4, "CALL_UPDATE", raw, "1")
 	require.False(t, notify)
+}
+
+func TestCallAlertDroppedAfterPortalRemovalCanRetry(t *testing.T) {
+	_, user, portal, _ := newRecoveryTest(t)
+	portal.MXID = ""
+	portal.log = zerolog.Nop()
+	raw := json.RawMessage(`{"channel_id":"1000000000000000002","message_id":"20","ringing":["1"]}`)
+	channel, ring, notify := user.callRings.accept(1, 1, 1, "CALL_CREATE", raw, "1")
+	require.True(t, notify)
+	portal.handleDiscordMessages(portalDiscordMessage{user: user, msg: &discordCallAlert{ring: ring}})
+	_, _, retry := user.callRings.accept(1, 1, 2, "CALL_UPDATE", raw, "1")
+	require.Equal(t, portal.Key.ChannelID, channel)
+	require.True(t, retry)
 }
 
 func TestDiscordCallAlertContent(t *testing.T) {
