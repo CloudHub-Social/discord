@@ -172,6 +172,11 @@ func TestMergePartialDiscordMessage(t *testing.T) {
 	require.Empty(t, original.Components)
 }
 
+func TestComponentRemovalRequiresEncryption(t *testing.T) {
+	require.True(t, discordUpdateNeedsEncryption(&discordgo.Message{Components: []discordgo.MessageComponent{}, Attachments: []*discordgo.MessageAttachment{{ID: "1"}}}))
+	require.False(t, discordUpdateNeedsEncryption(&discordgo.Message{}))
+}
+
 func TestPreserveComponentMediaOnFailure(t *testing.T) {
 	previous := []componentMedia{{id: "component_a", url: "https://cdn.discordapp.com/a.png"}, {id: "component_b", url: "https://cdn.discordapp.com/b.png"}, {id: "component_c", url: "https://cdn.discordapp.com/c.png"}}
 	pending := map[string]*database.Message{"component_a": nil, "component_b": nil, "component_c": nil}

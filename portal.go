@@ -1078,7 +1078,7 @@ func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *dis
 	puppet := portal.bridge.GetPuppetByID(msg.Author.ID)
 	intent := puppet.IntentFor(portal)
 
-	if portal.Encrypted && portal.bridge.Crypto == nil && discordMessageHasNewContent(msg) {
+	if portal.Encrypted && portal.bridge.Crypto == nil && discordUpdateNeedsEncryption(msg) {
 		log.Error().Msg("Cannot bridge new Discord content without room encryption")
 		return
 	}

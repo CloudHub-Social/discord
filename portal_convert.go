@@ -293,6 +293,11 @@ func (portal *Portal) convertDiscordMessage(ctx context.Context, puppet *Puppet,
 	return portal.convertDiscordMessageWithGallery(ctx, puppet, intent, msg, false)
 }
 
+// An explicit empty component list can trigger attachment presentation edits.
+func discordUpdateNeedsEncryption(msg *discordgo.Message) bool {
+	return msg.Components != nil || discordMessageHasNewContent(msg)
+}
+
 func discordMessageHasNewContent(msg *discordgo.Message) bool {
 	if msg.Poll != nil || len(msg.Components) > 0 || (msg.MessageReference != nil && msg.MessageReference.Type == discordgo.MessageReferenceTypeForward) {
 		return true
