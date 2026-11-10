@@ -47,6 +47,14 @@ type portalDiscordMessage struct {
 	thread *Thread
 }
 
+type discordPollVote struct{ messageID string }
+
+type discordPollSnapshot struct {
+	messageID  string
+	message    *discordgo.Message
+	generation uint64
+}
+
 // componentRefreshResult re-enters the serialized portal queue after the
 // Discord REST lookup completes away from the event loop.
 type componentRefreshResult struct {
@@ -63,6 +71,9 @@ var relayClient, _ = discordgo.New("")
 
 type Portal struct {
 	*database.Portal
+	pollRefreshLock  sync.Mutex
+	pollRefreshState map[string]*pollRefreshState
+	pollRefreshSlots chan struct{}
 
 	Parent *Portal
 	Guild  *Guild
@@ -598,6 +609,10 @@ func (portal *Portal) handleDiscordMessages(msg portalDiscordMessage) {
 		portal.handleDiscordMessageUpdate(msg.user, convertedMsg.Message)
 	case *componentRefreshResult:
 		portal.handleDiscordMessageUpdateWithRefresh(msg.user, convertedMsg.message, true, convertedMsg.failed)
+	case *discordPollVote:
+		portal.queuePollRefresh(msg.user, convertedMsg.messageID, true)
+	case *discordPollSnapshot:
+		portal.finishPollRefresh(msg.user, convertedMsg)
 	case *discordgo.MessageDelete:
 		portal.handleDiscordMessageDelete(msg.user, convertedMsg.Message)
 	case *discordgo.MessageDeleteBulk:

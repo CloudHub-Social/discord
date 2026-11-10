@@ -823,6 +823,8 @@ const BotIntents = discordgo.IntentGuilds |
 	//discordgo.IntentGuildScheduledEvents |
 	discordgo.IntentDirectMessages |
 	discordgo.IntentDirectMessageTyping |
+	discordgo.Intent(1<<24) | // GUILD_MESSAGE_POLLS
+	discordgo.Intent(1<<25) | // DIRECT_MESSAGE_POLLS
 	discordgo.IntentDirectMessageTyping |
 	// Privileged intents
 	discordgo.IntentMessageContent |
@@ -1091,6 +1093,10 @@ func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 		user.pushPortalMessage(evt, "bulk message delete", evt.ChannelID, evt.GuildID)
 	case *discordgo.MessageUpdate:
 		user.pushPortalMessage(evt, "message update", evt.ChannelID, evt.GuildID)
+	case *discordgo.MessagePollVoteAdd:
+		user.pushPortalMessage(&discordPollVote{messageID: evt.MessageID}, "poll vote", evt.ChannelID, evt.GuildID)
+	case *discordgo.MessagePollVoteRemove:
+		user.pushPortalMessage(&discordPollVote{messageID: evt.MessageID}, "poll vote", evt.ChannelID, evt.GuildID)
 	case *discordgo.MessageReactionAdd:
 		user.pushPortalMessage(evt, "reaction add", evt.ChannelID, evt.GuildID)
 	case *discordgo.MessageReactionRemove:
