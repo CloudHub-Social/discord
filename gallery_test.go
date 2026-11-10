@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/stretchr/testify/require"
@@ -329,4 +330,42 @@ func TestExistingGalleryEditWithGIFAndAggregationDisabled(t *testing.T) {
 	parts = portal.convertDiscordMessageWithGallery(context.Background(), puppet, nil, msg, true)
 	require.Len(t, parts, 1)
 	require.Contains(t, parts[0].Content.Body, gif)
+}
+
+func TestFetchGalleryMessageUserSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/channels/123/messages", r.URL.Path)
+		require.Equal(t, "456", r.URL.Query().Get("around"))
+		require.Equal(t, "1", r.URL.Query().Get("limit"))
+		_, _ = io.WriteString(w, `[{"id":"456","channel_id":"123","author":{"id":"789"}}]`)
+	}))
+	defer server.Close()
+	old := discordgo.EndpointChannels
+	discordgo.EndpointChannels = server.URL + "/channels/"
+	defer func() { discordgo.EndpointChannels = old }()
+	sess, err := discordgo.New("token")
+	require.NoError(t, err)
+	sess.IsUser = true
+	got, err := fetchGalleryMessage(sess, "123", "456", "789")
+	require.NoError(t, err)
+	require.Equal(t, "456", got.ID)
+	_, err = fetchGalleryMessage(sess, "123", "456", "wrong")
+	require.Error(t, err)
+}
+
+func TestSelectGalleryMessageRejectsWrongIdentity(t *testing.T) {
+	valid := &discordgo.Message{ID: "456", ChannelID: "123", Author: &discordgo.User{ID: "789"}}
+	for _, messages := range [][]*discordgo.Message{nil, {nil}, {{ID: "other", ChannelID: "123", Author: &discordgo.User{ID: "789"}}}, {{ID: "456", ChannelID: "other", Author: &discordgo.User{ID: "789"}}}, {{ID: "456", ChannelID: "123"}}, {valid, valid}} {
+		_, err := selectGalleryMessage(messages, "123", "456", "789")
+		require.Error(t, err)
+	}
+}
+
+func TestGalleryMessageIsCurrent(t *testing.T) {
+	t1 := time.Unix(100, 0)
+	t2 := time.Unix(200, 0)
+	require.False(t, galleryMessageIsCurrent(&discordgo.Message{EditedTimestamp: &t1}, &discordgo.Message{EditedTimestamp: &t2}))
+	require.False(t, galleryMessageIsCurrent(&discordgo.Message{}, &discordgo.Message{EditedTimestamp: &t2}))
+	require.True(t, galleryMessageIsCurrent(&discordgo.Message{EditedTimestamp: &t2}, &discordgo.Message{EditedTimestamp: &t1}))
+	require.True(t, galleryMessageIsCurrent(&discordgo.Message{EditedTimestamp: &t2}, &discordgo.Message{}))
 }

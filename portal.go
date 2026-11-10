@@ -819,6 +819,37 @@ func (portal *Portal) sendThreadCreationNotice(ctx context.Context, thread *Thre
 	}
 }
 
+// retainForwardSnapshotAttachments removes existing snapshot items from the redaction set.
+// Nil means Discord omitted the snapshot; an empty slice explicitly removes it.
+func retainForwardSnapshotAttachments(attachmentMap map[string]*database.Message, snapshots []discordgo.MessageSnapshot) {
+	if snapshots == nil {
+		for attachmentID := range attachmentMap {
+			if strings.HasPrefix(attachmentID, "forward_") {
+				delete(attachmentMap, attachmentID)
+			}
+		}
+		return
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.Message == nil {
+			continue
+		}
+		for _, attachment := range snapshot.Message.Attachments {
+			if attachment != nil {
+				delete(attachmentMap, "forward_"+attachment.ID)
+			}
+		}
+		for _, sticker := range snapshot.Message.StickerItems {
+			if sticker != nil {
+				delete(attachmentMap, "forward_"+sticker.ID)
+			}
+		}
+		for _, media := range collectComponentMedia(snapshot.Message.Components) {
+			delete(attachmentMap, "forward_"+media.id)
+		}
+	}
+}
+
 func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Message) {
 	log := portal.log.With().
 		Str("message_id", msg.ID).
@@ -897,6 +928,18 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 	for _, remainingAttachment := range msg.Attachments {
 		if _, found := attachmentMap[remainingAttachment.ID]; found {
 			delete(attachmentMap, remainingAttachment.ID)
+		}
+	}
+	retainForwardSnapshotAttachments(attachmentMap, msg.MessageSnapshots)
+	if msg.Components == nil {
+		for attachmentID := range attachmentMap {
+			if strings.HasPrefix(attachmentID, "component_") {
+				delete(attachmentMap, attachmentID)
+			}
+		}
+	} else {
+		for _, media := range collectComponentMedia(msg.Components) {
+			delete(attachmentMap, media.id)
 		}
 	}
 	for _, remainingSticker := range msg.StickerItems {

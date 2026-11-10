@@ -144,7 +144,20 @@ func (portal *Portal) convertDiscordSticker(ctx context.Context, intent *appserv
 	}
 }
 
+// discordVoiceWaveform rescales Discord's unsigned byte samples to Matrix's 0–1024 range.
+func discordVoiceWaveform(samples []byte) []int {
+	waveform := make([]int, len(samples))
+	for i, sample := range samples {
+		waveform[i] = int(sample) * 1024 / 255
+	}
+	return waveform
+}
+
 func (portal *Portal) convertDiscordAttachment(ctx context.Context, intent *appservice.IntentAPI, messageID string, att *discordgo.MessageAttachment) *ConvertedMessage {
+	return portal.convertDiscordAttachmentWithCopy(ctx, intent, messageID, att, false)
+}
+
+func (portal *Portal) convertDiscordAttachmentWithCopy(ctx context.Context, intent *appservice.IntentAPI, messageID string, att *discordgo.MessageAttachment, forceCopy bool) *ConvertedMessage {
 	content := &event.MessageEventContent{
 		Body: att.Filename,
 		Info: &event.FileInfo{
@@ -173,9 +186,10 @@ func (portal *Portal) convertDiscordAttachment(ctx context.Context, intent *apps
 	case "audio":
 		content.MsgType = event.MsgAudio
 		if att.Waveform != nil {
-			// TODO convert waveform
+			waveform := discordVoiceWaveform(att.Waveform)
 			extra["org.matrix.msc1767.audio"] = map[string]any{
 				"duration": int(att.DurationSeconds * 1000),
+				"waveform": waveform,
 			}
 			extra["org.matrix.msc3245.voice"] = map[string]any{}
 		}
@@ -187,7 +201,7 @@ func (portal *Portal) convertDiscordAttachment(ctx context.Context, intent *apps
 		content.MsgType = event.MsgFile
 	}
 	mxc := portal.bridge.DMA.AttachmentMXC(portal.Key.ChannelID, messageID, att)
-	if mxc.IsEmpty() || portal.Encrypted {
+	if forceCopy || mxc.IsEmpty() || portal.Encrypted {
 		content = portal.convertDiscordFile(ctx, "attachment", intent, att.ID, att.URL, content)
 	} else {
 		content.URL = mxc.CUString()
@@ -279,8 +293,31 @@ func (portal *Portal) convertDiscordMessage(ctx context.Context, puppet *Puppet,
 	return portal.convertDiscordMessageWithGallery(ctx, puppet, intent, msg, false)
 }
 
+func discordMessageHasNewContent(msg *discordgo.Message) bool {
+	if msg.Poll != nil || len(msg.Components) > 0 || (msg.MessageReference != nil && msg.MessageReference.Type == discordgo.MessageReferenceTypeForward) {
+		return true
+	}
+	for _, e := range msg.Embeds {
+		if e != nil && string(e.Type) == "poll_result" {
+			return true
+		}
+	}
+	for _, a := range msg.Attachments {
+		if a != nil && len(a.Waveform) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Existing gallery messages must remain editable even after aggregation is disabled.
 func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, puppet *Puppet, intent *appservice.IntentAPI, msg *discordgo.Message, forceGallery bool) []*ConvertedMessage {
+	// Never introduce a new plaintext fallback in an encrypted room when crypto
+	// is unavailable. The caller will treat this as an unhandled message.
+	if portal.Encrypted && portal.bridge.Crypto == nil && discordMessageHasNewContent(msg) {
+		zerolog.Ctx(ctx).Error().Msg("Cannot bridge new Discord content without room encryption")
+		return nil
+	}
 	predictedLength := len(msg.Attachments) + len(msg.StickerItems)
 	if msg.Content != "" {
 		predictedLength++
@@ -291,6 +328,7 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 	}
 	log := zerolog.Ctx(ctx)
 	handledIDs := make(map[string]struct{})
+	componentSpoilerURLs := componentSpoilers(msg.Components)
 	for _, att := range msg.Attachments {
 		if _, handled := handledIDs[att.ID]; handled {
 			continue
@@ -298,6 +336,12 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 		handledIDs[att.ID] = struct{}{}
 		log := log.With().Str("attachment_id", att.ID).Logger()
 		if part := portal.convertDiscordAttachment(log.WithContext(ctx), intent, msg.ID, att); part != nil {
+			if attachmentHasComponentSpoiler(att, componentSpoilerURLs) {
+				if part.Extra == nil {
+					part.Extra = make(map[string]any)
+				}
+				part.Extra[gallerySpoilerKey] = true
+			}
 			parts = append(parts, part)
 		}
 	}
@@ -314,6 +358,65 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 		}
 		if forceGallery || !hasVideoEmbed {
 			parts = combineDiscordGallery(parts, len(msg.Attachments))
+		}
+	}
+	// Render trusted card media through the same encryption-aware Matrix upload path.
+	// Discord attachment-backed component media is already handled above.
+	if !forceGallery {
+		attachmentURLs := map[string]bool{}
+		for _, attachment := range msg.Attachments {
+			if attachment != nil {
+				attachmentURLs[attachment.URL] = true
+			}
+		}
+		for _, media := range collectComponentMedia(msg.Components) {
+			if !attachmentURLs[media.url] {
+				parts = append(parts, portal.convertComponentMedia(intent, media))
+			}
+		}
+	}
+	// Snapshot media belongs to the source channel, not the destination portal.
+	// Copy it through the ordinary encrypted upload path instead of creating a
+	// direct-media URL that points at the wrong Discord message.
+	if msg.MessageReference != nil && msg.MessageReference.Type == discordgo.MessageReferenceTypeForward {
+		for _, snapshot := range msg.MessageSnapshots {
+			if snapshot.Message == nil {
+				continue
+			}
+			forwardSpoilers := componentSpoilers(snapshot.Message.Components)
+			for _, att := range snapshot.Message.Attachments {
+				if att == nil {
+					continue
+				}
+				part := portal.convertDiscordAttachmentWithCopy(ctx, intent, msg.MessageReference.MessageID, att, true)
+				if part != nil {
+					if attachmentHasComponentSpoiler(att, forwardSpoilers) {
+						if part.Extra == nil {
+							part.Extra = make(map[string]any)
+						}
+						part.Extra[gallerySpoilerKey] = true
+					}
+					part.AttachmentID = "forward_" + att.ID
+					parts = append(parts, part)
+				}
+			}
+			for _, sticker := range snapshot.Message.StickerItems {
+				if sticker == nil {
+					continue
+				}
+				part := portal.convertDiscordSticker(ctx, intent, sticker)
+				if part != nil {
+					part.AttachmentID = "forward_" + sticker.ID
+					parts = append(parts, part)
+				}
+			}
+			if !forceGallery {
+				for _, media := range collectComponentMedia(snapshot.Message.Components) {
+					part := portal.convertComponentMedia(intent, media)
+					part.AttachmentID = "forward_" + media.id
+					parts = append(parts, part)
+				}
+			}
 		}
 	}
 	for _, sticker := range msg.StickerItems {
@@ -732,11 +835,38 @@ func (portal *Portal) convertDiscordTextMessage(ctx context.Context, intent *app
 	}
 	if msg.Content != "" && (len(msg.Attachments) > 0 || !isPlainGifMessage(msg)) {
 		htmlParts = append(htmlParts, portal.renderDiscordMarkdownOnlyHTML(msg.Content, true))
-	} else if msg.MessageReference != nil &&
+	}
+	if msg.MessageReference != nil &&
 		msg.MessageReference.Type == discordgo.MessageReferenceTypeForward &&
 		len(msg.MessageSnapshots) > 0 &&
 		msg.MessageSnapshots[0].Message != nil {
 		forwardedHTML := portal.renderDiscordMarkdownOnlyHTMLNoUnwrap(msg.MessageSnapshots[0].Message.Content, true)
+		forwarded := msg.MessageSnapshots[0].Message
+		// Forwarded embeds are rendered as text here; do not reupload inline
+		// embed images without an encrypted-media representation.
+		for _, embed := range forwarded.Embeds {
+			if embed == nil {
+				continue
+			}
+			if embed.Title != "" {
+				forwardedHTML += "<p><strong>" + html.EscapeString(embed.Title) + "</strong></p>"
+			}
+			if embed.Description != "" {
+				forwardedHTML += portal.renderDiscordMarkdownOnlyHTMLNoUnwrap(embed.Description, true)
+			}
+			for _, field := range embed.Fields {
+				if field != nil {
+					forwardedHTML += "<p><strong>" + html.EscapeString(field.Name) + "</strong>: " + html.EscapeString(field.Value) + "</p>"
+				}
+			}
+			if embed.URL != "" {
+				forwardedHTML += "<p>" + html.EscapeString(embed.URL) + "</p>"
+			}
+		}
+		if len(forwarded.Components) > 0 {
+			ref := msg.MessageReference
+			forwardedHTML += portal.renderDiscordComponents(forwarded.Components, discordMessageURL(ref.GuildID, ref.ChannelID, ref.MessageID))
+		}
 		msgTSText := msg.MessageSnapshots[0].Message.Timestamp.Format("2006-01-02 15:04 MST")
 		origLink := fmt.Sprintf("unknown channel • %s", msgTSText)
 		forwardedFromPortal := portal.bridge.GetExistingPortalByID(database.NewPortalKey(msg.MessageReference.ChannelID, ""))
@@ -781,9 +911,15 @@ func (portal *Portal) convertDiscordTextMessage(ctx context.Context, intent *app
 		case EmbedVideo:
 			// Ignore video embeds, they're handled as separate messages
 		default:
-			log := with.Logger()
-			log.Warn().Msg("Unknown embed type in message")
+			if string(embed.Type) != "poll_result" {
+				log := with.Logger()
+				log.Warn().Msg("Unknown embed type in message")
+			}
 		}
+	}
+
+	if pollHTML := discordPollHTML(msg, portal.GuildID); pollHTML != "" {
+		htmlParts = append(htmlParts, pollHTML)
 	}
 
 	if len(msg.Components) > 0 {

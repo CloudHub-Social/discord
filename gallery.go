@@ -260,6 +260,38 @@ func galleryEditExtra(extra map[string]any) map[string]any {
 	return outer
 }
 
+// fetchGalleryMessage verifies the message identity before reconstructing an edit.
+func fetchGalleryMessage(sess *discordgo.Session, channelID, messageID, senderID string, opts ...discordgo.RequestOption) (*discordgo.Message, error) {
+	var messages []*discordgo.Message
+	var err error
+	if sess.IsUser {
+		messages, err = sess.ChannelMessages(channelID, 1, "", "", messageID, opts...)
+	} else {
+		var msg *discordgo.Message
+		msg, err = sess.ChannelMessage(channelID, messageID, opts...)
+		messages = []*discordgo.Message{msg}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return selectGalleryMessage(messages, channelID, messageID, senderID)
+}
+
+func selectGalleryMessage(messages []*discordgo.Message, channelID, messageID, senderID string) (*discordgo.Message, error) {
+	if len(messages) != 1 || messages[0] == nil || messages[0].ID != messageID || messages[0].ChannelID != channelID || messages[0].Author == nil || messages[0].Author.ID != senderID {
+		return nil, fmt.Errorf("Discord message identity does not match the bridge mapping")
+	}
+	return messages[0], nil
+}
+
+// A fetch can race a subsequent edit. Never publish a version older than the update.
+func galleryMessageIsCurrent(full, update *discordgo.Message) bool {
+	if full == nil || update == nil {
+		return false
+	}
+	return update.EditedTimestamp == nil || (full.EditedTimestamp != nil && !full.EditedTimestamp.Before(*update.EditedTimestamp))
+}
+
 // Discord gateway updates may omit fields, so reconstruct a gallery only from
 // the complete current message instead of treating absent attachments as removals.
 func (portal *Portal) handleDiscordGalleryUpdate(ctx context.Context, user *User, update *discordgo.Message, existing *database.Message) {
@@ -268,9 +300,18 @@ func (portal *Portal) handleDiscordGalleryUpdate(ctx context.Context, user *User
 		log.Warn().Msg("Cannot refresh gallery without Discord session")
 		return
 	}
-	full, err := user.Session.ChannelMessage(existing.DiscordProtoChannelID(), update.ID, portal.RefererOptIfUser(user.Session, existing.ThreadID)...)
+	channelID := existing.DiscordProtoChannelID()
+	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	opts := portal.RefererOptIfUser(user.Session, existing.ThreadID)
+	opts = append(opts, discordgo.WithContext(fetchCtx), discordgo.WithRetryOnRatelimit(false), discordgo.WithRestRetries(0))
+	full, err := fetchGalleryMessage(user.Session, channelID, update.ID, existing.SenderID, opts...)
 	if err != nil || full == nil || full.Author == nil {
 		log.Err(err).Msg("Failed to refresh edited Discord gallery")
+		return
+	}
+	if !galleryMessageIsCurrent(full, update) {
+		log.Warn().Msg("Discord gallery refresh is older than the received update")
 		return
 	}
 	if full.Author.ID == portal.RelayWebhookID {
