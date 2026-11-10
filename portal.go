@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -846,6 +847,25 @@ func prepareAttachmentPresentationEdit(part *ConvertedMessage, target id.EventID
 // queueComponentRefresh schedules bounded, read-only recovery without blocking
 // the portal event loop. Saturation falls back to text handling with no edit
 // timestamp advancement, so a later update can retry.
+func componentRefreshRetryDelay(err error, attempt int) time.Duration {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return 0
+	}
+	var limited *discordgo.RateLimitError
+	if errors.As(err, &limited) {
+		if limited.RetryAfter > 0 && limited.RetryAfter <= 5*time.Second {
+			return limited.RetryAfter
+		}
+		return 0
+	}
+	var rest *discordgo.RESTError
+	var network net.Error
+	if (errors.As(err, &rest) && rest.Response != nil && rest.Response.StatusCode >= 500) || (errors.As(err, &network) && network.Timeout()) {
+		return time.Duration(attempt+1) * 250 * time.Millisecond
+	}
+	return 0
+}
+
 func (portal *Portal) queueComponentRefresh(user *User, update *discordgo.Message, existing *database.Message) bool {
 	if user == nil {
 		return false
@@ -870,16 +890,20 @@ func (portal *Portal) queueComponentRefresh(user *User, update *discordgo.Messag
 		opts = append(opts, discordgo.WithContext(ctx), discordgo.WithRetryOnRatelimit(false), discordgo.WithRestRetries(0))
 		var full *discordgo.Message
 		var err error
-		for attempt := 0; attempt < 2; attempt++ {
+		for attempt := 0; attempt < 3; attempt++ {
 			full, err = fetchGalleryMessage(session, existing.DiscordProtoChannelID(), update.ID, existing.SenderID, opts...)
 			if err == nil && galleryMessageIsCurrent(full, update) {
 				break
 			}
-			var limited *discordgo.RateLimitError
-			if !errors.As(err, &limited) || limited.RetryAfter <= 0 || limited.RetryAfter > 5*time.Second {
+			delay := componentRefreshRetryDelay(err, attempt)
+			if err == nil && full != nil {
+				// The message-list endpoint may lag behind the gateway update.
+				delay = time.Duration(attempt+1) * 250 * time.Millisecond
+			}
+			if delay == 0 || attempt == 2 {
 				break
 			}
-			timer := time.NewTimer(limited.RetryAfter)
+			timer := time.NewTimer(delay)
 			select {
 			case <-timer.C:
 			case <-ctx.Done():

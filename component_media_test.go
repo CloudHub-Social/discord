@@ -276,3 +276,58 @@ func TestComponentRefreshRetriesRateLimit(t *testing.T) {
 		t.Fatal("rate-limited update not retried")
 	}
 }
+
+func TestComponentRefreshRecoversAfterDiscordServerError(t *testing.T) {
+	br, user, portal, _ := newRecoveryTest(t)
+	existing := br.DB.Message.GetFirstByDiscordID(portal.Key, recoveryTestMessageID)
+	user.Session.IsUser = true
+	attempts := 0
+	user.Session.Client.Transport = presenceTestTransport(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"message":"unavailable"}`)), Request: req}, nil
+		}
+		return recoverySourceResponse(t, &discordgo.Message{ID: recoveryTestMessageID, ChannelID: portal.Key.ChannelID, Author: &discordgo.User{ID: "2"}}), nil
+	})
+	require.True(t, portal.queueComponentRefresh(user, &discordgo.Message{ID: recoveryTestMessageID}, existing))
+	select {
+	case queued := <-portal.discordMessages:
+		result, ok := queued.msg.(*componentRefreshResult)
+		require.True(t, ok)
+		require.False(t, result.failed)
+		require.Equal(t, 2, attempts)
+	case <-time.After(3 * time.Second):
+		t.Fatal("server error was not retried")
+	}
+}
+
+func TestComponentRefreshDoesNotRetryPermissionErrors(t *testing.T) {
+	err := &discordgo.RESTError{Response: &http.Response{StatusCode: http.StatusForbidden}}
+	require.Zero(t, componentRefreshRetryDelay(err, 0))
+}
+
+func TestComponentRefreshRetriesStaleSnapshot(t *testing.T) {
+	br, user, portal, _ := newRecoveryTest(t)
+	existing := br.DB.Message.GetFirstByDiscordID(portal.Key, recoveryTestMessageID)
+	user.Session.IsUser = true
+	older, edited := time.Unix(100, 0), time.Unix(200, 0)
+	attempts := 0
+	user.Session.Client.Transport = presenceTestTransport(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		timestamp := &edited
+		if attempts == 1 {
+			timestamp = &older
+		}
+		return recoverySourceResponse(t, &discordgo.Message{ID: recoveryTestMessageID, ChannelID: portal.Key.ChannelID, Author: &discordgo.User{ID: "2"}, EditedTimestamp: timestamp}), nil
+	})
+	require.True(t, portal.queueComponentRefresh(user, &discordgo.Message{ID: recoveryTestMessageID, EditedTimestamp: &edited}, existing))
+	select {
+	case queued := <-portal.discordMessages:
+		result, ok := queued.msg.(*componentRefreshResult)
+		require.True(t, ok)
+		require.False(t, result.failed)
+		require.Equal(t, 2, attempts)
+	case <-time.After(3 * time.Second):
+		t.Fatal("stale snapshot was not retried")
+	}
+}
