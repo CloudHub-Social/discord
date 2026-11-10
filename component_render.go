@@ -27,9 +27,10 @@ import (
 
 // renderDiscordComponents presents the information Discord provides without
 // pretending that application controls can be operated from Matrix.
-func (portal *Portal) renderDiscordComponents(components []discordgo.MessageComponent) string {
+func (portal *Portal) renderDiscordComponents(components []discordgo.MessageComponent, messageURL string) string {
 	var parts []string
 	unsupported := false
+	needsDiscord := false
 	var render func(discordgo.MessageComponent)
 	render = func(component discordgo.MessageComponent) {
 		switch c := component.(type) {
@@ -40,6 +41,7 @@ func (portal *Portal) renderDiscordComponents(components []discordgo.MessageComp
 		case *discordgo.Container:
 			if c.Spoiler {
 				parts = append(parts, "<p>Discord spoiler content: open in Discord to view.</p>")
+				needsDiscord = true
 				return
 			}
 			for _, child := range c.Components {
@@ -98,5 +100,33 @@ func (portal *Portal) renderDiscordComponents(components []discordgo.MessageComp
 	if unsupported {
 		parts = append(parts, msgComponentTemplateHTML)
 	}
+	if (unsupported || needsDiscord) && messageURL != "" {
+		parts = append(parts, fmt.Sprintf(`<p><a href="%s">Open message in Discord</a></p>`, html.EscapeString(messageURL)))
+	}
 	return strings.Join(parts, "\n")
+}
+
+// discordMessageURL uses the actual message channel, which can be a thread.
+// Missing or malformed IDs fall back to the existing text-only notice.
+func discordMessageURL(guildID, channelID, messageID string) string {
+	validID := func(id string) bool {
+		if id == "" {
+			return false
+		}
+		for _, c := range id {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	if !validID(channelID) || !validID(messageID) {
+		return ""
+	}
+	if guildID == "" {
+		guildID = "@me"
+	} else if !validID(guildID) {
+		return ""
+	}
+	return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", guildID, channelID, messageID)
 }
