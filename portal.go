@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"reflect"
 	"regexp"
 	"slices"
@@ -944,13 +945,17 @@ func mergePartialDiscordMessage(cached, update *discordgo.Message) {
 
 // preserveComponentMediaOnFailure keeps earlier media when replacements fail,
 // except when a new spoiler could make retaining an old event disclose content.
-func preserveComponentMediaOnFailure(attachmentMap map[string]*database.Message, failed bool, components []discordgo.MessageComponent) {
-	if !failed || len(componentSpoilers(components)) > 0 {
-		return
-	}
-	for attachmentID := range attachmentMap {
-		if strings.HasPrefix(attachmentID, "component_") {
-			delete(attachmentMap, attachmentID)
+func preserveComponentMediaOnFailure(attachmentMap map[string]*database.Message, previous, failed []componentMedia) {
+	for _, old := range previous {
+		oldURL, err := url.Parse(old.url)
+		if err != nil {
+			continue
+		}
+		for _, replacement := range failed {
+			newURL, err := url.Parse(replacement.url)
+			if err == nil && oldURL.EscapedPath() == newURL.EscapedPath() && !replacement.spoiler {
+				delete(attachmentMap, old.id)
+			}
 		}
 	}
 }
@@ -1043,6 +1048,10 @@ func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *dis
 		}
 	}
 
+	var previousComponentMedia []componentMedia
+	if cached, ok := portal.recentMessages.Get(msg.ID); ok {
+		previousComponentMedia = collectComponentMedia(cached.Components)
+	}
 	if msg.Author == nil {
 		creationMessage, ok := portal.recentMessages.Get(msg.ID)
 		if !ok {
@@ -1076,6 +1085,7 @@ func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *dis
 	// Reconcile media independently of the text edit. Failed media remains
 	// retryable; removed or newly-spoilered old parts must not stay visible.
 	componentUpdateFailed := componentSnapshotFailed
+	var failedComponentMedia []componentMedia
 	if msg.Components != nil {
 		known := make(map[string]bool, len(existing))
 		for _, part := range existing {
@@ -1120,6 +1130,7 @@ func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *dis
 			if part == nil || part.Content.MsgType == event.MsgNotice {
 				log.Warn().Msg("Failed to convert updated component media")
 				componentUpdateFailed = true
+				failedComponentMedia = append(failedComponentMedia, media)
 				continue
 			}
 			if existing[0].ThreadID != "" {
@@ -1127,6 +1138,7 @@ func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *dis
 				if thread == nil || thread.RootMXID == "" {
 					log.Warn().Msg("Cannot map updated component media to thread")
 					componentUpdateFailed = true
+					failedComponentMedia = append(failedComponentMedia, media)
 					continue
 				}
 				part.Content.RelatesTo = &event.RelatesTo{}
@@ -1138,6 +1150,7 @@ func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *dis
 			if err != nil {
 				log.Err(err).Msg("Failed to send updated component media")
 				componentUpdateFailed = true
+				failedComponentMedia = append(failedComponentMedia, media)
 				continue
 			}
 			existing[0].MassInsertParts([]database.MessagePart{{AttachmentID: media.id, MXID: resp.EventID}})
@@ -1176,7 +1189,7 @@ func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *dis
 			delete(attachmentMap, media.id)
 		}
 	}
-	preserveComponentMediaOnFailure(attachmentMap, componentUpdateFailed, msg.Components)
+	preserveComponentMediaOnFailure(attachmentMap, previousComponentMedia, failedComponentMedia)
 	for _, remainingSticker := range msg.StickerItems {
 		if _, found := attachmentMap[remainingSticker.ID]; found {
 			delete(attachmentMap, remainingSticker.ID)

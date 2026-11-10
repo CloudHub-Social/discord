@@ -173,22 +173,13 @@ func TestMergePartialDiscordMessage(t *testing.T) {
 }
 
 func TestPreserveComponentMediaOnFailure(t *testing.T) {
-	for _, tc := range []struct {
-		name                           string
-		failed, spoiler, wantPreserved bool
-	}{
-		{"successful removal", false, false, false}, {"failed replacement", true, false, true}, {"failed spoiler update", true, true, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			pending := map[string]*database.Message{"component_old": nil, "other": nil}
-			components := []discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/new.png"}, Spoiler: tc.spoiler}}
-			preserveComponentMediaOnFailure(pending, tc.failed, components)
-			_, remains := pending["component_old"]
-			require.Equal(t, !tc.wantPreserved, remains)
-			_, unrelated := pending["other"]
-			require.True(t, unrelated)
-		})
-	}
+	previous := []componentMedia{{id: "component_a", url: "https://cdn.discordapp.com/a.png"}, {id: "component_b", url: "https://cdn.discordapp.com/b.png"}, {id: "component_c", url: "https://cdn.discordapp.com/c.png"}}
+	pending := map[string]*database.Message{"component_a": nil, "component_b": nil, "component_c": nil}
+	failed := []componentMedia{{url: "https://media.discordapp.net/a.png?new=1"}, {url: "https://cdn.discordapp.com/b.png", spoiler: true}}
+	preserveComponentMediaOnFailure(pending, previous, failed)
+	require.NotContains(t, pending, "component_a")
+	require.Contains(t, pending, "component_b")
+	require.Contains(t, pending, "component_c")
 }
 
 func TestFailedComponentMediaDoesNotClaimSuccessfulIdentity(t *testing.T) {
