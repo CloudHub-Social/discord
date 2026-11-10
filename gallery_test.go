@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io"
@@ -283,4 +284,37 @@ func TestGalleryCaptionEditOmitsAttachments(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(data, &raw))
 	require.Contains(t, raw, "attachments")
+}
+
+func TestGalleryExtraMediaLinkFallback(t *testing.T) {
+	part := &ConvertedMessage{Content: &event.MessageEventContent{MsgType: galleryMessageType, Body: "caption"}}
+	appendDiscordExtraLink(part, "https://example.org/a.gif?x=1&y=2")
+	require.Contains(t, part.Content.Body, "https://example.org/a.gif?x=1&y=2")
+	require.Contains(t, part.Content.FormattedBody, `href="https://example.org/a.gif?x=1&amp;y=2"`)
+	before := part.Content.Body
+	appendDiscordExtraLink(part, "javascript:alert(1)")
+	appendDiscordExtraLink(part, "https://example.org/a.gif?x=1&y=2")
+	require.Equal(t, before, part.Content.Body)
+}
+
+func TestExistingGalleryEditWithGIFAndAggregationDisabled(t *testing.T) {
+	disabled := false
+	cfg := &config.Config{}
+	cfg.Bridge.DiscordAttachmentGalleries = &disabled
+	dma := &DirectMediaAPI{cfg: config.DirectMedia{ServerName: "example.org"}, attachmentCache: make(map[AttachmentCacheKey]AttachmentCacheValue)}
+	br := &DiscordBridge{Config: cfg, DMA: dma}
+	portal := &Portal{Portal: &database.Portal{Key: database.PortalKey{ChannelID: "100"}}, bridge: br}
+	puppet := &Puppet{bridge: br}
+	gif := "https://example.org/test.gif"
+	msg := &discordgo.Message{ID: "200", Content: gif, Attachments: []*discordgo.MessageAttachment{
+		{ID: "301", Filename: "one.png", ContentType: "image/png", URL: "https://cdn.example.org/one"},
+		{ID: "302", Filename: "two.png", ContentType: "image/png", URL: "https://cdn.example.org/two"},
+	}, Embeds: []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeGifv, URL: gif, Video: &discordgo.MessageEmbedVideo{URL: gif}}}}
+	parts := portal.convertDiscordMessageWithGallery(context.Background(), puppet, nil, msg, true)
+	require.Len(t, parts, 1)
+	require.Equal(t, galleryAttachmentID, parts[0].AttachmentID)
+	require.Contains(t, parts[0].Content.Body, gif)
+	items, err := decodeGallery(parts[0].Extra)
+	require.NoError(t, err)
+	require.Len(t, items, 2)
 }

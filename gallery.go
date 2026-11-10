@@ -15,7 +15,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -149,6 +151,19 @@ func combineDiscordGallery(parts []*ConvertedMessage, count int) []*ConvertedMes
 		}
 	}
 	return []*ConvertedMessage{{AttachmentID: galleryAttachmentID, Type: event.EventMessage, Content: content, Extra: extra}}
+}
+
+// Additional Discord-only media stays reachable when an existing gallery is
+// edited to include an embed or sticker that cannot share its event mapping.
+func appendDiscordExtraLink(part *ConvertedMessage, rawURL string) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || strings.Contains(part.Content.Body, rawURL) {
+		return
+	}
+	part.Content.EnsureHasHTML()
+	part.Content.Body += "\n" + rawURL
+	escaped := html.EscapeString(rawURL)
+	part.Content.FormattedBody += `<br/><a href="` + escaped + `">` + escaped + `</a>`
 }
 
 // Stable Matrix transaction IDs make a retried Discord gallery create/edit

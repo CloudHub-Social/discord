@@ -303,7 +303,7 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 	}
 	// A gallery owns the caption and all successfully transferred attachments.
 	// If any transfer failed, retain the existing individual-message fallback.
-	if len(msg.Attachments) >= 2 && len(msg.StickerItems) == 0 && (forceGallery || portal.bridge.Config.Bridge.AttachmentGalleriesEnabled()) {
+	if len(msg.Attachments) >= 2 && (forceGallery || len(msg.StickerItems) == 0) && (forceGallery || portal.bridge.Config.Bridge.AttachmentGalleriesEnabled()) {
 		// Video embeds are separate events and must keep their existing mapping.
 		hasVideoEmbed := false
 		for _, embed := range msg.Embeds {
@@ -312,11 +312,15 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 				break
 			}
 		}
-		if !hasVideoEmbed {
+		if forceGallery || !hasVideoEmbed {
 			parts = combineDiscordGallery(parts, len(msg.Attachments))
 		}
 	}
 	for _, sticker := range msg.StickerItems {
+		if forceGallery && len(parts) == 1 && parts[0].AttachmentID == galleryAttachmentID {
+			appendDiscordExtraLink(parts[0], sticker.URL())
+			continue
+		}
 		if _, handled := handledIDs[sticker.ID]; handled {
 			continue
 		}
@@ -329,6 +333,10 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 	for i, embed := range msg.Embeds {
 		// Ignore non-video embeds, they're handled in convertDiscordTextMessage
 		if getEmbedType(msg, embed) != EmbedVideo {
+			continue
+		}
+		if forceGallery && len(parts) == 1 && parts[0].AttachmentID == galleryAttachmentID {
+			appendDiscordExtraLink(parts[0], embed.URL)
 			continue
 		}
 		// Discord deduplicates embeds by URL. It makes things easier for us too.
@@ -722,7 +730,7 @@ func (portal *Portal) convertDiscordTextMessage(ctx context.Context, intent *app
 		puppet.UpdateInfo(nil, msg.Interaction.User, nil)
 		htmlParts = append(htmlParts, fmt.Sprintf(msgInteractionTemplateHTML, puppet.MXID, puppet.Name, msg.Interaction.Name))
 	}
-	if msg.Content != "" && !isPlainGifMessage(msg) {
+	if msg.Content != "" && (len(msg.Attachments) > 0 || !isPlainGifMessage(msg)) {
 		htmlParts = append(htmlParts, portal.renderDiscordMarkdownOnlyHTML(msg.Content, true))
 	} else if msg.MessageReference != nil &&
 		msg.MessageReference.Type == discordgo.MessageReferenceTypeForward &&
