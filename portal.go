@@ -588,6 +588,9 @@ func (portal *Portal) handleDiscordMessages(msg portalDiscordMessage) {
 	if portal.MXID == "" {
 		msgCreate, ok := msg.msg.(*discordgo.MessageCreate)
 		if !ok {
+			if alert, isCall := msg.msg.(*discordCallAlert); isCall {
+				msg.user.callRings.complete(portal.Key.ChannelID, alert.ring, false)
+			}
 			portal.log.Warn().Msg("Can't create Matrix room from non new message event")
 			return
 		}
@@ -610,6 +613,8 @@ func (portal *Portal) handleDiscordMessages(msg portalDiscordMessage) {
 		portal.handleDiscordMessageUpdate(msg.user, convertedMsg.Message)
 	case *componentRefreshResult:
 		portal.handleDiscordMessageUpdateWithRefresh(msg.user, convertedMsg.message, true, convertedMsg.failed)
+	case *discordCallAlert:
+		portal.handleDiscordCallAlert(msg.user, convertedMsg)
 	case *discordPollVote:
 		portal.queuePollRefresh(msg.user, convertedMsg.messageID, true)
 	case *discordPollSnapshot:

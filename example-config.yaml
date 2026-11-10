@@ -203,6 +203,9 @@ bridge:
     # notifications for large guilds, since both use the same opcode-14 subscription.
     sync_discord_presence_to_matrix: false
 
+    # Alert in an existing DM when this Discord account is being called.
+    # This opens Discord; it does not bridge or answer audio calls.
+    discord_call_alerts: false
     # Allow voice status lookup in your private bridge management room.
     discord_voice_status: false
     # Should the Discord custom status TEXT be reflected onto Matrix? Needs the same
