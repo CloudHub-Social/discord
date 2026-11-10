@@ -72,3 +72,11 @@ func TestRenderWordleCardLines(t *testing.T) {
 		t.Fatalf("lost Wordle content or line breaks: %s", got)
 	}
 }
+
+func TestAdjacentTextDisplaysPreserveBlocks(t *testing.T) {
+	p := &Portal{}
+	got := p.renderDiscordComponents([]discordgo.MessageComponent{&discordgo.TextDisplay{Content: "First"}, &discordgo.Separator{}, &discordgo.TextDisplay{Content: "Second"}})
+	if !strings.Contains(got, "<p>First</p>") || !strings.Contains(got, "<p>Second</p>") {
+		t.Fatalf("text displays lack block boundaries: %s", got)
+	}
+}

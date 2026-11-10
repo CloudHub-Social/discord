@@ -53,7 +53,7 @@ func (portal *Portal) renderDiscordComponents(components []discordgo.MessageComp
 				render(c.Accessory)
 			}
 		case *discordgo.TextDisplay:
-			parts = append(parts, portal.renderDiscordMarkdownOnlyHTML(c.Content, true))
+			parts = append(parts, portal.renderDiscordMarkdownOnlyHTMLNoUnwrap(c.Content, true))
 		case *discordgo.Button:
 			label := c.Label
 			if c.Emoji != nil && c.Emoji.Name != "" {
