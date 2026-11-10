@@ -17,11 +17,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
+	"go.mau.fi/mautrix-discord/database"
 )
 
 func TestRenderDiscordComponents(t *testing.T) {
@@ -30,7 +32,7 @@ func TestRenderDiscordComponents(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
 	}
-	got := (&Portal{}).renderDiscordComponents(msg.Components)
+	got := (&Portal{}).renderDiscordComponents(msg.Components, "")
 	for _, want := range []string{"<strong>Wordle</strong>", "Play &lt;now&gt;", `href="https://example.org/?a=1&amp;b=2"`, "Choose", "One", "Use the Discord app"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in %s", want, got)
@@ -57,7 +59,7 @@ func TestRenderDiscordComponentsSafety(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := p.renderDiscordComponents(tc.components)
+			got := p.renderDiscordComponents(tc.components, "")
 			if !strings.Contains(got, tc.contains) || (tc.absent != "" && strings.Contains(got, tc.absent)) {
 				t.Errorf("unexpected output: %s", got)
 			}
@@ -67,7 +69,7 @@ func TestRenderDiscordComponentsSafety(t *testing.T) {
 
 func TestRenderWordleCardLines(t *testing.T) {
 	p := &Portal{}
-	got := p.renderDiscordComponents([]discordgo.MessageComponent{&discordgo.Container{Components: []discordgo.MessageComponent{&discordgo.TextDisplay{Content: "Wordle 1970 4/6*\n\n🟨⬛⬛\n🟩🟩🟩"}}}})
+	got := p.renderDiscordComponents([]discordgo.MessageComponent{&discordgo.Container{Components: []discordgo.MessageComponent{&discordgo.TextDisplay{Content: "Wordle 1970 4/6*\n\n🟨⬛⬛\n🟩🟩🟩"}}}}, "")
 	if !strings.Contains(got, "Wordle 1970") || !strings.Contains(got, "🟨⬛⬛") || !strings.Contains(got, "🟩🟩🟩") || !(strings.Contains(got, "<br") || strings.Contains(got, "</p>")) {
 		t.Fatalf("lost Wordle content or line breaks: %s", got)
 	}
@@ -75,8 +77,57 @@ func TestRenderWordleCardLines(t *testing.T) {
 
 func TestAdjacentTextDisplaysPreserveBlocks(t *testing.T) {
 	p := &Portal{}
-	got := p.renderDiscordComponents([]discordgo.MessageComponent{&discordgo.TextDisplay{Content: "First"}, &discordgo.Separator{}, &discordgo.TextDisplay{Content: "Second"}})
+	got := p.renderDiscordComponents([]discordgo.MessageComponent{&discordgo.TextDisplay{Content: "First"}, &discordgo.Separator{}, &discordgo.TextDisplay{Content: "Second"}}, "")
 	if !strings.Contains(got, "<p>First</p>") || !strings.Contains(got, "<p>Second</p>") {
 		t.Fatalf("text displays lack block boundaries: %s", got)
+	}
+}
+
+func TestDiscordMessageURL(t *testing.T) {
+	tests := []struct{ guild, channel, message, want string }{
+		{"", "123", "456", "https://discord.com/channels/@me/123/456"},
+		{"789", "123", "456", "https://discord.com/channels/789/123/456"},
+		{"789", "", "456", ""}, {"789", "123", "", ""},
+		{"bad/host", "123", "456", ""}, {"", "123/evil", "456", ""},
+	}
+	for _, tt := range tests {
+		if got := discordMessageURL(tt.guild, tt.channel, tt.message); got != tt.want {
+			t.Errorf("discordMessageURL(%q,%q,%q) = %q, want %q", tt.guild, tt.channel, tt.message, got, tt.want)
+		}
+	}
+}
+
+func TestComponentDiscordLinks(t *testing.T) {
+	portal := &Portal{}
+	messageURL := discordMessageURL("", "123", "456")
+	cases := []struct {
+		name         string
+		components   []discordgo.MessageComponent
+		want, absent string
+	}{
+		{"interactive", []discordgo.MessageComponent{&discordgo.Button{Label: "Play", Style: discordgo.PrimaryButton}}, `href="https://discord.com/channels/@me/123/456"`, ""},
+		{"spoiler", []discordgo.MessageComponent{&discordgo.Container{Spoiler: true}}, `href="https://discord.com/channels/@me/123/456"`, ""},
+		{"link", []discordgo.MessageComponent{&discordgo.Button{Label: "Visit", Style: discordgo.LinkButton, URL: "https://example.org/path?a=1&b=2"}}, `href="https://example.org/path?a=1&amp;b=2"`, "Open message in Discord"},
+		{"disabled", []discordgo.MessageComponent{&discordgo.Button{Label: "Visit", Style: discordgo.LinkButton, URL: "https://example.org", Disabled: true}}, "Visit (disabled)", "https://example.org"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := portal.renderDiscordComponents(tt.components, messageURL)
+			if !strings.Contains(got, tt.want) || (tt.absent != "" && strings.Contains(got, tt.absent)) {
+				t.Fatalf("unexpected result: %s", got)
+			}
+		})
+	}
+	if got := portal.renderDiscordComponents([]discordgo.MessageComponent{&discordgo.Button{Label: "Play"}}, ""); !strings.Contains(got, "Use the Discord app") || strings.Contains(got, "href=") {
+		t.Fatalf("missing fallback: %s", got)
+	}
+}
+
+func TestComponentDiscordLinkInMatrixMessage(t *testing.T) {
+	portal := &Portal{Portal: &database.Portal{}}
+	msg := &discordgo.Message{ID: "456", ChannelID: "123", Components: []discordgo.MessageComponent{&discordgo.Button{Label: "Play", Style: discordgo.PrimaryButton}}}
+	converted := portal.convertDiscordTextMessage(context.Background(), nil, msg)
+	if converted == nil || !strings.Contains(converted.Content.FormattedBody, `href="https://discord.com/channels/@me/123/456"`) {
+		t.Fatalf("missing Discord link in converted Matrix message: %#v", converted)
 	}
 }

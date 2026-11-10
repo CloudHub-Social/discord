@@ -758,7 +758,7 @@ func (portal *Portal) convertDiscordTextMessage(ctx context.Context, intent *app
 	}
 
 	if len(msg.Components) > 0 {
-		htmlParts = append(htmlParts, portal.renderDiscordComponents(msg.Components))
+		htmlParts = append(htmlParts, portal.renderDiscordComponents(msg.Components, discordMessageURL(portal.GuildID, msg.ChannelID, msg.ID)))
 	}
 
 	if len(htmlParts) == 0 {
