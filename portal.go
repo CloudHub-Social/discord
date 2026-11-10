@@ -46,6 +46,13 @@ type portalDiscordMessage struct {
 	thread *Thread
 }
 
+// componentRefreshResult re-enters the serialized portal queue after the
+// Discord REST lookup completes away from the event loop.
+type componentRefreshResult struct {
+	message *discordgo.Message
+	failed  bool
+}
+
 type portalMatrixMessage struct {
 	evt  *event.Event
 	user *User
@@ -73,7 +80,9 @@ type Portal struct {
 	commands     map[string]*discordgo.ApplicationCommand
 	commandsLock sync.RWMutex
 
-	forwardBackfillLock sync.Mutex
+	forwardBackfillLock   sync.Mutex
+	componentRefreshOnce  sync.Once
+	componentRefreshSlots chan struct{}
 
 	currentlyTyping     []id.UserID
 	currentlyTypingLock sync.Mutex
@@ -586,6 +595,8 @@ func (portal *Portal) handleDiscordMessages(msg portalDiscordMessage) {
 		portal.handleDiscordMessageCreate(msg.user, convertedMsg.Message, msg.thread)
 	case *discordgo.MessageUpdate:
 		portal.handleDiscordMessageUpdate(msg.user, convertedMsg.Message)
+	case *componentRefreshResult:
+		portal.handleDiscordMessageUpdateWithRefresh(msg.user, convertedMsg.message, true, convertedMsg.failed)
 	case *discordgo.MessageDelete:
 		portal.handleDiscordMessageDelete(msg.user, convertedMsg.Message)
 	case *discordgo.MessageDeleteBulk:
@@ -831,6 +842,83 @@ func prepareAttachmentPresentationEdit(part *ConvertedMessage, target id.EventID
 	part.Extra = galleryEditExtra(part.Extra)
 }
 
+// queueComponentRefresh schedules bounded, read-only recovery without blocking
+// the portal event loop. Saturation falls back to text handling with no edit
+// timestamp advancement, so a later update can retry.
+func (portal *Portal) queueComponentRefresh(user *User, update *discordgo.Message, existing *database.Message) bool {
+	if user == nil {
+		return false
+	}
+	user.Lock()
+	session := user.Session
+	user.Unlock()
+	if session == nil {
+		return false
+	}
+	portal.componentRefreshOnce.Do(func() { portal.componentRefreshSlots = make(chan struct{}, 8) })
+	select {
+	case portal.componentRefreshSlots <- struct{}{}:
+	default:
+		return false
+	}
+	go func() {
+		defer func() { <-portal.componentRefreshSlots }()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		opts := portal.RefererOptIfUser(session, existing.ThreadID)
+		opts = append(opts, discordgo.WithContext(ctx), discordgo.WithRetryOnRatelimit(false), discordgo.WithRestRetries(0))
+		var full *discordgo.Message
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			full, err = fetchGalleryMessage(session, existing.DiscordProtoChannelID(), update.ID, existing.SenderID, opts...)
+			if err == nil && galleryMessageIsCurrent(full, update) {
+				break
+			}
+			var limited *discordgo.RateLimitError
+			if !errors.As(err, &limited) || limited.RetryAfter <= 0 || limited.RetryAfter > 5*time.Second {
+				break
+			}
+			timer := time.NewTimer(limited.RetryAfter)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				err = ctx.Err()
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		failed := err != nil || !galleryMessageIsCurrent(full, update)
+		user.Lock()
+		sameSession := user.Session == session
+		user.Unlock()
+		if !sameSession {
+			failed = true
+		}
+		result := update
+		if !failed {
+			result = full
+			if result.Components == nil {
+				result.Components = []discordgo.MessageComponent{}
+			}
+			if result.Attachments == nil {
+				result.Attachments = []*discordgo.MessageAttachment{}
+			}
+		} else {
+			portal.log.Warn().Msg("Cannot refresh attachment presentation for component update")
+		}
+		queueTimer := time.NewTimer(5 * time.Second)
+		defer queueTimer.Stop()
+		select {
+		case portal.discordMessages <- portalDiscordMessage{user: user, msg: &componentRefreshResult{message: result, failed: failed}}:
+		case <-queueTimer.C:
+			portal.log.Warn().Msg("Could not queue refreshed component update")
+		}
+	}()
+	return true
+}
+
 // mergePartialDiscordMessage preserves omitted fields while applying explicit
 // slices. Empty content is ambiguous with absence in discordgo's message type.
 func mergePartialDiscordMessage(cached, update *discordgo.Message) {
@@ -899,6 +987,10 @@ func retainForwardSnapshotAttachments(attachmentMap map[string]*database.Message
 }
 
 func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Message) {
+	portal.handleDiscordMessageUpdateWithRefresh(user, msg, false, false)
+}
+
+func (portal *Portal) handleDiscordMessageUpdateWithRefresh(user *User, msg *discordgo.Message, refreshed, refreshFailed bool) {
 	log := portal.log.With().
 		Str("message_id", msg.ID).
 		Str("action", "discord message update").
@@ -931,10 +1023,10 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 		return
 	}
 
-	// Component updates can omit the attachment list. Fetch an authoritative
-	// snapshot before changing attachment presentation; absent is not empty.
-	componentSnapshotFailed := false
-	if msg.Components != nil && msg.Attachments == nil {
+	// Lookup runs outside the portal queue so unrelated messages are not held
+	// behind Discord latency or a rate-limit wait.
+	componentSnapshotFailed := refreshFailed
+	if !refreshed && msg.Components != nil && msg.Attachments == nil {
 		hasMappedAttachment := false
 		for _, part := range existing {
 			if part.AttachmentID != "" && isNumber(part.AttachmentID) {
@@ -943,23 +1035,11 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 			}
 		}
 		if hasMappedAttachment {
-			if user == nil || user.Session == nil {
-				componentSnapshotFailed = true
-			} else {
-				fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				opts := portal.RefererOptIfUser(user.Session, existing[0].ThreadID)
-				opts = append(opts, discordgo.WithContext(fetchCtx), discordgo.WithRetryOnRatelimit(false), discordgo.WithRestRetries(0))
-				full, err := fetchGalleryMessage(user.Session, existing[0].DiscordProtoChannelID(), msg.ID, existing[0].SenderID, opts...)
-				cancel()
-				if err != nil || !galleryMessageIsCurrent(full, msg) {
-					componentSnapshotFailed = true
-				} else {
-					msg = full
-				}
+			if portal.queueComponentRefresh(user, msg, existing[0]) {
+				return
 			}
-			if componentSnapshotFailed {
-				log.Warn().Msg("Cannot refresh attachment presentation for component update")
-			}
+			componentSnapshotFailed = true
+			log.Warn().Msg("Cannot schedule attachment presentation refresh")
 		}
 	}
 

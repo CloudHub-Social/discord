@@ -11,9 +11,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/stretchr/testify/require"
@@ -200,4 +202,69 @@ func TestFailedComponentMediaDoesNotClaimSuccessfulIdentity(t *testing.T) {
 	require.Len(t, actual, 1)
 	known = map[string]bool{failedComponentMediaID(actual[0].id): true}
 	require.Len(t, newComponentMedia([]discordgo.MessageComponent{component}, nil, known), 1)
+}
+
+func TestComponentRefreshIsAsynchronousAndQueuesFullMessage(t *testing.T) {
+	br, user, portal, _ := newRecoveryTest(t)
+	existing := br.DB.Message.GetFirstByDiscordID(portal.Key, recoveryTestMessageID)
+	user.Session.IsUser = true
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	user.Session.Client.Transport = presenceTestTransport(func(req *http.Request) (*http.Response, error) {
+		close(entered)
+		<-release
+		return recoverySourceResponse(t, &discordgo.Message{ID: recoveryTestMessageID, ChannelID: portal.Key.ChannelID, Author: &discordgo.User{ID: "2"}, Content: "updated"}), nil
+	})
+	update := &discordgo.Message{ID: recoveryTestMessageID, Components: []discordgo.MessageComponent{&discordgo.Button{Label: "x"}}}
+	require.True(t, portal.queueComponentRefresh(user, update, existing))
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lookup did not begin")
+	}
+	close(release)
+	select {
+	case queued := <-portal.discordMessages:
+		result, ok := queued.msg.(*componentRefreshResult)
+		require.True(t, ok)
+		require.False(t, result.failed)
+		require.Equal(t, "updated", result.message.Content)
+		require.NotNil(t, result.message.Attachments)
+		require.NotNil(t, result.message.Components)
+	case <-time.After(2 * time.Second):
+		t.Fatal("refreshed update not queued")
+	}
+}
+
+func TestComponentRefreshSaturationDoesNotBlock(t *testing.T) {
+	_, user, portal, _ := newRecoveryTest(t)
+	portal.componentRefreshOnce.Do(func() { portal.componentRefreshSlots = make(chan struct{}, 8) })
+	for i := 0; i < 8; i++ {
+		portal.componentRefreshSlots <- struct{}{}
+	}
+	require.False(t, portal.queueComponentRefresh(user, &discordgo.Message{ID: "1"}, &database.Message{}))
+}
+
+func TestComponentRefreshRetriesRateLimit(t *testing.T) {
+	br, user, portal, _ := newRecoveryTest(t)
+	existing := br.DB.Message.GetFirstByDiscordID(portal.Key, recoveryTestMessageID)
+	user.Session.IsUser = true
+	attempts := 0
+	user.Session.Client.Transport = presenceTestTransport(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"retry_after":0.01,"message":"rate limited"}`)), Request: req}, nil
+		}
+		return recoverySourceResponse(t, &discordgo.Message{ID: recoveryTestMessageID, ChannelID: portal.Key.ChannelID, Author: &discordgo.User{ID: "2"}}), nil
+	})
+	require.True(t, portal.queueComponentRefresh(user, &discordgo.Message{ID: recoveryTestMessageID}, existing))
+	select {
+	case queued := <-portal.discordMessages:
+		result, ok := queued.msg.(*componentRefreshResult)
+		require.True(t, ok)
+		require.False(t, result.failed)
+		require.Equal(t, 2, attempts)
+	case <-time.After(2 * time.Second):
+		t.Fatal("rate-limited update not retried")
+	}
 }
