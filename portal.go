@@ -631,8 +631,15 @@ func (portal *Portal) handleDiscordMessageCreate(user *User, msg *discordgo.Mess
 		Str("action", "discord message create").
 		Logger()
 	ctx := log.WithContext(context.Background())
+	if len(msg.Attachments) >= 2 && portal.Encrypted && portal.bridge.Crypto == nil {
+		log.Error().Msg("Cannot bridge gallery to encrypted room without crypto")
+		return
+	}
 
 	portal.recentMessages.Push(msg.ID, msg)
+	if portal.reconcileGalleryEcho(msg) {
+		return
+	}
 
 	existing := portal.bridge.DB.Message.GetByDiscordID(portal.Key, msg.ID)
 	if existing != nil {
@@ -683,7 +690,13 @@ func (portal *Portal) handleDiscordMessageCreate(user *User, msg *discordgo.Mess
 		// Only set mentions for first event, but keep empty object for rest
 		mentions = &event.Mentions{}
 
-		resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
+		var resp *mautrix.RespSendEvent
+		var err error
+		if part.AttachmentID == galleryAttachmentID {
+			resp, err = portal.sendDiscordGalleryEvent(intent, part.Content, part.Extra, ts.UnixMilli(), msg.ID, "create")
+		} else {
+			resp, err = portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
+		}
 		if err != nil {
 			log.Err(err).
 				Int("part_index", i).
@@ -832,6 +845,11 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 
 	if msg.Flags == discordgo.MessageFlagsHasThread {
 		portal.bridge.threadFound(ctx, user, existing[0], msg.ID, msg.Thread)
+	}
+
+	if existing[0].AttachmentID == galleryAttachmentID {
+		portal.handleDiscordGalleryUpdate(ctx, user, msg, existing[0])
+		return
 	}
 
 	if msg.Author == nil {
@@ -1577,6 +1595,10 @@ func (portal *Portal) handleMatrixMessage(sender *User, evt *event.Event) {
 		edits := portal.bridge.DB.Message.GetByMXID(portal.Key, editMXID)
 		if edits != nil {
 			newContentRaw, _ := evt.Content.Raw["m.new_content"].(map[string]any)
+			if edits.AttachmentID == galleryAttachmentID || content.NewContent.MsgType == galleryMessageType {
+				portal.handleMatrixGalleryEdit(sender, evt, edits, content.NewContent, newContentRaw, isWebhookSend)
+				return
+			}
 			discordContent, allowedMentions := portal.parseMatrixHTML(content.NewContent, parseAllowedLinkPreviews(newContentRaw))
 			var err error
 			var msg *discordgo.Message
@@ -1660,6 +1682,32 @@ func (portal *Portal) handleMatrixMessage(sender *User, evt *event.Event) {
 		if content.MsgType == event.MsgEmote {
 			sendReq.Content = fmt.Sprintf("_%s_", sendReq.Content)
 		}
+	case galleryMessageType:
+		if portal.bridge.DB.Message.GetByMXID(portal.Key, evt.ID) != nil {
+			go portal.sendMessageMetrics(evt, nil, "")
+			return
+		}
+		pending, err := portal.bridge.DB.Message.HasPendingGallery(evt.ID)
+		if err != nil {
+			go portal.sendMessageMetrics(evt, err, "Failed to check gallery send")
+			return
+		}
+		if pending {
+			go portal.sendMessageMetrics(evt, fmt.Errorf("gallery send has an unresolved earlier attempt; check Discord before retrying"), "Holding")
+			return
+		}
+		items, err := decodeGallery(evt.Content.Raw)
+		if err != nil {
+			go portal.sendMessageMetrics(evt, err, "Invalid gallery in")
+			return
+		}
+		galleryReq, err := portal.prepareMatrixGallery(sender, channelID, threadID, items, portal.bridge.Config.Bridge.UseDiscordCDNUpload && !isWebhookSend && sess.IsUser)
+		if err != nil {
+			go portal.sendMessageMetrics(evt, err, "Error preparing gallery in")
+			return
+		}
+		sendReq.Files, sendReq.Attachments = galleryReq.Files, galleryReq.Attachments
+		sendReq.Content, sendReq.AllowedMentions = portal.parseMatrixHTML(content, parseAllowedLinkPreviews(evt.Content.Raw))
 	case event.MsgAudio, event.MsgFile, event.MsgImage, event.MsgVideo:
 		data, err := downloadMatrixAttachment(portal.MainIntent(), content)
 		if err != nil {
@@ -1743,22 +1791,61 @@ func (portal *Portal) handleMatrixMessage(sender *User, evt *event.Event) {
 			sendReq.AllowedMentions.Parse = append(sendReq.AllowedMentions.Parse, discordgo.AllowedMentionTypeEveryone)
 		}
 	}
-	sendReq.Nonce = generateNonce()
+	isGallery := content.MsgType == galleryMessageType
+	if isGallery {
+		sendReq.Nonce = galleryNonce(evt.ID)
+		senderID := sender.DiscordID
+		if isWebhookSend {
+			senderID = portal.RelayWebhookID
+		}
+		reserved, err := portal.bridge.DB.Message.ReserveGallery(database.GalleryPending{MXID: evt.ID, Channel: portal.Key, ThreadID: threadID, SenderID: senderID, SenderMXID: sender.MXID, Nonce: sendReq.Nonce})
+		if err != nil {
+			go portal.sendMessageMetrics(evt, err, "Failed to reserve gallery send")
+			return
+		}
+		if !reserved {
+			go portal.sendMessageMetrics(evt, fmt.Errorf("gallery send has an unresolved earlier attempt; check Discord before retrying"), "Holding")
+			return
+		}
+	} else {
+		sendReq.Nonce = generateNonce()
+	}
 	var msg *discordgo.Message
 	var err error
 	if !isWebhookSend {
-		msg, err = sess.ChannelMessageSendComplex(channelID, &sendReq, portal.RefererOptIfUser(sess, threadID)...)
+		opts := portal.RefererOptIfUser(sess, threadID)
+		if isGallery {
+			opts = append(opts, discordgo.WithRestRetries(0))
+		}
+		msg, err = sess.ChannelMessageSendComplex(channelID, &sendReq, opts...)
 	} else {
 		username, avatarURL := portal.getRelayUserMeta(sender)
+		opts := []discordgo.RequestOption{}
+		if isGallery {
+			opts = append(opts, discordgo.WithRestRetries(0))
+		}
 		msg, err = relayClient.WebhookThreadExecute(portal.RelayWebhookID, portal.RelayWebhookSecret, true, threadID, &discordgo.WebhookParams{
 			Content:         sendReq.Content,
 			Username:        username,
 			AvatarURL:       avatarURL,
 			Files:           sendReq.Files,
+			Attachments:     sendReq.Attachments,
 			Components:      sendReq.Components,
 			Embeds:          sendReq.Embeds,
 			AllowedMentions: sendReq.AllowedMentions,
-		})
+		}, opts...)
+	}
+	if isGallery && err == nil && (msg == nil || msg.ID == "") {
+		err = fmt.Errorf("Discord returned no message ID; gallery send outcome is unknown")
+		msg = nil
+	}
+	if isGallery && err != nil {
+		var restErr *discordgo.RESTError
+		if errors.As(err, &restErr) && restErr.Response != nil && restErr.Response.StatusCode >= 400 && restErr.Response.StatusCode < 500 && restErr.Response.StatusCode != 408 {
+			if clearErr := portal.bridge.DB.Message.ClearPendingGallery(evt.ID); clearErr != nil {
+				portal.log.Err(clearErr).Msg("Failed to clear rejected gallery send")
+			}
+		}
 	}
 	sender.handlePossible40002(err)
 	go portal.sendMessageMetrics(evt, err, "Error sending")
@@ -1766,7 +1853,9 @@ func (portal *Portal) handleMatrixMessage(sender *User, evt *event.Event) {
 		dbMsg := portal.bridge.DB.Message.New()
 		dbMsg.Channel = portal.Key
 		dbMsg.DiscordID = msg.ID
-		if len(msg.Attachments) > 0 {
+		if content.MsgType == galleryMessageType {
+			dbMsg.AttachmentID = galleryAttachmentID
+		} else if len(msg.Attachments) > 0 {
 			dbMsg.AttachmentID = msg.Attachments[0].ID
 		}
 		dbMsg.MXID = evt.ID
@@ -1779,6 +1868,11 @@ func (portal *Portal) handleMatrixMessage(sender *User, evt *event.Event) {
 		dbMsg.Timestamp, _ = discordgo.SnowflakeTimestamp(msg.ID)
 		dbMsg.ThreadID = threadID
 		dbMsg.Insert()
+		if isGallery {
+			if clearErr := portal.bridge.DB.Message.ClearPendingGallery(evt.ID); clearErr != nil {
+				portal.log.Err(clearErr).Msg("Failed to clear completed gallery send")
+			}
+		}
 	}
 }
 

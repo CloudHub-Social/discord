@@ -150,6 +150,7 @@ func (portal *Portal) convertDiscordAttachment(ctx context.Context, intent *apps
 		Info: &event.FileInfo{
 			Height:   att.Height,
 			MimeType: att.ContentType,
+			Duration: int(att.DurationSeconds * 1000),
 			Width:    att.Width,
 
 			// This gets overwritten later after the file is uploaded to the homeserver
@@ -186,7 +187,7 @@ func (portal *Portal) convertDiscordAttachment(ctx context.Context, intent *apps
 		content.MsgType = event.MsgFile
 	}
 	mxc := portal.bridge.DMA.AttachmentMXC(portal.Key.ChannelID, messageID, att)
-	if mxc.IsEmpty() {
+	if mxc.IsEmpty() || portal.Encrypted {
 		content = portal.convertDiscordFile(ctx, "attachment", intent, att.ID, att.URL, content)
 	} else {
 		content.URL = mxc.CUString()
@@ -293,6 +294,21 @@ func (portal *Portal) convertDiscordMessage(ctx context.Context, puppet *Puppet,
 		log := log.With().Str("attachment_id", att.ID).Logger()
 		if part := portal.convertDiscordAttachment(log.WithContext(ctx), intent, msg.ID, att); part != nil {
 			parts = append(parts, part)
+		}
+	}
+	// A gallery owns the caption and all successfully transferred attachments.
+	// If any transfer failed, retain the existing individual-message fallback.
+	if len(msg.Attachments) >= 2 && len(msg.StickerItems) == 0 {
+		// Video embeds are separate events and must keep their existing mapping.
+		hasVideoEmbed := false
+		for _, embed := range msg.Embeds {
+			if getEmbedType(msg, embed) == EmbedVideo {
+				hasVideoEmbed = true
+				break
+			}
+		}
+		if !hasVideoEmbed {
+			parts = combineDiscordGallery(parts, len(msg.Attachments))
 		}
 	}
 	for _, sticker := range msg.StickerItems {

@@ -1,0 +1,5 @@
+# Gallery send reservation migration
+
+Revision 25 adds the small `gallery_pending` table to record a Matrix gallery event before sending it to Discord. The table prevents a retry from silently sending a second message after an uncertain network result. No existing rows or tables are changed. A gateway echo with the matching nonce can reconcile a user-session send; otherwise an unresolved reservation requires operator investigation before retry.
+
+Before production, test the upgrade from a copy of the deployed PostgreSQL schema and a fresh SQLite database, verify a recent database backup, record the bridge image and revision, and check that the migration creates the table without changing existing message counts. On rollback, stop the new bridge, restore the prior image, and retain the additive table: the prior bridge ignores it. Do not remove pending records or drop the table until their outcomes have been reconciled and a separate cleanup is approved. Check bridge health, pending reservations, message flow and presence after rollout.
