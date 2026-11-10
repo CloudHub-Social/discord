@@ -104,8 +104,7 @@ func (portal *Portal) finishPollRefresh(user *User, snapshot *discordPollSnapsho
 	}
 	portal.pollRefreshLock.Unlock()
 	if changed {
-		portal.queuePollRefresh(user, snapshot.messageID, false)
-		return
+		defer portal.queuePollRefresh(user, snapshot.messageID, false)
 	}
 	if snapshot.message == nil || snapshot.message.Poll == nil {
 		portal.log.Warn().Msg("Discord poll refresh did not return a poll")
@@ -142,6 +141,10 @@ func (portal *Portal) finishPollRefresh(user *User, snapshot *discordPollSnapsho
 		}
 		if _, err := portal.sendMatrixMessage(intent, event.EventMessage, converted.Content, extra, 0); err != nil {
 			portal.log.Err(err).Msg("Failed to send refreshed Discord poll")
+		} else if portal.recentMessages != nil {
+			if cached, ok := portal.recentMessages.Get(snapshot.messageID); ok {
+				cached.Poll = snapshot.message.Poll
+			}
 		}
 		return
 	}
