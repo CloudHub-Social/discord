@@ -433,7 +433,7 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 						continue
 					}
 					part := portal.convertComponentMedia(intent, media)
-					part.AttachmentID = "forward_" + media.id
+					part.AttachmentID = "forward_" + part.AttachmentID
 					parts = append(parts, part)
 				}
 			}

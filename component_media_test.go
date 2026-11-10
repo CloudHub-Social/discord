@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
@@ -186,4 +187,17 @@ func TestPreserveComponentMediaOnFailure(t *testing.T) {
 			require.True(t, unrelated)
 		})
 	}
+}
+
+func TestFailedComponentMediaDoesNotClaimSuccessfulIdentity(t *testing.T) {
+	media := componentMedia{id: "component_123"}
+	failed := failedComponentMediaID(media.id)
+	require.NotEqual(t, media.id, failed)
+	require.True(t, strings.HasPrefix(failed, "component_"))
+	known := map[string]bool{failed: true}
+	component := &discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/a.png"}}
+	actual := collectComponentMedia([]discordgo.MessageComponent{component})
+	require.Len(t, actual, 1)
+	known = map[string]bool{failedComponentMediaID(actual[0].id): true}
+	require.Len(t, newComponentMedia([]discordgo.MessageComponent{component}, nil, known), 1)
 }

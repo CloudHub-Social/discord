@@ -90,6 +90,12 @@ func collectComponentMedia(components []discordgo.MessageComponent) []componentM
 	return out
 }
 
+// A failure notice must not occupy the successful media identity; a later
+// Discord update can then retry a refreshed URL and replace the notice.
+func failedComponentMediaID(mediaID string) string {
+	return "component_failed_" + strings.TrimPrefix(mediaID, "component_")
+}
+
 func checkComponentMediaRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 || !trustedComponentMediaURL(req.URL.String()) {
 		return fmt.Errorf("untrusted component media redirect")
@@ -101,7 +107,7 @@ func (portal *Portal) convertComponentMedia(intent *appservice.IntentAPI, m comp
 	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: checkComponentMediaRedirect}
 	dbFile, err := portal.bridge.copyAttachmentToMatrixWithClient(intent, m.url, portal.Encrypted, AttachmentMeta{AttachmentID: m.id}, client)
 	if err != nil {
-		return &ConvertedMessage{AttachmentID: m.id, Type: event.EventMessage, Content: portal.createMediaFailedMessage(fmt.Errorf("could not copy Discord card media"))}
+		return &ConvertedMessage{AttachmentID: failedComponentMediaID(m.id), Type: event.EventMessage, Content: portal.createMediaFailedMessage(fmt.Errorf("could not copy Discord card media"))}
 	}
 	filename := path.Base(strings.SplitN(m.url, "?", 2)[0])
 	if filename == "." || filename == "/" || filename == "" {
