@@ -9,16 +9,15 @@ import (
 	"maunium.net/go/mautrix/bridge/commands"
 )
 
-type voiceStatusEntry struct{ user, channel string }
+type voiceStatusEntry struct{ user, channel, channelID string }
 
 // snapshotVoiceStatus copies only data for one requested guild while holding
 // discordgo's state lock; the cache may be incomplete for a user session.
-func snapshotVoiceStatus(state *discordgo.State, guildID string) ([]voiceStatusEntry, bool) {
-	if state == nil || guildID == "" || !isNumber(guildID) {
+func snapshotVoiceStatus(state *discordgo.State, guildID, userID string) ([]voiceStatusEntry, bool) {
+	if state == nil || guildID == "" || !isNumber(guildID) || userID == "" {
 		return nil, false
 	}
 	state.RLock()
-	defer state.RUnlock()
 	var guild *discordgo.Guild
 	for _, candidate := range state.Guilds {
 		if candidate != nil && candidate.ID == guildID {
@@ -27,6 +26,7 @@ func snapshotVoiceStatus(state *discordgo.State, guildID string) ([]voiceStatusE
 		}
 	}
 	if guild == nil || guild.Unavailable {
+		state.RUnlock()
 		return nil, false
 	}
 	channels := make(map[string]string)
@@ -66,8 +66,17 @@ func snapshotVoiceStatus(state *discordgo.State, guildID string) ([]voiceStatusE
 		if name == "" {
 			name = "Discord user " + voice.UserID
 		}
-		result = append(result, voiceStatusEntry{user: name, channel: channel})
+		result = append(result, voiceStatusEntry{user: name, channel: channel, channelID: voice.ChannelID})
 	}
+	state.RUnlock()
+	visible := result[:0]
+	for _, entry := range result {
+		permissions, err := state.UserChannelPermissions(userID, entry.channelID)
+		if err == nil && permissions&discordgo.PermissionViewChannel != 0 {
+			visible = append(visible, entry)
+		}
+	}
+	result = visible
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].channel == result[j].channel {
 			return result[i].user < result[j].user
@@ -96,13 +105,13 @@ func fnVoiceStatus(ce *WrappedCommandEvent) {
 		return
 	}
 	ce.User.Lock()
-	session := ce.User.Session
+	session, discordID := ce.User.Session, ce.User.DiscordID
 	ce.User.Unlock()
 	if session == nil || session.State == nil || !ce.User.Connected() {
 		ce.Reply("Discord is not connected.")
 		return
 	}
-	entries, known := snapshotVoiceStatus(session.State, ce.Args[0])
+	entries, known := snapshotVoiceStatus(session.State, ce.Args[0], discordID)
 	if !known {
 		ce.Reply("That server is not available in the Discord session cache.")
 		return
