@@ -62,6 +62,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "delete_guild_on_leave")
 	helper.Copy(up.Bool, "bridge", "federate_rooms")
 	helper.Copy(up.Bool, "bridge", "prefix_webhook_messages")
+	helper.Copy(up.Bool, "bridge", "discord_attachment_galleries")
 	helper.Copy(up.Bool, "bridge", "enable_webhook_avatars")
 	helper.Copy(up.Bool, "bridge", "use_discord_cdn_upload")
 	helper.Copy(up.Bool, "bridge", "forbid_dming_strangers")

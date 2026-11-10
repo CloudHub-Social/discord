@@ -1,4 +1,4 @@
--- v0 -> v24 (compatible with v19+): Latest revision
+-- v0 -> v25 (compatible with v19+): Latest revision
 
 CREATE TABLE guild (
     dcid       TEXT PRIMARY KEY,
@@ -178,3 +178,13 @@ CREATE TABLE discord_file (
 );
 
 CREATE INDEX discord_file_mxc_idx ON discord_file (mxc);
+
+CREATE TABLE gallery_pending (
+    mxid TEXT PRIMARY KEY,
+    dc_chan_id TEXT NOT NULL,
+    dc_chan_receiver TEXT NOT NULL,
+    dc_thread_id TEXT NOT NULL,
+    dc_sender TEXT NOT NULL,
+    sender_mxid TEXT NOT NULL,
+    nonce TEXT NOT NULL UNIQUE
+);

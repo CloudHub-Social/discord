@@ -258,6 +258,10 @@ func (portal *Portal) convertMessageBatch(log zerolog.Logger, source *User, mess
 	metas := make([]*discordgo.Message, 0, len(messages))
 	ctx := context.Background()
 	for _, msg := range messages {
+		if len(msg.Attachments) >= 2 && portal.Encrypted && portal.bridge.Crypto == nil {
+			log.Error().Str("message_id", msg.ID).Msg("Cannot backfill gallery to encrypted room without crypto")
+			continue
+		}
 		for _, mention := range msg.Mentions {
 			puppet := portal.bridge.GetPuppetByID(mention.ID)
 			puppet.UpdateInfo(nil, mention, nil)
@@ -277,6 +281,10 @@ func (portal *Portal) convertMessageBatch(log zerolog.Logger, source *User, mess
 			Logger()
 		parts := portal.convertDiscordMessage(log.WithContext(ctx), puppet, intent, msg)
 		for i, part := range parts {
+			if part.AttachmentID == galleryAttachmentID && portal.Encrypted && portal.bridge.Crypto == nil {
+				log.Error().Msg("Cannot backfill gallery into encrypted room without crypto")
+				continue
+			}
 			if (replyTo != nil || threadRootEvent != "") && part.Content.RelatesTo == nil {
 				part.Content.RelatesTo = &event.RelatesTo{}
 			}
