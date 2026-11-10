@@ -1130,9 +1130,11 @@ func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 		switch evt.Type {
 		case "CALL_CREATE", "CALL_UPDATE", "CALL_DELETE":
 			if user.bridge.Config.Bridge.DiscordCallAlerts {
-				channelID, messageID, ring := user.callRings.accept(generation, epoch, evt.Sequence, evt.Type, evt.RawData, user.DiscordID)
-				if ring {
-					user.pushPortalMessage(&discordCallAlert{messageID: messageID}, "incoming call", channelID, "")
+				channelID, ring, notify := user.callRings.accept(generation, epoch, evt.Sequence, evt.Type, evt.RawData, user.DiscordID)
+				if notify {
+					if !user.pushPortalMessage(&discordCallAlert{ring: ring}, "incoming call", channelID, "") {
+						user.callRings.complete(channelID, ring, false)
+					}
 				}
 			}
 		case "READY", "READY_SUPPLEMENTAL":
@@ -2673,10 +2675,10 @@ func (user *User) findPortal(channelID string) (*Portal, *Thread) {
 	return nil, nil
 }
 
-func (user *User) pushPortalMessage(msg interface{}, typeName, channelID, guildID string) {
+func (user *User) pushPortalMessage(msg interface{}, typeName, channelID, guildID string) bool {
 	if user.getGuildBridgingMode(guildID) <= database.GuildBridgeNothing {
 		// If guild bridging mode is nothing, don't even check if the portal exists
-		return
+		return false
 	}
 
 	portal, thread := user.findPortal(channelID)
@@ -2686,10 +2688,13 @@ func (user *User) pushPortalMessage(msg interface{}, typeName, channelID, guildI
 			Str("guild_id", guildID).
 			Str("channel_id", channelID).
 			Msg("Dropping event in unknown channel")
-		return
+		return false
 	}
 	if mode := user.getGuildBridgingMode(portal.GuildID); mode <= database.GuildBridgeNothing || (portal.MXID == "" && mode <= database.GuildBridgeIfPortalExists) {
-		return
+		return false
+	}
+	if _, isCall := msg.(*discordCallAlert); isCall && portal.MXID == "" {
+		return false
 	}
 
 	wrappedMsg := portalDiscordMessage{
@@ -2707,6 +2712,7 @@ func (user *User) pushPortalMessage(msg interface{}, typeName, channelID, guildI
 			Msg("Portal message buffer is full")
 		portal.discordMessages <- wrappedMsg
 	}
+	return true
 }
 
 type CustomReadReceipt struct {

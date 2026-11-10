@@ -10,7 +10,11 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
-type discordCallAlert struct{ messageID string }
+type ringKey struct {
+	messageID string
+	serial    uint64
+}
+type discordCallAlert struct{ ring ringKey }
 
 func discordCallAlertContent(channelID, messageID string, recipient id.UserID) *event.MessageEventContent {
 	link := discordMessageURL("", channelID, messageID)
@@ -27,6 +31,8 @@ func discordCallAlertContent(channelID, messageID string, recipient id.UserID) *
 }
 
 func (portal *Portal) handleDiscordCallAlert(user *User, alert *discordCallAlert) {
+	delivered := false
+	defer func() { user.callRings.complete(portal.Key.ChannelID, alert.ring, delivered) }()
 	if portal.Type != discordgo.ChannelTypeDM && portal.Type != discordgo.ChannelTypeGroupDM {
 		return
 	}
@@ -34,22 +40,24 @@ func (portal *Portal) handleDiscordCallAlert(user *User, alert *discordCallAlert
 		portal.log.Warn().Msg("Cannot send Discord call alert without room encryption")
 		return
 	}
-	if !user.callRings.isRinging(portal.Key.ChannelID, alert.messageID) {
+	if !user.callRings.isRinging(portal.Key.ChannelID, alert.ring) {
 		return
 	}
-	content := discordCallAlertContent(portal.Key.ChannelID, alert.messageID, user.MXID)
+	content := discordCallAlertContent(portal.Key.ChannelID, alert.ring.messageID, user.MXID)
 	if content == nil {
 		return
 	}
 	if _, err := portal.sendMatrixMessage(portal.MainIntent(), event.EventMessage, content, nil, 0); err != nil {
 		portal.log.Err(err).Msg("Failed to send Discord call alert")
+	} else {
+		delivered = true
 	}
 }
 
-func (tracker *callRingTracker) isRinging(channelID, messageID string) bool {
+func (tracker *callRingTracker) isRinging(channelID string, ring ringKey) bool {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	return tracker.active[channelID] == messageID && messageID != ""
+	return tracker.active[channelID] == ring && ring.serial != 0
 }
 
 // discordCallSignal represents the private, user-session gateway payload. A
@@ -69,43 +77,68 @@ type callRingTracker struct {
 	generation   uint64
 	epoch        uint64
 	lastSequence map[string]int64
-	active       map[string]string
+	active       map[string]ringKey
+	pending      map[string]ringKey
+	delivered    map[string]ringKey
+	nextSerial   uint64
 }
 
-func (tracker *callRingTracker) accept(generation, epoch uint64, sequence int64, kind string, raw json.RawMessage, self string) (string, string, bool) {
+func (tracker *callRingTracker) complete(channelID string, ring ringKey, delivered bool) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.active[channelID] != ring || tracker.pending[channelID] != ring {
+		return
+	}
+	delete(tracker.pending, channelID)
+	if delivered {
+		tracker.delivered[channelID] = ring
+	}
+}
+
+func (tracker *callRingTracker) accept(generation, epoch uint64, sequence int64, kind string, raw json.RawMessage, self string) (string, ringKey, bool) {
 	var call discordCallSignal
 	if json.Unmarshal(raw, &call) != nil || call.ChannelID == "" || !isNumber(call.ChannelID) || call.GuildID != "" || self == "" {
-		return "", "", false
+		return "", ringKey{}, false
 	}
 	if kind != "CALL_CREATE" && kind != "CALL_UPDATE" && kind != "CALL_DELETE" {
-		return "", "", false
+		return "", ringKey{}, false
 	}
 	if kind != "CALL_DELETE" && (call.MessageID == "" || !isNumber(call.MessageID) || call.Ringing == nil) {
-		return "", "", false
+		return "", ringKey{}, false
 	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	if generation < tracker.generation || (generation == tracker.generation && epoch < tracker.epoch) {
-		return "", "", false
+		return "", ringKey{}, false
 	}
 	if generation != tracker.generation || epoch != tracker.epoch {
 		tracker.generation, tracker.epoch = generation, epoch
 		tracker.lastSequence = make(map[string]int64)
-		tracker.active = make(map[string]string)
+		tracker.active = make(map[string]ringKey)
+		tracker.pending = make(map[string]ringKey)
+		tracker.delivered = make(map[string]ringKey)
 	}
 	if tracker.lastSequence == nil {
 		tracker.lastSequence = make(map[string]int64)
 	}
 	if sequence <= tracker.lastSequence[call.ChannelID] {
-		return "", "", false
+		return "", ringKey{}, false
 	}
 	tracker.lastSequence[call.ChannelID] = sequence
 	if tracker.active == nil {
-		tracker.active = make(map[string]string)
+		tracker.active = make(map[string]ringKey)
+	}
+	if tracker.pending == nil {
+		tracker.pending = make(map[string]ringKey)
+	}
+	if tracker.delivered == nil {
+		tracker.delivered = make(map[string]ringKey)
 	}
 	if kind == "CALL_DELETE" || call.Unavailable {
 		delete(tracker.active, call.ChannelID)
-		return "", "", false
+		delete(tracker.pending, call.ChannelID)
+		delete(tracker.delivered, call.ChannelID)
+		return "", ringKey{}, false
 	}
 	ringing := false
 	for _, id := range *call.Ringing {
@@ -116,11 +149,19 @@ func (tracker *callRingTracker) accept(generation, epoch uint64, sequence int64,
 	}
 	if !ringing {
 		delete(tracker.active, call.ChannelID)
-		return "", "", false
+		delete(tracker.pending, call.ChannelID)
+		delete(tracker.delivered, call.ChannelID)
+		return "", ringKey{}, false
 	}
-	if tracker.active[call.ChannelID] == call.MessageID {
-		return "", "", false
+	ring := tracker.active[call.ChannelID]
+	if ring.messageID != call.MessageID || ring.serial == 0 {
+		tracker.nextSerial++
+		ring = ringKey{messageID: call.MessageID, serial: tracker.nextSerial}
+		tracker.active[call.ChannelID] = ring
 	}
-	tracker.active[call.ChannelID] = call.MessageID
-	return call.ChannelID, call.MessageID, true
+	if tracker.pending[call.ChannelID] == ring || tracker.delivered[call.ChannelID] == ring {
+		return "", ringKey{}, false
+	}
+	tracker.pending[call.ChannelID] = ring
+	return call.ChannelID, ring, true
 }

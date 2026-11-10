@@ -11,18 +11,22 @@ import (
 func TestCallRingTracker(t *testing.T) {
 	var tracker callRingTracker
 	ring := json.RawMessage(`{"channel_id":"10","message_id":"20","ringing":["1"]}`)
-	_, _, notify := tracker.accept(1, 1, 1, "CALL_CREATE", ring, "1")
+	_, first, notify := tracker.accept(1, 1, 1, "CALL_CREATE", ring, "1")
 	require.True(t, notify)
-	require.True(t, tracker.isRinging("10", "20"))
+	require.True(t, tracker.isRinging("10", first))
 	_, _, notify = tracker.accept(1, 1, 2, "CALL_UPDATE", ring, "1")
 	require.False(t, notify, "repeated ring is deduplicated")
 	_, _, notify = tracker.accept(1, 1, 3, "CALL_UPDATE", json.RawMessage(`{"channel_id":"10","message_id":"20"}`), "1")
 	require.False(t, notify, "missing ringing list is not an end")
 	_, _, notify = tracker.accept(1, 1, 4, "CALL_UPDATE", json.RawMessage(`{"channel_id":"10","message_id":"20","ringing":[]}`), "1")
 	require.False(t, notify)
-	require.False(t, tracker.isRinging("10", "20"))
-	_, _, notify = tracker.accept(1, 1, 5, "CALL_UPDATE", ring, "1")
+	require.False(t, tracker.isRinging("10", first))
+	_, second, notify := tracker.accept(1, 1, 5, "CALL_UPDATE", ring, "1")
 	require.True(t, notify, "a fresh ring after stop is delivered")
+	require.NotEqual(t, first, second)
+	require.False(t, tracker.isRinging("10", first), "canceled alert must stay canceled")
+	tracker.complete("10", first, true)
+	require.True(t, tracker.isRinging("10", second), "stale completion must not consume the new ring")
 	_, _, notify = tracker.accept(1, 1, 4, "CALL_UPDATE", ring, "1")
 	require.False(t, notify, "out of order events are ignored")
 	_, _, notify = tracker.accept(1, 2, 1, "CALL_CREATE", ring, "1")
@@ -39,6 +43,19 @@ func TestCallRingTrackerRejectsInvalidOrUnrelatedEvents(t *testing.T) {
 		_, _, notify := tracker.accept(1, 1, 1, "CALL_CREATE", json.RawMessage(raw), "1")
 		require.False(t, notify)
 	}
+}
+
+func TestCallRingTrackerRetriesFailedDelivery(t *testing.T) {
+	var tracker callRingTracker
+	ring := json.RawMessage(`{"channel_id":"10","message_id":"20","ringing":["1"]}`)
+	_, first, notify := tracker.accept(1, 1, 1, "CALL_CREATE", ring, "1")
+	require.True(t, notify)
+	tracker.complete("10", first, false)
+	_, retry, notify := tracker.accept(1, 1, 2, "CALL_UPDATE", ring, "1")
+	require.True(t, notify)
+	tracker.complete("10", retry, true)
+	_, _, notify = tracker.accept(1, 1, 3, "CALL_UPDATE", ring, "1")
+	require.False(t, notify)
 }
 
 func TestDiscordCallAlertContent(t *testing.T) {
