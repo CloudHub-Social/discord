@@ -10,10 +10,11 @@ package main
 
 import (
 	"context"
-	"github.com/bwmarrin/discordgo"
-	"go.mau.fi/mautrix-discord/database"
 	"strings"
 	"testing"
+
+	"github.com/bwmarrin/discordgo"
+	"go.mau.fi/mautrix-discord/database"
 )
 
 func TestDiscordPollHTML(t *testing.T) {

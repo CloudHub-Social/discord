@@ -10,10 +10,11 @@ package main
 
 import (
 	"context"
-	"github.com/bwmarrin/discordgo"
-	"github.com/stretchr/testify/require"
 	"net/http"
 	"testing"
+
+	"github.com/bwmarrin/discordgo"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTrustedComponentMediaURL(t *testing.T) {
