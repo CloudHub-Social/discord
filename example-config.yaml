@@ -206,6 +206,8 @@ bridge:
     # Alert in an existing DM when this Discord account is being called.
     # This opens Discord; it does not bridge or answer audio calls.
     discord_call_alerts: false
+    # Allow voice status lookup in your private bridge management room.
+    discord_voice_status: false
     # Should the Discord custom status TEXT be reflected onto Matrix? Needs the same
     # guild subscription as presence, so enabling either one drives subscriptions.
     # With presence read off but this on, the puppet is shown "online" to carry the text.

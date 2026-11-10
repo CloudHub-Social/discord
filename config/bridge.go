@@ -88,6 +88,7 @@ type BridgeConfig struct {
 	// it also disables Discord→Matrix typing notifications for large guilds, since
 	// both ride the same opcode-14 subscription.
 	SyncDiscordPresenceToMatrix bool `yaml:"sync_discord_presence_to_matrix"`
+	DiscordVoiceStatus          bool `yaml:"discord_voice_status"`
 
 	// DiscordCallAlerts posts a link when Discord reports that this account is ringing.
 	DiscordCallAlerts bool `yaml:"discord_call_alerts"`
