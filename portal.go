@@ -854,6 +854,19 @@ func mergePartialDiscordMessage(cached, update *discordgo.Message) {
 	}
 }
 
+// preserveComponentMediaOnFailure keeps earlier media when replacements fail,
+// except when a new spoiler could make retaining an old event disclose content.
+func preserveComponentMediaOnFailure(attachmentMap map[string]*database.Message, failed bool, components []discordgo.MessageComponent) {
+	if !failed || len(componentSpoilers(components)) > 0 {
+		return
+	}
+	for attachmentID := range attachmentMap {
+		if strings.HasPrefix(attachmentID, "component_") {
+			delete(attachmentMap, attachmentID)
+		}
+	}
+}
+
 // retainForwardSnapshotAttachments removes existing snapshot items from the redaction set.
 // Nil means Discord omitted the snapshot; an empty slice explicitly removes it.
 func retainForwardSnapshotAttachments(attachmentMap map[string]*database.Message, snapshots []discordgo.MessageSnapshot) {
@@ -1083,6 +1096,7 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 			delete(attachmentMap, media.id)
 		}
 	}
+	preserveComponentMediaOnFailure(attachmentMap, componentUpdateFailed, msg.Components)
 	for _, remainingSticker := range msg.StickerItems {
 		if _, found := attachmentMap[remainingSticker.ID]; found {
 			delete(attachmentMap, remainingSticker.ID)

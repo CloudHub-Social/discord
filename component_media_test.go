@@ -16,6 +16,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/stretchr/testify/require"
+	"go.mau.fi/mautrix-discord/database"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -166,4 +167,23 @@ func TestMergePartialDiscordMessage(t *testing.T) {
 	require.Len(t, original.Attachments, 1)
 	require.NotNil(t, original.Components)
 	require.Empty(t, original.Components)
+}
+
+func TestPreserveComponentMediaOnFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		failed, spoiler, wantPreserved bool
+	}{
+		{"successful removal", false, false, false}, {"failed replacement", true, false, true}, {"failed spoiler update", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pending := map[string]*database.Message{"component_old": nil, "other": nil}
+			components := []discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/new.png"}, Spoiler: tc.spoiler}}
+			preserveComponentMediaOnFailure(pending, tc.failed, components)
+			_, remains := pending["component_old"]
+			require.Equal(t, !tc.wantPreserved, remains)
+			_, unrelated := pending["other"]
+			require.True(t, unrelated)
+		})
+	}
 }
