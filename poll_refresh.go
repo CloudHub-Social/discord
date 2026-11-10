@@ -14,6 +14,12 @@ type pollRefreshState struct {
 	inFlight   bool
 }
 
+func retainRefreshedPoll(cached, refreshed *discordgo.Message) {
+	if cached != nil && refreshed != nil && refreshed.Poll != nil {
+		cached.Poll = refreshed.Poll
+	}
+}
+
 // queuePollRefresh coalesces bursts of vote events into authoritative, bounded
 // reads instead of counting events, which may be duplicated or lost.
 func (portal *Portal) queuePollRefresh(user *User, messageID string, vote bool) {
@@ -69,14 +75,35 @@ func (portal *Portal) queuePollRefresh(user *User, messageID string, vote bool) 
 		defer cancel()
 		opts := portal.RefererOptIfUser(session, threadID)
 		opts = append(opts, discordgo.WithContext(ctx), discordgo.WithRetryOnRatelimit(false), discordgo.WithRestRetries(0))
-		message, err := fetchGalleryMessage(session, channelID, messageID, senderID, opts...)
+		var message *discordgo.Message
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			message, err = fetchGalleryMessage(session, channelID, messageID, senderID, opts...)
+			if err == nil || attempt == 2 {
+				break
+			}
+			delay := componentRefreshRetryDelay(err, attempt)
+			if delay == 0 {
+				break
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				err = ctx.Err()
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
 		user.Lock()
 		sameSession := user.Session == session
 		user.Unlock()
 		if err != nil || !sameSession {
 			message = nil
 		}
-		timer := time.NewTimer(5 * time.Second)
+		timer := time.NewTimer(15 * time.Second)
 		defer timer.Stop()
 		select {
 		case portal.discordMessages <- portalDiscordMessage{user: user, msg: &discordPollSnapshot{messageID: messageID, message: message, generation: generation}}:
@@ -143,7 +170,7 @@ func (portal *Portal) finishPollRefresh(user *User, snapshot *discordPollSnapsho
 			portal.log.Err(err).Msg("Failed to send refreshed Discord poll")
 		} else if portal.recentMessages != nil {
 			if cached, ok := portal.recentMessages.Get(snapshot.messageID); ok {
-				cached.Poll = snapshot.message.Poll
+				retainRefreshedPoll(cached, snapshot.message)
 			}
 		}
 		return
