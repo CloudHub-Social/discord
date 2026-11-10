@@ -170,6 +170,9 @@ bridge:
     # This will use the fallback mode in MSC4144, which means clients that support MSC4144 will not show the prefix
     # (and will instead show the name and avatar as the message sender).
     prefix_webhook_messages: true
+    # Combine multiple Discord attachments into an experimental MSC4274 gallery.
+    # Set false when Matrix clients in bridged rooms do not support galleries.
+    discord_attachment_galleries: true
     # Bridge webhook avatars?
     enable_webhook_avatars: false
     # Should the bridge upload media to the Discord CDN directly before sending the message when using a user token,

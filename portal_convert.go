@@ -276,6 +276,11 @@ func (portal *Portal) convertDiscordVideoEmbed(ctx context.Context, intent *apps
 }
 
 func (portal *Portal) convertDiscordMessage(ctx context.Context, puppet *Puppet, intent *appservice.IntentAPI, msg *discordgo.Message) []*ConvertedMessage {
+	return portal.convertDiscordMessageWithGallery(ctx, puppet, intent, msg, false)
+}
+
+// Existing gallery messages must remain editable even after aggregation is disabled.
+func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, puppet *Puppet, intent *appservice.IntentAPI, msg *discordgo.Message, forceGallery bool) []*ConvertedMessage {
 	predictedLength := len(msg.Attachments) + len(msg.StickerItems)
 	if msg.Content != "" {
 		predictedLength++
@@ -298,7 +303,7 @@ func (portal *Portal) convertDiscordMessage(ctx context.Context, puppet *Puppet,
 	}
 	// A gallery owns the caption and all successfully transferred attachments.
 	// If any transfer failed, retain the existing individual-message fallback.
-	if len(msg.Attachments) >= 2 && len(msg.StickerItems) == 0 {
+	if len(msg.Attachments) >= 2 && len(msg.StickerItems) == 0 && (forceGallery || portal.bridge.Config.Bridge.AttachmentGalleriesEnabled()) {
 		// Video embeds are separate events and must keep their existing mapping.
 		hasVideoEmbed := false
 		for _, embed := range msg.Embeds {

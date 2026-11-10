@@ -243,7 +243,7 @@ func (portal *Portal) handleDiscordGalleryUpdate(ctx context.Context, user *User
 	}
 	puppet := portal.bridge.GetPuppetByID(full.Author.ID)
 	intent := puppet.IntentFor(portal)
-	parts := portal.convertDiscordMessage(ctx, puppet, intent, full)
+	parts := portal.convertDiscordMessageWithGallery(ctx, puppet, intent, full, true)
 	var converted *ConvertedMessage
 	switch {
 	case len(full.Attachments) >= 2:
@@ -424,16 +424,14 @@ func (portal *Portal) handleMatrixGalleryEdit(sender *User, evt *event.Event, or
 		caption = &event.MessageEventContent{MsgType: event.MsgText, Body: ""}
 	}
 	discordContent, allowedMentions := portal.parseMatrixHTML(caption, parseAllowedLinkPreviews(raw))
-	// An explicit empty list removes all old attachments when an edit becomes text.
-	attachments := req.Attachments
-	if attachments == nil {
-		attachments = []*discordgo.MessageAttachment{}
-	}
+	// A text replacement may be a caption-only edit from a client that doesn't
+	// retain gallery itemtypes. Omit attachments so Discord preserves them.
+	attachments := galleryEditAttachments(req, len(items) > 0)
 	var result *discordgo.Message
 	if webhook {
-		result, err = relayClient.WebhookMessageEdit(portal.RelayWebhookID, portal.RelayWebhookSecret, original.DiscordID, &discordgo.WebhookEdit{Content: &discordContent, Files: req.Files, Attachments: &attachments, AllowedMentions: allowedMentions})
+		result, err = relayClient.WebhookMessageEdit(portal.RelayWebhookID, portal.RelayWebhookSecret, original.DiscordID, &discordgo.WebhookEdit{Content: &discordContent, Files: req.Files, Attachments: attachments, AllowedMentions: allowedMentions})
 	} else {
-		edit := &discordgo.MessageEdit{ID: original.DiscordID, Channel: channelID, Content: &discordContent, Files: req.Files, Attachments: &attachments}
+		edit := &discordgo.MessageEdit{ID: original.DiscordID, Channel: channelID, Content: &discordContent, Files: req.Files, Attachments: attachments}
 		result, err = sender.Session.ChannelMessageEditComplex(edit, portal.RefererOptIfUser(sender.Session, original.ThreadID)...)
 	}
 	sender.handlePossible40002(err)
@@ -441,4 +439,12 @@ func (portal *Portal) handleMatrixGalleryEdit(sender *User, evt *event.Event, or
 	if result != nil && result.EditedTimestamp != nil {
 		original.UpdateEditTimestamp(*result.EditedTimestamp)
 	}
+}
+
+// A nil attachment pointer leaves existing Discord media untouched.
+func galleryEditAttachments(req *discordgo.MessageSend, replaceMedia bool) *[]*discordgo.MessageAttachment {
+	if !replaceMedia {
+		return nil
+	}
+	return &req.Attachments
 }

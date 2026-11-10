@@ -268,3 +268,19 @@ func TestGalleryWebhookProfileFallback(t *testing.T) {
 	profile := part.Extra["com.beeper.per_message_profile"].(map[string]any)
 	require.Equal(t, true, profile["has_fallback"])
 }
+
+func TestGalleryCaptionEditOmitsAttachments(t *testing.T) {
+	req := &discordgo.MessageSend{Attachments: []*discordgo.MessageAttachment{{ID: "0", Filename: "file.txt"}}}
+	text := "updated caption"
+	edit := discordgo.MessageEdit{Content: &text, Attachments: galleryEditAttachments(req, false)}
+	data, err := json.Marshal(edit)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(data, &raw))
+	require.NotContains(t, raw, "attachments")
+	edit.Attachments = galleryEditAttachments(req, true)
+	data, err = json.Marshal(edit)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(data, &raw))
+	require.Contains(t, raw, "attachments")
+}
