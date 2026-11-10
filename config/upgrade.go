@@ -68,6 +68,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "forbid_dming_strangers")
 	helper.Copy(up.Bool, "bridge", "sync_matrix_presence_to_discord")
 	helper.Copy(up.Bool, "bridge", "sync_discord_presence_to_matrix")
+	helper.Copy(up.Bool, "bridge", "discord_voice_status")
 	// Before status sync was split from presence sync, the presence flags also
 	// carried custom status text. For existing configs that predate the split (the
 	// status key is absent), default each status flag to the matching presence flag
