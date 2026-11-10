@@ -310,6 +310,29 @@ func discordMessageHasNewContent(msg *discordgo.Message) bool {
 	return false
 }
 
+// Separate extra media cannot be maintained by the single-gallery edit path.
+func hasSeparateForwardMedia(msg *discordgo.Message) bool {
+	if msg.MessageReference == nil || msg.MessageReference.Type != discordgo.MessageReferenceTypeForward {
+		return false
+	}
+	for _, snapshot := range msg.MessageSnapshots {
+		if snapshot.Message != nil && (len(snapshot.Message.Attachments) > 0 || len(snapshot.Message.StickerItems) > 0 || len(collectComponentMedia(snapshot.Message.Components)) > 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func canAggregateDiscordGallery(msg *discordgo.Message, forceGallery, enabled bool) bool {
+	if len(msg.Attachments) < 2 {
+		return false
+	}
+	if forceGallery {
+		return true
+	}
+	return enabled && len(msg.StickerItems) == 0 && len(newComponentMedia(msg.Components, msg.Attachments, nil)) == 0 && !hasSeparateForwardMedia(msg)
+}
+
 // Existing gallery messages must remain editable even after aggregation is disabled.
 func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, puppet *Puppet, intent *appservice.IntentAPI, msg *discordgo.Message, forceGallery bool) []*ConvertedMessage {
 	// Never introduce a new plaintext fallback in an encrypted room when crypto
@@ -347,7 +370,7 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 	}
 	// A gallery owns the caption and all successfully transferred attachments.
 	// If any transfer failed, retain the existing individual-message fallback.
-	if len(msg.Attachments) >= 2 && (forceGallery || len(msg.StickerItems) == 0) && (forceGallery || portal.bridge.Config.Bridge.AttachmentGalleriesEnabled()) {
+	if canAggregateDiscordGallery(msg, forceGallery, portal.bridge.Config.Bridge.AttachmentGalleriesEnabled()) {
 		// Video embeds are separate events and must keep their existing mapping.
 		hasVideoEmbed := false
 		for _, embed := range msg.Embeds {

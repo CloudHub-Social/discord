@@ -922,8 +922,9 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 		log.Error().Msg("Cannot bridge new Discord content without room encryption")
 		return
 	}
-	// Add replacement component media before removing old parts. If any upload
-	// or send fails, retain the old parts so the card never loses its media.
+	// Reconcile media independently of the text edit. Failed media remains
+	// retryable; removed or newly-spoilered old parts must not stay visible.
+	componentUpdateFailed := false
 	if msg.Components != nil {
 		known := make(map[string]bool, len(existing))
 		for _, part := range existing {
@@ -933,13 +934,15 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 			part := portal.convertComponentMedia(intent, media)
 			if part == nil || part.Content.MsgType == event.MsgNotice {
 				log.Warn().Msg("Failed to convert updated component media")
-				return
+				componentUpdateFailed = true
+				continue
 			}
 			if existing[0].ThreadID != "" {
 				thread := portal.bridge.GetThreadByID(existing[0].ThreadID, nil)
 				if thread == nil || thread.RootMXID == "" {
 					log.Warn().Msg("Cannot map updated component media to thread")
-					return
+					componentUpdateFailed = true
+					continue
 				}
 				part.Content.RelatesTo = &event.RelatesTo{}
 				part.Content.RelatesTo.SetThread(thread.RootMXID, thread.RootMXID)
@@ -949,7 +952,8 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, 0)
 			if err != nil {
 				log.Err(err).Msg("Failed to send updated component media")
-				return
+				componentUpdateFailed = true
+				continue
 			}
 			existing[0].MassInsertParts([]database.MessagePart{{AttachmentID: media.id, MXID: resp.EventID}})
 			known[media.id] = true
@@ -1001,6 +1005,7 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 			log.Err(err).
 				Str("event_id", deletedAttachment.MXID.String()).
 				Msg("Failed to redact attachment")
+			componentUpdateFailed = true
 		} else {
 			redactions.Str(deletedAttachment.AttachmentID, resp.EventID.String())
 			deletedAttachment.Delete()
@@ -1047,7 +1052,7 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 
 	portal.sendDeliveryReceipt(resp.EventID)
 
-	if msg.EditedTimestamp != nil {
+	if msg.EditedTimestamp != nil && !componentUpdateFailed {
 		existing[0].UpdateEditTimestamp(*msg.EditedTimestamp)
 	}
 	log.Debug().

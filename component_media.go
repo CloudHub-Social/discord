@@ -42,16 +42,18 @@ func collectComponentMedia(components []discordgo.MessageComponent) []componentM
 			return
 		}
 		u, _ := url.Parse(raw)
-		sum := sha256.Sum256([]byte(strings.ToLower(u.Hostname()) + u.EscapedPath()))
+		desc := ""
+		if description != nil {
+			desc = *description
+		}
+		// Metadata participates in identity, so a spoiler or description edit
+		// replaces the old event instead of retaining stale presentation.
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%t", u.EscapedPath(), desc, spoiler)))
 		id := fmt.Sprintf("component_%x", sum[:12])
 		if seen[id] {
 			return
 		}
 		seen[id] = true
-		desc := ""
-		if description != nil {
-			desc = *description
-		}
 		out = append(out, componentMedia{url: raw, description: desc, id: id, spoiler: spoiler})
 	}
 	var walk func(discordgo.MessageComponent, bool)

@@ -38,7 +38,7 @@ func TestCollectComponentMediaNestedAndSpoiler(t *testing.T) {
 	description := "description"
 	components := []discordgo.MessageComponent{&discordgo.Container{Spoiler: true, Components: []discordgo.MessageComponent{&discordgo.MediaGallery{Items: []discordgo.MediaGalleryItem{
 		{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/a.png?signature=one"}, Description: &description},
-		{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/a.png?signature=two"}},
+		{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/a.png?signature=two"}, Description: &description},
 		{Media: discordgo.UnfurledMediaItem{URL: "https://evil.invalid/a.png"}},
 	}}}}}
 	got := collectComponentMedia(components)
@@ -91,4 +91,39 @@ func TestNewComponentMediaOnEdit(t *testing.T) {
 	require.Len(t, add, 1)
 	require.NotEqual(t, oldMedia[0].id, add[0].id)
 	require.Empty(t, newComponentMedia([]discordgo.MessageComponent{next}, []*discordgo.MessageAttachment{{URL: "https://media.discordapp.net/new.png?token=1"}}, known))
+}
+
+func TestComponentMediaMetadataChangesIdentity(t *testing.T) {
+	url := "https://cdn.discordapp.com/attachments/1/a.png"
+	before := collectComponentMedia([]discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: url}}})
+	after := collectComponentMedia([]discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: url}, Spoiler: true}})
+	require.Len(t, before, 1)
+	require.Len(t, after, 1)
+	require.NotEqual(t, before[0].id, after[0].id)
+}
+
+func TestComponentMediaDescriptionAndSpoilerEditsChangeIdentity(t *testing.T) {
+	first := "first"
+	second := "second"
+	makeItem := func(desc *string, spoiler bool) []componentMedia {
+		return collectComponentMedia([]discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/a"}, Description: desc, Spoiler: spoiler}})
+	}
+	before, afterDesc, afterSpoiler := makeItem(&first, false), makeItem(&second, false), makeItem(&first, true)
+	require.NotEqual(t, before[0].id, afterDesc[0].id)
+	require.NotEqual(t, before[0].id, afterSpoiler[0].id)
+}
+
+func TestHasSeparateForwardMedia(t *testing.T) {
+	msg := &discordgo.Message{MessageReference: &discordgo.MessageReference{Type: discordgo.MessageReferenceTypeForward}, MessageSnapshots: []discordgo.MessageSnapshot{{Message: &discordgo.Message{Attachments: []*discordgo.MessageAttachment{{ID: "1"}}}}}}
+	require.True(t, hasSeparateForwardMedia(msg))
+	msg.MessageSnapshots[0].Message.Attachments = nil
+	require.False(t, hasSeparateForwardMedia(msg))
+}
+
+func TestCanAggregateGalleryAvoidsSeparateMedia(t *testing.T) {
+	msg := &discordgo.Message{Attachments: []*discordgo.MessageAttachment{{ID: "1"}, {ID: "2"}}}
+	require.True(t, canAggregateDiscordGallery(msg, false, true))
+	msg.Components = []discordgo.MessageComponent{&discordgo.Thumbnail{Media: discordgo.UnfurledMediaItem{URL: "https://cdn.discordapp.com/new.png"}}}
+	require.False(t, canAggregateDiscordGallery(msg, false, true))
+	require.True(t, canAggregateDiscordGallery(msg, true, true))
 }
