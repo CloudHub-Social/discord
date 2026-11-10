@@ -317,4 +317,16 @@ func TestExistingGalleryEditWithGIFAndAggregationDisabled(t *testing.T) {
 	items, err := decodeGallery(parts[0].Extra)
 	require.NoError(t, err)
 	require.Len(t, items, 2)
+
+	msg.Attachments = msg.Attachments[:1]
+	parts = portal.convertDiscordMessageWithGallery(context.Background(), puppet, nil, msg, true)
+	require.Len(t, parts, 2)
+	require.Equal(t, "", parts[0].AttachmentID)
+	require.Contains(t, parts[0].Content.Body, gif)
+	require.Equal(t, "301", parts[1].AttachmentID)
+
+	msg.Attachments = nil
+	parts = portal.convertDiscordMessageWithGallery(context.Background(), puppet, nil, msg, true)
+	require.Len(t, parts, 1)
+	require.Contains(t, parts[0].Content.Body, gif)
 }

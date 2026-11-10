@@ -155,15 +155,35 @@ func combineDiscordGallery(parts []*ConvertedMessage, count int) []*ConvertedMes
 
 // Additional Discord-only media stays reachable when an existing gallery is
 // edited to include an embed or sticker that cannot share its event mapping.
-func appendDiscordExtraLink(part *ConvertedMessage, rawURL string) {
+func appendDiscordExtraLink(part *ConvertedMessage, rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || strings.Contains(part.Content.Body, rawURL) {
-		return
+		return false
 	}
-	part.Content.EnsureHasHTML()
-	part.Content.Body += "\n" + rawURL
 	escaped := html.EscapeString(rawURL)
-	part.Content.FormattedBody += `<br/><a href="` + escaped + `">` + escaped + `</a>`
+	link := `<a href="` + escaped + `">` + escaped + `</a>`
+	if part.Content.Body == "" {
+		part.Content.Body = rawURL
+		part.Content.Format = event.FormatHTML
+		part.Content.FormattedBody = link
+	} else {
+		part.Content.EnsureHasHTML()
+		part.Content.Body += "\n" + rawURL
+		part.Content.FormattedBody += "<br/>" + link
+	}
+	return true
+}
+
+func appendDiscordExtraPart(parts []*ConvertedMessage, rawURL string) []*ConvertedMessage {
+	if len(parts) > 0 && (parts[0].AttachmentID == galleryAttachmentID || parts[0].AttachmentID == "") {
+		appendDiscordExtraLink(parts[0], rawURL)
+		return parts
+	}
+	caption := &ConvertedMessage{Type: event.EventMessage, Content: &event.MessageEventContent{MsgType: event.MsgText}}
+	if !appendDiscordExtraLink(caption, rawURL) {
+		return parts
+	}
+	return append([]*ConvertedMessage{caption}, parts...)
 }
 
 // Stable Matrix transaction IDs make a retried Discord gallery create/edit

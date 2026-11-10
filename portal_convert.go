@@ -317,8 +317,8 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 		}
 	}
 	for _, sticker := range msg.StickerItems {
-		if forceGallery && len(parts) == 1 && parts[0].AttachmentID == galleryAttachmentID {
-			appendDiscordExtraLink(parts[0], sticker.URL())
+		if forceGallery {
+			parts = appendDiscordExtraPart(parts, sticker.URL())
 			continue
 		}
 		if _, handled := handledIDs[sticker.ID]; handled {
@@ -335,8 +335,8 @@ func (portal *Portal) convertDiscordMessageWithGallery(ctx context.Context, pupp
 		if getEmbedType(msg, embed) != EmbedVideo {
 			continue
 		}
-		if forceGallery && len(parts) == 1 && parts[0].AttachmentID == galleryAttachmentID {
-			appendDiscordExtraLink(parts[0], embed.URL)
+		if forceGallery {
+			parts = appendDiscordExtraPart(parts, embed.URL)
 			continue
 		}
 		// Discord deduplicates embeds by URL. It makes things easier for us too.
