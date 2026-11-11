@@ -140,6 +140,10 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 				bootstrapped = user.restoreDiscordVoiceState(generation, epoch, discordID, observed)
 				nextBootstrapAttempt = time.Now().Add(time.Minute)
 			}
+			if !user.isCurrentConnection(generation, epoch) {
+				user.voiceMirrorLock.Unlock()
+				return
+			}
 			for member := range user.voiceMirrorPending {
 				if _, returned := observed[member]; returned {
 					delete(user.voiceMirrorPending, member)
