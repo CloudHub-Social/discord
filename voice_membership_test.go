@@ -8,6 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+
+	"go.mau.fi/mautrix-discord/config"
+	"go.mau.fi/mautrix-discord/database"
 )
 
 func TestSnapshotDiscordVoiceMembershipsRespectsVisibility(t *testing.T) {
@@ -25,6 +28,43 @@ func TestSnapshotDiscordVoiceMembershipsRespectsVisibility(t *testing.T) {
 	require.NoError(t, state.GuildAdd(guild))
 	require.Equal(t, map[voiceMembership]struct{}{{channelID: "20", userID: "2"}: {}}, snapshotDiscordVoiceMemberships(state, "1"))
 	require.Empty(t, snapshotDiscordVoiceMemberships(state, "unknown"))
+}
+
+func TestStaleVoiceWorkerReturnsWakeToNewConnection(t *testing.T) {
+	bridge := &DiscordBridge{Config: &config.Config{}}
+	bridge.Config.Bridge.DiscordVoiceActivity = true
+	user := &User{User: &database.User{}, bridge: bridge, voiceMirrorWake: make(chan struct{}, 1)}
+	done := make(chan struct{})
+	go func() { defer close(done); user.runDiscordVoiceMirror(0, 0) }()
+	require.Eventually(t, func() bool {
+		user.voiceMirrorLock.Lock()
+		defer user.voiceMirrorLock.Unlock()
+		return user.voiceMirrorRunning
+	}, 2*time.Second, 10*time.Millisecond)
+	user.reconnectLock.Lock()
+	user.sessionGeneration = 1
+	user.reconnectLock.Unlock()
+	user.voiceMirrorWake <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale worker did not exit")
+	}
+	select {
+	case <-user.voiceMirrorWake:
+	default:
+		t.Fatal("stale worker consumed the new connection's wake")
+	}
+}
+
+func TestStaleVoiceWorkerDoesNotReplaceCurrentWorker(t *testing.T) {
+	bridge := &DiscordBridge{Config: &config.Config{}}
+	bridge.Config.Bridge.DiscordVoiceActivity = true
+	user := &User{User: &database.User{}, bridge: bridge, sessionGeneration: 2, connectionEpoch: 1, voiceMirrorRunning: true, voiceMirrorGeneration: 2, voiceMirrorEpoch: 1}
+	user.runDiscordVoiceMirror(1, 0)
+	require.True(t, user.voiceMirrorRunning)
+	require.Equal(t, uint64(2), user.voiceMirrorGeneration)
+	require.Equal(t, uint64(1), user.voiceMirrorEpoch)
 }
 
 func TestDiscordVoiceMembershipContent(t *testing.T) {

@@ -27,6 +27,7 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 	otherViewer := false
 	failClearOnce := false
 	failStateOnce := true
+	power := map[string]any{"users": map[string]any{"@bridge:example.com": float64(100), "@discord_3:example.com": float64(1)}, "events": map[string]any{discordVoiceEventType: float64(1)}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Logf("mock homeserver request: %s %s", r.Method, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
@@ -55,6 +56,18 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 			ghost := "@discord_3:example.com"
 			members = append(members, map[string]any{"type": "org.matrix.msc3401.call.member", "state_key": discordVoiceMembershipStateKey(ghost, "1"), "sender": ghost, "event_id": "$stale", "content": discordVoiceMembershipContent(time.Now(), "1")})
 			_ = json.NewEncoder(w).Encode(members)
+		case strings.Contains(r.URL.Path, "/state/m.room.power_levels"):
+			viewersMu.Lock()
+			defer viewersMu.Unlock()
+			if r.Method == http.MethodPut {
+				if json.NewDecoder(r.Body).Decode(&power) != nil {
+					http.Error(w, "invalid", 400)
+					return
+				}
+				_, _ = w.Write([]byte(`{"event_id":"$power"}`))
+			} else {
+				_ = json.NewEncoder(w).Encode(power)
+			}
 		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/state/org.matrix.msc3401.call.member/"):
 			var body map[string]any
 			if json.NewDecoder(r.Body).Decode(&body) != nil {
@@ -62,6 +75,18 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 				return
 			}
 			viewersMu.Lock()
+			levels := power["users"].(map[string]any)
+			sender := r.URL.Query().Get("user_id")
+			level, _ := levels[sender].(float64)
+			required, ok := power["events"].(map[string]any)[discordVoiceEventType].(float64)
+			if !ok {
+				required = 50
+			}
+			if level < required {
+				viewersMu.Unlock()
+				http.Error(w, `{"errcode":"M_FORBIDDEN"}`, http.StatusForbidden)
+				return
+			}
 			fail := len(body) == 0 && failClearOnce
 			if fail {
 				failClearOnce = false

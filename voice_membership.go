@@ -97,6 +97,10 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 		return
 	}
 	user.voiceMirrorLock.Lock()
+	if !user.isCurrentConnection(generation, epoch) {
+		user.voiceMirrorLock.Unlock()
+		return
+	}
 	if user.voiceMirrorRunning && user.voiceMirrorGeneration == generation && user.voiceMirrorEpoch == epoch {
 		user.voiceMirrorLock.Unlock()
 		return
@@ -178,6 +182,10 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 					continue
 				}
 				puppet := user.bridge.GetPuppetByID(member.userID)
+				if err := portal.ensureDiscordVoicePower(puppet.MXID, user.MXID); err != nil {
+					user.log.Warn().Err(err).Msg("Cannot grant narrow Discord voice membership permission")
+					continue
+				}
 				intent := puppet.DefaultIntent()
 				stateKey := discordVoiceMembershipStateKey(string(puppet.MXID), discordID)
 				eventType := event.Type{Type: "org.matrix.msc3401.call.member", Class: event.StateEventType}
@@ -192,6 +200,15 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 		select {
 		case <-ticker.C:
 		case <-user.voiceMirrorWake:
+			if !user.isCurrentConnection(generation, epoch) {
+				// An older worker can wake after a reconnect. Return its signal
+				// so the current worker can promptly process the new voice state.
+				select {
+				case user.voiceMirrorWake <- struct{}{}:
+				default:
+				}
+				return
+			}
 		}
 	}
 }
