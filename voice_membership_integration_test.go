@@ -175,3 +175,39 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 	user.voiceMirrorWake <- struct{}{}
 	require.Empty(t, next(), "a failed departure clear is retried on reconciliation")
 }
+
+func TestVoiceStateSendRegistersAndJoinsNewGhost(t *testing.T) {
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			requests = append(requests, "register")
+			_, _ = w.Write([]byte(`{"user_id":"@discord_2:example.com"}`))
+		case strings.HasSuffix(r.URL.Path, "/join"):
+			requests = append(requests, "join")
+			_, _ = w.Write([]byte(`{"room_id":"!test:example.com"}`))
+		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/state/org.matrix.msc3401.call.member/"):
+			requests = append(requests, "state")
+			_, _ = w.Write([]byte(`{"event_id":"$event"}`))
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	as := appservice.Create()
+	as.HomeserverDomain = "example.com"
+	as.Registration = &appservice.Registration{SenderLocalpart: "bridge", AppToken: "test"}
+	require.NoError(t, as.SetHomeserverURL(server.URL))
+	ghost := as.Intent("@discord_2:example.com")
+	room := id.RoomID("!test:example.com")
+	typ := event.Type{Type: discordVoiceEventType, Class: event.StateEventType}
+	_, err := ghost.SendStateEvent(room, typ, discordVoiceMembershipStateKey(string(ghost.UserID), "1"), discordVoiceMembershipContent(time.Now(), "1"))
+	require.NoError(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"register", "join", "state"}, requests)
+}
