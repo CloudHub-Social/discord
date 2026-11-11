@@ -37,8 +37,9 @@ type BridgeConfig struct {
 
 	PortalMessageBuffer int `yaml:"portal_message_buffer"`
 
-	PublicAddress  string `yaml:"public_address"`
-	AvatarProxyKey string `yaml:"avatar_proxy_key"`
+	PublicAddress       string `yaml:"public_address"`
+	AvatarProxyKey      string `yaml:"avatar_proxy_key"`
+	DiscordRedirectBase string `yaml:"discord_redirect_base"`
 
 	DeliveryReceipts            bool  `yaml:"delivery_receipts"`
 	MessageStatusEvents         bool  `yaml:"message_status_events"`
@@ -89,6 +90,7 @@ type BridgeConfig struct {
 	// both ride the same opcode-14 subscription.
 	SyncDiscordPresenceToMatrix bool `yaml:"sync_discord_presence_to_matrix"`
 	DiscordVoiceStatus          bool `yaml:"discord_voice_status"`
+	DiscordVoiceActivity        bool `yaml:"discord_voice_activity"`
 
 	// DiscordCallAlerts posts a link when Discord reports that this account is ringing.
 	DiscordCallAlerts bool `yaml:"discord_call_alerts"`

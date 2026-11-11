@@ -83,6 +83,7 @@ type Portal struct {
 	log    zerolog.Logger
 
 	roomCreateLock sync.Mutex
+	voicePowerLock sync.Mutex
 	encryptLock    sync.Mutex
 
 	discordMessages chan portalDiscordMessage

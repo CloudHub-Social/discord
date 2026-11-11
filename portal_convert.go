@@ -890,7 +890,7 @@ func (portal *Portal) convertDiscordTextMessage(ctx context.Context, intent *app
 		}
 		if len(forwarded.Components) > 0 {
 			ref := msg.MessageReference
-			forwardedHTML += portal.renderDiscordComponents(forwarded.Components, discordMessageURL(ref.GuildID, ref.ChannelID, ref.MessageID))
+			forwardedHTML += portal.renderDiscordComponents(forwarded.Components, discordMessageURL(ref.GuildID, ref.ChannelID, ref.MessageID, portal.discordRedirectBase()))
 		}
 		msgTSText := msg.MessageSnapshots[0].Message.Timestamp.Format("2006-01-02 15:04 MST")
 		origLink := fmt.Sprintf("unknown channel • %s", msgTSText)
@@ -943,12 +943,12 @@ func (portal *Portal) convertDiscordTextMessage(ctx context.Context, intent *app
 		}
 	}
 
-	if pollHTML := discordPollHTML(msg, portal.GuildID); pollHTML != "" {
+	if pollHTML := discordPollHTML(msg, portal.GuildID, portal.discordRedirectBase()); pollHTML != "" {
 		htmlParts = append(htmlParts, pollHTML)
 	}
 
 	if len(msg.Components) > 0 {
-		htmlParts = append(htmlParts, portal.renderDiscordComponents(msg.Components, discordMessageURL(portal.GuildID, msg.ChannelID, msg.ID)))
+		htmlParts = append(htmlParts, portal.renderDiscordComponents(msg.Components, discordMessageURL(portal.GuildID, msg.ChannelID, msg.ID, portal.discordRedirectBase())))
 	}
 
 	if len(htmlParts) == 0 {

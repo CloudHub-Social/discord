@@ -41,7 +41,14 @@ var (
 
 type User struct {
 	*database.User
-	callRings callRingTracker
+	callRings             callRingTracker
+	voiceMirrorLock       sync.Mutex
+	voiceMirrorPublished  map[voiceMembership]time.Time
+	voiceMirrorPending    map[voiceMembership]struct{}
+	voiceMirrorWake       chan struct{}
+	voiceMirrorRunning    bool
+	voiceMirrorGeneration uint64
+	voiceMirrorEpoch      uint64
 
 	sync.Mutex
 
@@ -456,6 +463,7 @@ func (br *DiscordBridge) NewUser(dbUser *database.User) *User {
 		activeGuildSubs:  make(map[string]time.Time),
 		subscribedGuilds: make(map[string][]string),
 		guildSubSignal:   make(chan struct{}, 1),
+		voiceMirrorWake:  make(chan struct{}, 1),
 	}
 	user.nextDiscordUploadID.Store(rand.Int31n(100))
 	user.BridgeState = br.NewBridgeStateQueue(user)
@@ -943,7 +951,7 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 	}
 	if !session.IsUser {
 		session.Identify.Intents = BotIntents
-		if user.bridge.Config.Bridge.DiscordVoiceStatus {
+		if user.bridge.Config.Bridge.DiscordVoiceStatus || user.bridge.Config.Bridge.DiscordVoiceActivity {
 			session.Identify.Intents |= discordgo.IntentGuildVoiceStates
 		}
 	}
@@ -1035,6 +1043,12 @@ func (user *User) eventHandlerSync(generation, epoch uint64, rawEvt any) {
 		user.readyComplete = false
 		user.presenceLock.Unlock()
 	}
+	if _, ok := rawEvt.(*discordgo.VoiceStateUpdate); ok {
+		select {
+		case user.voiceMirrorWake <- struct{}{}:
+		default:
+		}
+	}
 	go user.eventHandler(generation, epoch, rawEvt)
 }
 
@@ -1111,6 +1125,8 @@ func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 		user.typingStartHandler(evt)
 	case *discordgo.PresenceUpdate:
 		user.presenceUpdateHandler(evt)
+	case *discordgo.VoiceStateUpdate:
+		user.clearDiscordVoiceDeparture(evt, generation, epoch)
 	case *discordgo.GuildMembersChunk:
 		if len(evt.Presences) > 0 {
 			go user.seedPresences(evt.Presences)
@@ -1368,6 +1384,7 @@ func (user *User) readyHandler(r *discordgo.Ready, generation, epoch uint64) {
 		go user.seedMergedPresences(stashed)
 	}
 
+	go user.runDiscordVoiceMirror(generation, epoch)
 	user.sendConnectedState(generation, epoch)
 }
 
@@ -1798,6 +1815,7 @@ func (user *User) sleepGuildSub(ctx context.Context) {
 
 func (user *User) resumeHandler(_ *discordgo.Resumed, generation, epoch uint64) {
 	user.log.Debug().Msg("Discord connection resumed")
+	go user.runDiscordVoiceMirror(generation, epoch)
 	// Clear the dedup cache so the first presence ping after a resume re-sends
 	// the current status to Discord (the resumed session may have lost it).
 	user.presenceLock.Lock()
