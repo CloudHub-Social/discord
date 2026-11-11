@@ -270,6 +270,9 @@ func (br *DiscordBridge) Start() {
 	if br.Config.Bridge.PublicAddress != "" {
 		br.AS.Router.HandleFunc("/mautrix-discord/avatar/{server}/{mediaID}/{checksum}", br.serveMediaProxy).Methods(http.MethodGet)
 	}
+	if br.Config.Bridge.DiscordRedirectBase != "" {
+		br.AS.Router.HandleFunc("/mautrix-discord/open/{guild}/{channel}/{message}", discordRedirect).Methods(http.MethodGet)
+	}
 	br.DMA = newDirectMediaAPI(br)
 	br.WaitWebsocketConnected()
 	go br.startUsers()

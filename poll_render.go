@@ -17,7 +17,7 @@ import (
 )
 
 // discordPollHTML renders a snapshot, never a Matrix poll that falsely suggests voting works.
-func discordPollHTML(msg *discordgo.Message, guildID string) string {
+func discordPollHTML(msg *discordgo.Message, guildID string, redirectBase ...string) string {
 	var lines []string
 	if msg.Poll != nil {
 		p := msg.Poll
@@ -67,7 +67,7 @@ func discordPollHTML(msg *discordgo.Message, guildID string) string {
 		}
 	}
 	if len(lines) > 0 {
-		if link := discordMessageURL(guildID, msg.ChannelID, msg.ID); link != "" {
+		if link := discordMessageURL(guildID, msg.ChannelID, msg.ID, redirectBase...); link != "" {
 			lines = append(lines, fmt.Sprintf(`<p><a href="%s">Open message in Discord</a></p>`, html.EscapeString(link)))
 		}
 	}

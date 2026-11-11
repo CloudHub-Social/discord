@@ -18,8 +18,8 @@ type ringKey struct {
 }
 type discordCallAlert struct{ ring ringKey }
 
-func discordCallAlertContent(channelID, messageID string, recipient id.UserID) *event.MessageEventContent {
-	link := discordMessageURL("", channelID, messageID)
+func discordCallAlertContent(channelID, messageID string, recipient id.UserID, redirectBase ...string) *event.MessageEventContent {
+	link := discordMessageURL("", channelID, messageID, redirectBase...)
 	if link == "" || recipient == "" {
 		return nil
 	}
@@ -45,7 +45,7 @@ func (portal *Portal) handleDiscordCallAlert(user *User, alert *discordCallAlert
 	if !user.isCurrentConnection(alert.ring.generation, alert.ring.epoch) || !user.callRings.isRinging(portal.Key.ChannelID, alert.ring) {
 		return
 	}
-	content := discordCallAlertContent(portal.Key.ChannelID, alert.ring.messageID, user.MXID)
+	content := discordCallAlertContent(portal.Key.ChannelID, alert.ring.messageID, user.MXID, portal.discordRedirectBase())
 	if content == nil {
 		return
 	}

@@ -108,7 +108,14 @@ func (portal *Portal) renderDiscordComponents(components []discordgo.MessageComp
 
 // discordMessageURL uses the actual message channel, which can be a thread.
 // Missing or malformed IDs fall back to the existing text-only notice.
-func discordMessageURL(guildID, channelID, messageID string) string {
+func (portal *Portal) discordRedirectBase() string {
+	if portal == nil || portal.bridge == nil || portal.bridge.Config == nil {
+		return ""
+	}
+	return portal.bridge.Config.Bridge.DiscordRedirectBase
+}
+
+func discordMessageURL(guildID, channelID, messageID string, redirectBase ...string) string {
 	validID := func(id string) bool {
 		if id == "" {
 			return false
@@ -127,6 +134,12 @@ func discordMessageURL(guildID, channelID, messageID string) string {
 		guildID = "@me"
 	} else if !validID(guildID) {
 		return ""
+	}
+	if len(redirectBase) > 0 && redirectBase[0] != "" {
+		u, err := url.Parse(redirectBase[0])
+		if err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" {
+			return strings.TrimRight(redirectBase[0], "/") + "/mautrix-discord/open/" + guildID + "/" + channelID + "/" + messageID
+		}
 	}
 	return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", guildID, channelID, messageID)
 }

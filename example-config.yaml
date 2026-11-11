@@ -114,6 +114,9 @@ bridge:
     # If not set, avatars will not be bridged. Only the /mautrix-discord/avatar/{server}/{id}/{hash} endpoint is used on this address.
     # This should not have a trailing slash, the endpoint above will be appended to the provided address.
     public_address: null
+    # HTTPS base URL with /mautrix-discord/open/ publicly routed to the bridge.
+    # Leave empty until the redirect is reachable and verified.
+    discord_redirect_base: null
     # A random key used to sign the avatar URLs. The bridge will only accept requests with a valid signature.
     avatar_proxy_key: generate
 
@@ -208,6 +211,9 @@ bridge:
     discord_call_alerts: false
     # Allow voice status lookup in your private bridge management room.
     discord_voice_status: false
+    # Experimental: publish Discord voice occupancy as Matrix call membership.
+    # This does not bridge audio and may disclose activity to Matrix room members.
+    discord_voice_activity: false
     # Should the Discord custom status TEXT be reflected onto Matrix? Needs the same
     # guild subscription as presence, so enabling either one drives subscriptions.
     # With presence read off but this on, the puppet is shown "online" to carry the text.

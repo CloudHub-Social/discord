@@ -41,6 +41,7 @@ func DoUpgrade(helper *up.Helper) {
 	}
 	helper.Copy(up.Int, "bridge", "startup_private_channel_create_limit")
 	helper.Copy(up.Str|up.Null, "bridge", "public_address")
+	helper.Copy(up.Str|up.Null, "bridge", "discord_redirect_base")
 	if apkey, ok := helper.Get(up.Str, "bridge", "avatar_proxy_key"); !ok || apkey == "generate" {
 		helper.Set(up.Str, random.String(32), "bridge", "avatar_proxy_key")
 	} else {
@@ -70,6 +71,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "sync_discord_presence_to_matrix")
 	helper.Copy(up.Bool, "bridge", "discord_call_alerts")
 	helper.Copy(up.Bool, "bridge", "discord_voice_status")
+	helper.Copy(up.Bool, "bridge", "discord_voice_activity")
 	// Before status sync was split from presence sync, the presence flags also
 	// carried custom status text. For existing configs that predate the split (the
 	// status key is absent), default each status flag to the matching presence flag
