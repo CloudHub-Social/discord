@@ -297,6 +297,7 @@ func (user *User) clearDiscordVoiceDeparture(update *discordgo.VoiceStateUpdate,
 // keep it tracked on failures so a later reconciliation can retry.
 func (user *User) clearPublishedVoiceMembership(member voiceMembership, discordID string) {
 	if _, published := user.voiceMirrorPublished[member]; !published {
+		delete(user.voiceMirrorPending, member)
 		return
 	}
 	portal := user.GetExistingPortalByID(member.channelID)

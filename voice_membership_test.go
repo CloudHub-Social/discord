@@ -67,6 +67,13 @@ func TestStaleVoiceWorkerDoesNotReplaceCurrentWorker(t *testing.T) {
 	require.Equal(t, uint64(1), user.voiceMirrorEpoch)
 }
 
+func TestClearUnpublishedVoiceMembershipDropsPending(t *testing.T) {
+	member := voiceMembership{channelID: "20", userID: "2"}
+	user := &User{voiceMirrorPending: map[voiceMembership]struct{}{member: {}}}
+	user.clearPublishedVoiceMembership(member, "1")
+	require.Empty(t, user.voiceMirrorPending)
+}
+
 func TestDiscordVoiceMembershipContent(t *testing.T) {
 	content := discordVoiceMembershipContent(time.UnixMilli(123456), "1")
 	require.Equal(t, int64(123456), content["created_ts"])
