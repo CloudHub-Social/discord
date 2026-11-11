@@ -67,6 +67,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "use_discord_cdn_upload")
 	helper.Copy(up.Bool, "bridge", "forbid_dming_strangers")
 	helper.Copy(up.Bool, "bridge", "sync_matrix_presence_to_discord")
+	helper.Copy(up.Bool, "bridge", "matrix_presence_online_as_idle")
 	helper.Copy(up.Bool, "bridge", "sync_discord_presence_to_matrix")
 	helper.Copy(up.Bool, "bridge", "discord_call_alerts")
 	helper.Copy(up.Bool, "bridge", "discord_voice_status")
