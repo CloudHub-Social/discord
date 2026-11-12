@@ -901,7 +901,7 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 	}
 	user.reconstructRelationships(nil)
 
-	user.log.Debug().Msg("Connecting to discord")
+	user.log.Info().Msg("Connecting to discord")
 
 	session, err := discordgo.New(user.DiscordToken)
 	if err != nil {
@@ -1321,7 +1321,7 @@ func (s ChannelSlice) Swap(i, j int) {
 }
 
 func (user *User) readyHandler(r *discordgo.Ready, generation, epoch uint64) {
-	user.log.Debug().Msg("Discord connection ready")
+	user.log.Info().Msg("Discord connection ready")
 	// Clear the sent-presence dedup cache so the first Matrix presence ping
 	// after a reconnect always reaches Discord (the new gateway session starts
 	// without this Matrix-derived status).
@@ -1850,7 +1850,7 @@ func (user *User) sleepGuildSub(ctx context.Context) {
 }
 
 func (user *User) resumeHandler(_ *discordgo.Resumed, generation, epoch uint64) {
-	user.log.Debug().Msg("Discord connection resumed")
+	user.log.Info().Msg("Discord connection resumed")
 	go user.runDiscordVoiceMirror(generation, epoch)
 	// Clear the dedup cache so the first presence ping after a resume re-sends
 	// the current status to Discord (the resumed session may have lost it).
@@ -2111,16 +2111,16 @@ func (user *User) disconnectedHandler(_ *discordgo.Disconnect) {
 // disconnectedLocked requires bridgeStateLock and reconnectLock.
 func (user *User) disconnectedLocked() {
 	if user.wasLoggedOut {
-		user.log.Debug().Msg("Disconnected from Discord (not updating bridge state as user was just logged out)")
+		user.log.Info().Msg("Disconnected from Discord (not updating bridge state as user was just logged out)")
 		return
 	}
 	// A teardown the bridge initiated (manual disconnect / shutdown) must not
 	// trigger a reconnect.
 	if user.manualDisconnect {
-		user.log.Debug().Msg("Disconnected from Discord (manual disconnect, not reconnecting)")
+		user.log.Info().Msg("Disconnected from Discord (manual disconnect, not reconnecting)")
 		return
 	}
-	user.log.Debug().Msg("Disconnected from Discord")
+	user.log.Info().Msg("Disconnected from Discord")
 	user.wasDisconnected = true
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "dc-transient-disconnect", Message: "Temporarily disconnected from Discord, trying to reconnect"})
 	// The dropped session's READY watchdog is moot now; the next connect arms a
