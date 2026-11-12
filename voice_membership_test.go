@@ -100,3 +100,21 @@ func TestOwnedDiscordVoiceState(t *testing.T) {
 	_, ok = isOwnedDiscordVoiceState(makeEvent("@other:example.org", key, map[string]any{"application": "m.call"}), "1", parse)
 	require.False(t, ok, "never touch another sender's state")
 }
+
+func TestDiscordVoiceGatewaySnapshotsAndPassiveUpdates(t *testing.T) {
+	state := discordgo.NewState()
+	require.NoError(t, state.GuildAdd(&discordgo.Guild{ID: "10", Channels: []*discordgo.Channel{{ID: "20", GuildID: "10", Type: discordgo.ChannelTypeGuildVoice}}, VoiceStates: []*discordgo.VoiceState{{GuildID: "10", ChannelID: "20", UserID: "2"}, {GuildID: "10", ChannelID: "20", UserID: "3"}}}))
+	known := map[string]bool{}
+	require.NoError(t, applyDiscordVoiceGatewayEvent(state, known, "READY_SUPPLEMENTAL", []byte(`{"guilds":[{"id":"10","voice_states":[{"user_id":"2","channel_id":"20"}]},{"id":"11"}]}`)))
+	require.True(t, known["10"])
+	require.False(t, known["11"])
+	guild, err := state.Guild("10")
+	require.NoError(t, err)
+	require.Len(t, guild.VoiceStates, 1)
+	require.Equal(t, "2", guild.VoiceStates[0].UserID)
+	require.NoError(t, applyDiscordVoiceGatewayEvent(state, known, "PASSIVE_UPDATE_V2", []byte(`{"guild_id":"10","updated_voice_states":[{"user_id":"4","channel_id":"20"}],"removed_voice_states":["2"]}`)))
+	require.Len(t, guild.VoiceStates, 1)
+	require.Equal(t, "4", guild.VoiceStates[0].UserID)
+	require.NoError(t, applyDiscordVoiceGatewayEvent(state, known, "READY_SUPPLEMENTAL", []byte(`{"guilds":[{"id":"10","voice_states":[]}]}`)))
+	require.Empty(t, guild.VoiceStates)
+}

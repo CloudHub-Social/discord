@@ -43,6 +43,8 @@ type User struct {
 	*database.User
 	callRings             callRingTracker
 	voiceMirrorLock       sync.Mutex
+	voiceSnapshotLock     sync.Mutex
+	voiceSnapshotGuilds   map[string]bool
 	voiceMirrorPublished  map[voiceMembership]time.Time
 	voiceMirrorPending    map[voiceMembership]struct{}
 	voiceMirrorWake       chan struct{}
@@ -955,7 +957,41 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 			session.Identify.Intents |= discordgo.IntentGuildVoiceStates
 		}
 	}
-	session.EventHandler = func(evt any) { user.eventHandlerSync(generation, epoch, evt) }
+	user.voiceSnapshotLock.Lock()
+	user.voiceSnapshotGuilds = make(map[string]bool)
+	user.voiceSnapshotLock.Unlock()
+	session.EventHandler = func(evt any) {
+		if user.bridge.Config.Bridge.DiscordVoiceActivity {
+			switch guildEvent := evt.(type) {
+			case *discordgo.GuildDelete:
+				user.voiceSnapshotLock.Lock()
+				if user.isCurrentConnection(generation, epoch) && guildEvent.Guild != nil {
+					delete(user.voiceSnapshotGuilds, guildEvent.ID)
+				}
+				user.voiceSnapshotLock.Unlock()
+			case *discordgo.GuildCreate:
+				user.voiceSnapshotLock.Lock()
+				if user.isCurrentConnection(generation, epoch) && guildEvent.Guild != nil && !guildEvent.Unavailable && guildEvent.VoiceStates != nil {
+					user.voiceSnapshotGuilds[guildEvent.ID] = true
+				}
+				user.voiceSnapshotLock.Unlock()
+			}
+		}
+		if raw, ok := evt.(*discordgo.Event); ok && (raw.Type == "READY_SUPPLEMENTAL" || raw.Type == "PASSIVE_UPDATE_V2") && user.bridge.Config.Bridge.DiscordVoiceActivity {
+			user.voiceSnapshotLock.Lock()
+			if user.isCurrentConnection(generation, epoch) {
+				if err := applyDiscordVoiceGatewayEvent(session.State, user.voiceSnapshotGuilds, raw.Type, raw.RawData); err != nil {
+					user.log.Warn().Err(err).Msg("Failed to process Discord voice gateway state")
+				}
+				select {
+				case user.voiceMirrorWake <- struct{}{}:
+				default:
+				}
+			}
+			user.voiceSnapshotLock.Unlock()
+		}
+		user.eventHandlerSync(generation, epoch, evt)
+	}
 
 	if session.IsUser {
 		err = session.LoadMainPage(context.TODO())

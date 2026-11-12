@@ -128,9 +128,11 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 	session, err := discordgo.New("test-token")
 	require.NoError(t, err)
 	require.NoError(t, session.State.GuildAdd(&discordgo.Guild{ID: "10", Roles: []*discordgo.Role{{ID: "10", Permissions: discordgo.PermissionViewChannel}}, Members: []*discordgo.Member{{User: &discordgo.User{ID: "1"}}}, Channels: []*discordgo.Channel{{ID: "20", GuildID: "10", Type: discordgo.ChannelTypeGuildVoice}}, VoiceStates: []*discordgo.VoiceState{{GuildID: "10", ChannelID: "20", UserID: "2"}}}))
-	user := &User{User: &database.User{MXID: "@owner:example.com", DiscordID: "1"}, bridge: br, Session: session, voiceMirrorWake: make(chan struct{}, 1), voiceMirrorPublished: make(map[voiceMembership]time.Time), voiceMirrorPending: make(map[voiceMembership]struct{})}
-	require.False(t, user.restoreDiscordVoicePortals(0, 0, "1", snapshotDiscordVoiceMemberships(session.State, "1"), []*Portal{br.portalsByID[key]}), "failed state reads must remain retryable")
-	require.True(t, user.restoreDiscordVoicePortals(0, 0, "1", snapshotDiscordVoiceMemberships(session.State, "1"), []*Portal{br.portalsByID[key]}))
+	user := &User{User: &database.User{MXID: "@owner:example.com", DiscordID: "1"}, bridge: br, Session: session, voiceMirrorWake: make(chan struct{}, 1), voiceMirrorPublished: make(map[voiceMembership]time.Time), voiceMirrorPending: make(map[voiceMembership]struct{}), voiceSnapshotGuilds: make(map[string]bool)}
+	require.False(t, user.restoreDiscordVoicePortals(0, 0, "1", snapshotDiscordVoiceMemberships(session.State, "1"), map[string]bool{"20": true}, []*Portal{br.portalsByID[key]}), "failed state reads must remain retryable")
+	require.True(t, user.restoreDiscordVoicePortals(0, 0, "1", snapshotDiscordVoiceMemberships(session.State, "1"), nil, []*Portal{br.portalsByID[key]}))
+	require.Empty(t, user.voiceMirrorPending, "an incomplete reconnect cache must not mark a participant as departed")
+	require.True(t, user.restoreDiscordVoicePortals(0, 0, "1", snapshotDiscordVoiceMemberships(session.State, "1"), map[string]bool{"20": true}, []*Portal{br.portalsByID[key]}))
 	require.Contains(t, user.voiceMirrorPending, voiceMembership{channelID: "20", userID: "3"}, "reconnect must recover stale bridge-owned membership")
 	done := make(chan struct{})
 	go func() { defer close(done); user.runDiscordVoiceMirror(0, 0) }()
@@ -154,8 +156,17 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 			return nil
 		}
 	}
-	require.Empty(t, next(), "recovered stale membership is cleared on startup")
 	require.Equal(t, "m.call", next()["application"])
+	select {
+	case body := <-updates:
+		t.Fatalf("unexpected clear before supplemental snapshot: %v", body)
+	case <-time.After(200 * time.Millisecond):
+	}
+	user.voiceSnapshotLock.Lock()
+	require.NoError(t, applyDiscordVoiceGatewayEvent(session.State, user.voiceSnapshotGuilds, "READY_SUPPLEMENTAL", []byte(`{"guilds":[{"id":"10","voice_states":[{"user_id":"2","channel_id":"20"}]}]}`)))
+	user.voiceSnapshotLock.Unlock()
+	user.voiceMirrorWake <- struct{}{}
+	require.Empty(t, next(), "the complete snapshot clears a user who left while disconnected")
 	viewersMu.Lock()
 	otherViewer = true
 	viewersMu.Unlock()
