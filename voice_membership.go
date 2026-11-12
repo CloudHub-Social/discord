@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -53,6 +54,18 @@ type voiceMembership struct {
 	userID    string
 }
 
+// A departure observed on an earlier connection may have been reversed while
+// disconnected, so its failed clear is not current evidence of absence.
+type voiceConnection struct{ generation, epoch uint64 }
+
+func (user *User) canRetryVoiceClear(member voiceMembership, complete bool, generation, epoch uint64) bool {
+	if complete {
+		return true
+	}
+	confirmed, ok := user.voiceMirrorConfirmed[member]
+	return ok && confirmed == (voiceConnection{generation, epoch})
+}
+
 // snapshotDiscordVoiceMemberships only returns channels the logged-in Discord
 // account is known to see. Discord's user-session cache may be incomplete.
 func snapshotDiscordVoiceMemberships(state *discordgo.State, userID string) map[voiceMembership]struct{} {
@@ -89,9 +102,140 @@ func snapshotDiscordVoiceMemberships(state *discordgo.State, userID string) map[
 	return result
 }
 
-// runDiscordVoiceMirror refreshes only currently observed memberships. Missing
-// entries are not explicitly removed because the upstream snapshot may be
-// incomplete; they expire automatically when no longer refreshed.
+// applyDiscordVoiceGatewayEvent incorporates user-gateway voice snapshots and
+// deltas that discordgo does not parse. The caller serializes gateway events.
+// A missing voice_states field means unavailable, not an empty snapshot.
+func applyDiscordVoiceGatewayEvent(state *discordgo.State, known map[string]bool, kind string, raw []byte) error {
+	type guildSnapshot struct {
+		ID          string          `json:"id"`
+		VoiceStates json.RawMessage `json:"voice_states"`
+	}
+	var snapshots []guildSnapshot
+	switch kind {
+	case "READY_SUPPLEMENTAL":
+		var payload struct {
+			Guilds []guildSnapshot `json:"guilds"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return err
+		}
+		snapshots = payload.Guilds
+	case "PASSIVE_UPDATE_V2":
+		var payload struct {
+			GuildID string                  `json:"guild_id"`
+			Updated []*discordgo.VoiceState `json:"updated_voice_states"`
+			Removed []string                `json:"removed_voice_states"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return err
+		}
+		state.Lock()
+		defer state.Unlock()
+		for _, guild := range state.Guilds {
+			if guild == nil || guild.ID != payload.GuildID {
+				continue
+			}
+			for _, id := range payload.Removed {
+				guild.VoiceStates = removeVoiceUser(guild.VoiceStates, id)
+			}
+			for _, voice := range payload.Updated {
+				if voice == nil || voice.UserID == "" {
+					continue
+				}
+				guild.VoiceStates = removeVoiceUser(guild.VoiceStates, voice.UserID)
+				if voice.ChannelID != "" {
+					voice.GuildID = guild.ID
+					guild.VoiceStates = append(guild.VoiceStates, voice)
+				}
+			}
+			break
+		}
+		return nil
+	default:
+		return nil
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.ID == "" || len(snapshot.VoiceStates) == 0 || string(snapshot.VoiceStates) == "null" {
+			continue
+		}
+		var voices []*discordgo.VoiceState
+		if err := json.Unmarshal(snapshot.VoiceStates, &voices); err != nil {
+			return err
+		}
+		for _, voice := range voices {
+			if voice == nil || voice.UserID == "" || voice.ChannelID == "" {
+				return fmt.Errorf("invalid voice state in supplemental snapshot")
+			}
+			voice.GuildID = snapshot.ID
+		}
+		state.Lock()
+		for _, guild := range state.Guilds {
+			if guild != nil && guild.ID == snapshot.ID && !guild.Unavailable {
+				guild.VoiceStates = voices
+				known[snapshot.ID] = true
+				break
+			}
+		}
+		state.Unlock()
+	}
+	return nil
+}
+
+func removeVoiceUser(states []*discordgo.VoiceState, userID string) []*discordgo.VoiceState {
+	result := states[:0]
+	for _, state := range states {
+		if state != nil && state.UserID != userID {
+			result = append(result, state)
+		}
+	}
+	return result
+}
+
+// snapshotDiscordVoiceMirror evaluates visibility once per channel so a
+// transient permission lookup failure cannot turn an observed user into a
+// supposedly departed one. The caller holds voiceSnapshotLock.
+func snapshotDiscordVoiceMirror(state *discordgo.State, userID string, known map[string]bool, bot bool) (map[voiceMembership]struct{}, map[string]bool) {
+	observed := make(map[voiceMembership]struct{})
+	knownChannels := make(map[string]bool)
+	channels := make(map[string]bool)
+	var candidates []voiceMembership
+	state.RLock()
+	for _, guild := range state.Guilds {
+		if guild == nil || guild.Unavailable {
+			continue
+		}
+		for _, channel := range guild.Channels {
+			if channel != nil && (channel.Type == discordgo.ChannelTypeGuildVoice || channel.Type == discordgo.ChannelTypeGuildStageVoice) {
+				channels[channel.ID] = known[guild.ID] || (bot && guild.VoiceStates != nil)
+			}
+		}
+		for _, voice := range guild.VoiceStates {
+			if voice != nil && voice.UserID != "" && voice.ChannelID != "" {
+				candidates = append(candidates, voiceMembership{channelID: voice.ChannelID, userID: voice.UserID})
+			}
+		}
+	}
+	state.RUnlock()
+	allowed := make(map[string]bool)
+	for channel, complete := range channels {
+		permissions, err := state.UserChannelPermissions(userID, channel)
+		if err == nil && permissions&discordgo.PermissionViewChannel != 0 {
+			allowed[channel] = true
+			if complete {
+				knownChannels[channel] = true
+			}
+		}
+	}
+	for _, member := range candidates {
+		if allowed[member.channelID] {
+			observed[member] = struct{}{}
+		}
+	}
+	return observed, knownChannels
+}
+
+// runDiscordVoiceMirror refreshes observed memberships and clears missing
+// entries only after a complete snapshot for their guild has arrived.
 func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 	if !user.bridge.Config.Bridge.DiscordVoiceActivity {
 		return
@@ -139,18 +283,33 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 			if user.voiceMirrorPending == nil {
 				user.voiceMirrorPending = make(map[voiceMembership]struct{})
 			}
-			observed := snapshotDiscordVoiceMemberships(session.State, discordID)
+			user.voiceSnapshotLock.Lock()
+			observed, knownChannels := snapshotDiscordVoiceMirror(session.State, discordID, user.voiceSnapshotGuilds, !session.IsUser)
+			user.voiceSnapshotLock.Unlock()
 			if !bootstrapped && discordID != "" && !time.Now().Before(nextBootstrapAttempt) {
-				bootstrapped = user.restoreDiscordVoiceState(generation, epoch, discordID, observed)
+				bootstrapped = user.restoreDiscordVoiceState(generation, epoch, discordID, observed, knownChannels)
 				nextBootstrapAttempt = time.Now().Add(time.Minute)
 			}
 			if !user.isCurrentConnection(generation, epoch) {
 				user.voiceMirrorLock.Unlock()
 				return
 			}
+			// A complete guild snapshot can prove a participant departed while
+			// disconnected. An incomplete startup cache cannot.
+			for member := range user.voiceMirrorPublished {
+				if knownChannels[member.channelID] {
+					if _, present := observed[member]; !present {
+						user.voiceMirrorPending[member] = struct{}{}
+					}
+				}
+			}
 			for member := range user.voiceMirrorPending {
+				if !user.canRetryVoiceClear(member, knownChannels[member.channelID], generation, epoch) {
+					continue
+				}
 				if _, returned := observed[member]; returned {
 					delete(user.voiceMirrorPending, member)
+					delete(user.voiceMirrorConfirmed, member)
 				} else {
 					user.clearPublishedVoiceMembership(member, discordID)
 				}
@@ -214,17 +373,16 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 }
 
 // restoreDiscordVoiceState reconciles state left by an earlier bridge process.
-// Missing cached Discord activity is cleared rather than displayed as certain;
-// future gateway updates can publish it again. Calls belonging to real Matrix
-// devices or another linked account are never modified.
-func (user *User) restoreDiscordVoiceState(generation, epoch uint64, discordID string, observed map[voiceMembership]struct{}) bool {
+// Missing cached Discord activity is cleared only with a complete guild snapshot.
+// Calls belonging to real Matrix devices or another linked account are never modified.
+func (user *User) restoreDiscordVoiceState(generation, epoch uint64, discordID string, observed map[voiceMembership]struct{}, knownChannels map[string]bool) bool {
 	if user.bridge.DB == nil {
 		return true
 	}
-	return user.restoreDiscordVoicePortals(generation, epoch, discordID, observed, user.bridge.GetAllPortals())
+	return user.restoreDiscordVoicePortals(generation, epoch, discordID, observed, knownChannels, user.bridge.GetAllPortals())
 }
 
-func (user *User) restoreDiscordVoicePortals(generation, epoch uint64, discordID string, observed map[voiceMembership]struct{}, portals []*Portal) bool {
+func (user *User) restoreDiscordVoicePortals(generation, epoch uint64, discordID string, observed map[voiceMembership]struct{}, knownChannels map[string]bool, portals []*Portal) bool {
 	complete := true
 	for _, portal := range portals {
 		if !user.isCurrentConnection(generation, epoch) {
@@ -249,8 +407,10 @@ func (user *User) restoreDiscordVoicePortals(generation, epoch uint64, discordID
 					continue
 				}
 				member := voiceMembership{channelID: portal.Key.ChannelID, userID: discordUser}
-				user.voiceMirrorPublished[member] = time.Time{}
-				if _, present := observed[member]; !present {
+				if _, tracked := user.voiceMirrorPublished[member]; !tracked {
+					user.voiceMirrorPublished[member] = time.Time{}
+				}
+				if _, present := observed[member]; !present && knownChannels[member.channelID] {
 					user.voiceMirrorPending[member] = struct{}{}
 				}
 			}
@@ -290,6 +450,10 @@ func (user *User) clearDiscordVoiceDeparture(update *discordgo.VoiceStateUpdate,
 		user.voiceMirrorPending = make(map[voiceMembership]struct{})
 	}
 	user.voiceMirrorPending[memberKey] = struct{}{}
+	if user.voiceMirrorConfirmed == nil {
+		user.voiceMirrorConfirmed = make(map[voiceMembership]voiceConnection)
+	}
+	user.voiceMirrorConfirmed[memberKey] = voiceConnection{generation, epoch}
 	user.clearPublishedVoiceMembership(memberKey, discordID)
 }
 
@@ -298,6 +462,7 @@ func (user *User) clearDiscordVoiceDeparture(update *discordgo.VoiceStateUpdate,
 func (user *User) clearPublishedVoiceMembership(member voiceMembership, discordID string) {
 	if _, published := user.voiceMirrorPublished[member]; !published {
 		delete(user.voiceMirrorPending, member)
+		delete(user.voiceMirrorConfirmed, member)
 		return
 	}
 	portal := user.GetExistingPortalByID(member.channelID)
@@ -311,5 +476,6 @@ func (user *User) clearPublishedVoiceMembership(member voiceMembership, discordI
 	} else {
 		delete(user.voiceMirrorPublished, member)
 		delete(user.voiceMirrorPending, member)
+		delete(user.voiceMirrorConfirmed, member)
 	}
 }
