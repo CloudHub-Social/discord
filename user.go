@@ -1938,6 +1938,21 @@ func (user *User) addGuildToSpace(guild *Guild, isInSpace bool, timestamp time.T
 			isInSpace = true
 		}
 	}
+	if guild.MXID != "" {
+		root := user.GetSpaceRoom()
+		if root != "" {
+			var parent event.SpaceParentEventContent
+			if err := user.bridge.Bot.StateEvent(guild.MXID, event.StateSpaceParent, root.String(), &parent); err != nil || len(parent.Via) == 0 {
+				_, err = user.bridge.Bot.SendStateEvent(guild.MXID, event.StateSpaceParent, root.String(), &event.SpaceParentEventContent{
+					Via:       []string{user.bridge.AS.HomeserverDomain},
+					Canonical: true,
+				})
+				if err != nil {
+					user.log.Error().Err(err).Str("guild_id", guild.ID).Msg("Failed to reconcile guild parent space")
+				}
+			}
+		}
+	}
 	user.MarkInPortal(database.UserPortal{
 		DiscordID: guild.ID,
 		Type:      database.UserPortalTypeGuild,
