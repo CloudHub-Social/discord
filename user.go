@@ -47,6 +47,7 @@ type User struct {
 	voiceSnapshotGuilds   map[string]bool
 	voiceMirrorPublished  map[voiceMembership]time.Time
 	voiceMirrorPending    map[voiceMembership]struct{}
+	voiceMirrorConfirmed  map[voiceMembership]voiceConnection
 	voiceMirrorWake       chan struct{}
 	voiceMirrorRunning    bool
 	voiceMirrorGeneration uint64

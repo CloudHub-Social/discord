@@ -118,3 +118,11 @@ func TestDiscordVoiceGatewaySnapshotsAndPassiveUpdates(t *testing.T) {
 	require.NoError(t, applyDiscordVoiceGatewayEvent(state, known, "READY_SUPPLEMENTAL", []byte(`{"guilds":[{"id":"10","voice_states":[]}]}`)))
 	require.Empty(t, guild.VoiceStates)
 }
+
+func TestVoicePendingRetryRequiresCurrentConfirmationOrSnapshot(t *testing.T) {
+	member := voiceMembership{channelID: "20", userID: "2"}
+	user := &User{voiceMirrorConfirmed: map[voiceMembership]voiceConnection{member: {generation: 3, epoch: 4}}}
+	require.True(t, user.canRetryVoiceClear(member, false, 3, 4), "confirmed leave on this connection can retry without a snapshot")
+	require.False(t, user.canRetryVoiceClear(member, false, 4, 5), "a previous connection cannot confirm current absence")
+	require.True(t, user.canRetryVoiceClear(member, true, 4, 5), "a complete new snapshot can confirm absence")
+}

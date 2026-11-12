@@ -182,9 +182,12 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 	viewersMu.Lock()
 	failClearOnce = true
 	viewersMu.Unlock()
+	user.voiceSnapshotLock.Lock()
+	delete(user.voiceSnapshotGuilds, "10")
+	user.voiceSnapshotLock.Unlock()
 	user.clearDiscordVoiceDeparture(update, 0, 0)
 	user.voiceMirrorWake <- struct{}{}
-	require.Empty(t, next(), "a failed departure clear is retried on reconciliation")
+	require.Empty(t, next(), "a confirmed departure clear is retried even without a complete snapshot")
 }
 
 func TestVoiceStateSendRegistersAndJoinsNewGhost(t *testing.T) {

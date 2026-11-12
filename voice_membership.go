@@ -54,6 +54,18 @@ type voiceMembership struct {
 	userID    string
 }
 
+// A departure observed on an earlier connection may have been reversed while
+// disconnected, so its failed clear is not current evidence of absence.
+type voiceConnection struct{ generation, epoch uint64 }
+
+func (user *User) canRetryVoiceClear(member voiceMembership, complete bool, generation, epoch uint64) bool {
+	if complete {
+		return true
+	}
+	confirmed, ok := user.voiceMirrorConfirmed[member]
+	return ok && confirmed == (voiceConnection{generation, epoch})
+}
+
 // snapshotDiscordVoiceMemberships only returns channels the logged-in Discord
 // account is known to see. Discord's user-session cache may be incomplete.
 func snapshotDiscordVoiceMemberships(state *discordgo.State, userID string) map[voiceMembership]struct{} {
@@ -292,11 +304,12 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 				}
 			}
 			for member := range user.voiceMirrorPending {
-				if !knownChannels[member.channelID] {
+				if !user.canRetryVoiceClear(member, knownChannels[member.channelID], generation, epoch) {
 					continue
 				}
 				if _, returned := observed[member]; returned {
 					delete(user.voiceMirrorPending, member)
+					delete(user.voiceMirrorConfirmed, member)
 				} else {
 					user.clearPublishedVoiceMembership(member, discordID)
 				}
@@ -437,6 +450,10 @@ func (user *User) clearDiscordVoiceDeparture(update *discordgo.VoiceStateUpdate,
 		user.voiceMirrorPending = make(map[voiceMembership]struct{})
 	}
 	user.voiceMirrorPending[memberKey] = struct{}{}
+	if user.voiceMirrorConfirmed == nil {
+		user.voiceMirrorConfirmed = make(map[voiceMembership]voiceConnection)
+	}
+	user.voiceMirrorConfirmed[memberKey] = voiceConnection{generation, epoch}
 	user.clearPublishedVoiceMembership(memberKey, discordID)
 }
 
@@ -445,6 +462,7 @@ func (user *User) clearDiscordVoiceDeparture(update *discordgo.VoiceStateUpdate,
 func (user *User) clearPublishedVoiceMembership(member voiceMembership, discordID string) {
 	if _, published := user.voiceMirrorPublished[member]; !published {
 		delete(user.voiceMirrorPending, member)
+		delete(user.voiceMirrorConfirmed, member)
 		return
 	}
 	portal := user.GetExistingPortalByID(member.channelID)
@@ -458,5 +476,6 @@ func (user *User) clearPublishedVoiceMembership(member voiceMembership, discordI
 	} else {
 		delete(user.voiceMirrorPublished, member)
 		delete(user.voiceMirrorPending, member)
+		delete(user.voiceMirrorConfirmed, member)
 	}
 }
