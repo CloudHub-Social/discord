@@ -982,6 +982,8 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 			if user.isCurrentConnection(generation, epoch) {
 				if err := applyDiscordVoiceGatewayEvent(session.State, user.voiceSnapshotGuilds, raw.Type, raw.RawData); err != nil {
 					user.log.Warn().Err(err).Msg("Failed to process Discord voice gateway state")
+				} else if raw.Type == "READY_SUPPLEMENTAL" {
+					user.log.Info().Int("complete_guilds", len(user.voiceSnapshotGuilds)).Msg("Processed Discord voice reconnect snapshot")
 				}
 				select {
 				case user.voiceMirrorWake <- struct{}{}:
