@@ -254,7 +254,7 @@ def unit_snapshot():
 def container_snapshot():
     template = '{"id":{{json .Id}},"running":{{json .State.Running}},"started":{{json .State.StartedAt}},"restarts":{{json .RestartCount}},"revision":{{json (index .Config.Labels "org.opencontainers.image.revision")}}}'
     result = json.loads(command(['docker', 'inspect', '--format', template, CONTAINER], 'container', limit=8192))
-    if not re.fullmatch(r'[0-9a-f]{64}', result.get('id', '')) or not re.fullmatch(r'[0-9a-f]{40}', result.get('revision', '')):
+    if not isinstance(result.get('id'), str) or not re.fullmatch(r'[0-9a-f]{64}', result['id']) or not isinstance(result.get('revision'), str) or not re.fullmatch(r'[0-9a-f]{40}', result['revision']):
         raise ProbeError('container_identity_invalid')
     return result
 

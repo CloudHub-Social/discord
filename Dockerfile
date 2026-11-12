@@ -8,6 +8,9 @@ RUN go build -o /usr/bin/mautrix-discord
 
 FROM alpine:3.23
 
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+
 ENV UID=1337 \
     GID=1337
 
