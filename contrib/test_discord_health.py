@@ -6,7 +6,7 @@ import pathlib
 from unittest.mock import patch
 import unittest
 
-from discord_health import ProbeError, assess, command, notification_key, parse_record, presence_snapshot, journal_records, collect
+from discord_health import ProbeError, assess, command, notification_key, parse_record, presence_snapshot, journal_records, collect, container_snapshot
 
 INV = 'a' * 32
 NOW = 10000.0
@@ -220,6 +220,13 @@ class AssessTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    def test_missing_revision_is_a_specific_probe_error(self):
+        data = {'id': 'a' * 64, 'running': True, 'started': '2026-01-01T00:00:00Z', 'restarts': 0, 'revision': None}
+        with patch('discord_health.command', return_value=json.dumps(data)):
+            with self.assertRaisesRegex(ProbeError, 'container_identity_invalid'):
+                container_snapshot()
+
+
     def test_duplicate_configuration_is_unknown(self):
         with tempfile.TemporaryDirectory() as folder:
             p = pathlib.Path(folder) / 'config.yaml'

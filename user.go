@@ -901,7 +901,7 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 	}
 	user.reconstructRelationships(nil)
 
-	user.log.Debug().Msg("Connecting to discord")
+	user.log.Info().Msg("Connecting to discord")
 
 	session, err := discordgo.New(user.DiscordToken)
 	if err != nil {
@@ -1187,10 +1187,8 @@ func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 		// discordgo dispatches a raw *Event for gateway event types it doesn't have
 		// a typed handler for. Discord's user gateway delivers presence via newer
 		// events (e.g. PRESENCE_UPDATE_V2, PASSIVE_UPDATE_V2) that discordgo does not
-		// parse, so they land here and are otherwise dropped — which is why some
-		// users never get a Matrix-side presence. Log the raw payload of the
-		// presence-relevant ones at debug so their schema can be captured and a
-		// proper handler written. Other unknown events are ignored.
+		// parse, so they land here and are otherwise dropped. Log only event
+		// metadata: these payloads can contain private presence and activity.
 		switch evt.Type {
 		case "CALL_CREATE", "CALL_UPDATE", "CALL_DELETE":
 			if user.bridge.Config.Bridge.DiscordCallAlerts {
@@ -1253,15 +1251,14 @@ func (user *User) eventHandler(generation, epoch uint64, rawEvt any) {
 					user.log.Debug().
 						Str("event_type", evt.Type).
 						Int("payload_bytes", len(evt.RawData)).
-						RawJSON("merged_presences", diag.MergedPresences).
-						Msg("Raw gateway merged_presences (presence seeding diagnostic)")
+						Msg("Gateway merged presences received")
 				}
 			}
 		case "PRESENCE_UPDATE_V2", "PASSIVE_UPDATE_V2", "SESSIONS_REPLACE":
 			user.log.Debug().
 				Str("event_type", evt.Type).
-				RawJSON("payload", evt.RawData).
-				Msg("Unhandled raw gateway event (presence diagnostic)")
+				Int("payload_bytes", len(evt.RawData)).
+				Msg("Gateway diagnostic event received")
 		}
 	default:
 		user.log.Debug().Type("event_type", evt).Msg("Unhandled event")
@@ -1324,7 +1321,7 @@ func (s ChannelSlice) Swap(i, j int) {
 }
 
 func (user *User) readyHandler(r *discordgo.Ready, generation, epoch uint64) {
-	user.log.Debug().Msg("Discord connection ready")
+	user.log.Info().Msg("Discord connection ready")
 	// Clear the sent-presence dedup cache so the first Matrix presence ping
 	// after a reconnect always reaches Discord (the new gateway session starts
 	// without this Matrix-derived status).
@@ -1853,7 +1850,7 @@ func (user *User) sleepGuildSub(ctx context.Context) {
 }
 
 func (user *User) resumeHandler(_ *discordgo.Resumed, generation, epoch uint64) {
-	user.log.Debug().Msg("Discord connection resumed")
+	user.log.Info().Msg("Discord connection resumed")
 	go user.runDiscordVoiceMirror(generation, epoch)
 	// Clear the dedup cache so the first presence ping after a resume re-sends
 	// the current status to Discord (the resumed session may have lost it).
@@ -2114,16 +2111,16 @@ func (user *User) disconnectedHandler(_ *discordgo.Disconnect) {
 // disconnectedLocked requires bridgeStateLock and reconnectLock.
 func (user *User) disconnectedLocked() {
 	if user.wasLoggedOut {
-		user.log.Debug().Msg("Disconnected from Discord (not updating bridge state as user was just logged out)")
+		user.log.Info().Msg("Disconnected from Discord (not updating bridge state as user was just logged out)")
 		return
 	}
 	// A teardown the bridge initiated (manual disconnect / shutdown) must not
 	// trigger a reconnect.
 	if user.manualDisconnect {
-		user.log.Debug().Msg("Disconnected from Discord (manual disconnect, not reconnecting)")
+		user.log.Info().Msg("Disconnected from Discord (manual disconnect, not reconnecting)")
 		return
 	}
-	user.log.Debug().Msg("Disconnected from Discord")
+	user.log.Info().Msg("Disconnected from Discord")
 	user.wasDisconnected = true
 	user.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "dc-transient-disconnect", Message: "Temporarily disconnected from Discord, trying to reconnect"})
 	// The dropped session's READY watchdog is moot now; the next connect arms a
