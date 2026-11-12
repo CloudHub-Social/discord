@@ -1926,16 +1926,35 @@ func (user *User) handlePrivateChannel(portal *Portal, meta *discordgo.Channel, 
 }
 
 func (user *User) addGuildToSpace(guild *Guild, isInSpace bool, timestamp time.Time) bool {
-	if len(guild.MXID) > 0 && !isInSpace {
-		_, err := user.bridge.Bot.SendStateEvent(user.GetSpaceRoom(), event.StateSpaceChild, guild.MXID.String(), &event.SpaceChildEventContent{
-			Via: []string{user.bridge.AS.HomeserverDomain},
-		})
-		if err != nil {
-			user.log.Error().Err(err).
-				Str("guild_space_id", guild.MXID.String()).
-				Msg("Failed to add guild space to user space")
-		} else {
-			isInSpace = true
+	if guild.MXID != "" {
+		root := user.GetSpaceRoom()
+		if root != "" {
+			// The cached user_portal.in_space flag can be stale after a partial
+			// state write or a manual space edit. Reconcile the actual state.
+			var child event.SpaceChildEventContent
+			if err := user.bridge.Bot.StateEvent(root, event.StateSpaceChild, guild.MXID.String(), &child); err != nil || len(child.Via) == 0 {
+				_, err = user.bridge.Bot.SendStateEvent(root, event.StateSpaceChild, guild.MXID.String(), &event.SpaceChildEventContent{
+					Via: []string{user.bridge.AS.HomeserverDomain},
+				})
+				if err != nil {
+					user.log.Error().Err(err).Str("guild_id", guild.ID).Msg("Failed to reconcile guild child space")
+					isInSpace = false
+				} else {
+					isInSpace = true
+				}
+			} else {
+				isInSpace = true
+			}
+			var parent event.SpaceParentEventContent
+			if err := user.bridge.Bot.StateEvent(guild.MXID, event.StateSpaceParent, root.String(), &parent); err != nil || len(parent.Via) == 0 || !parent.Canonical {
+				_, err = user.bridge.Bot.SendStateEvent(guild.MXID, event.StateSpaceParent, root.String(), &event.SpaceParentEventContent{
+					Via:       []string{user.bridge.AS.HomeserverDomain},
+					Canonical: true,
+				})
+				if err != nil {
+					user.log.Error().Err(err).Str("guild_id", guild.ID).Msg("Failed to reconcile guild parent space")
+				}
+			}
 		}
 	}
 	user.MarkInPortal(database.UserPortal{
