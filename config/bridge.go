@@ -72,6 +72,10 @@ type BridgeConfig struct {
 	// an empty activities list and never replays other clients' activities.
 	SyncMatrixPresenceToDiscord bool `yaml:"sync_matrix_presence_to_discord"`
 
+	// MatrixPresenceOnlineAsIdle avoids advertising the bridge's user session as
+	// active when Matrix reports online. Discord notification behavior is not guaranteed.
+	MatrixPresenceOnlineAsIdle bool `yaml:"matrix_presence_online_as_idle"`
+
 	// SyncMatrixStatusToDiscord controls whether the Matrix status message (the
 	// custom status TEXT) is forwarded to Discord. User text-only updates use
 	// REST without changing gateway state, AFK, or activities. When this flag is

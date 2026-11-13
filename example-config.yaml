@@ -191,6 +191,11 @@ bridge:
     # empty activities list for this bridge session; they do not replay activities
     # observed on other clients. This is off by default.
     sync_matrix_presence_to_discord: false
+
+    # Experimental: when forwarding user-account presence, report Matrix online
+    # as idle/away instead of an active bridge session. This changes the shown
+    # presence and does not guarantee Discord mobile push notifications.
+    matrix_presence_online_as_idle: false
     # Should the Matrix status message (custom status TEXT) be forwarded to Discord?
     # User status text is updated over REST independently of presence. Text-only
     # updates do not change gateway status, AFK, or activities. With this off,
