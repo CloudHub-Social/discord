@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -264,6 +265,7 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 	var lastReconcile time.Time
 	bootstrapped := false
 	var nextBootstrapAttempt time.Time
+	restoredPrivate := make(map[string]bool)
 	for user.isCurrentConnection(generation, epoch) {
 		if wait := time.Until(lastReconcile.Add(time.Second)); wait > 0 {
 			time.Sleep(wait)
@@ -285,10 +287,25 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 			}
 			user.voiceSnapshotLock.Lock()
 			observed, knownChannels := snapshotDiscordVoiceMirror(session.State, discordID, user.voiceSnapshotGuilds, !session.IsUser)
+			user.privateCalls.snapshot(observed, knownChannels)
 			user.voiceSnapshotLock.Unlock()
 			if !bootstrapped && discordID != "" && !time.Now().Before(nextBootstrapAttempt) {
 				bootstrapped = user.restoreDiscordVoiceState(generation, epoch, discordID, observed, knownChannels)
 				nextBootstrapAttempt = time.Now().Add(time.Minute)
+			}
+			// Inspect only private rooms with authoritative call data. This avoids
+			// blocking live updates on unrelated historical DM rooms.
+			for channel := range knownChannels {
+				if restoredPrivate[channel] {
+					continue
+				}
+				portal := user.GetExistingPortalByID(channel)
+				if portal == nil || (portal.Type != discordgo.ChannelTypeDM && portal.Type != discordgo.ChannelTypeGroupDM) {
+					continue
+				}
+				if user.restoreDiscordVoicePortals(generation, epoch, discordID, observed, knownChannels, []*Portal{portal}) {
+					restoredPrivate[channel] = true
+				}
 			}
 			if !user.isCurrentConnection(generation, epoch) {
 				user.voiceMirrorLock.Unlock()
@@ -311,6 +328,22 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 					delete(user.voiceMirrorPending, member)
 					delete(user.voiceMirrorConfirmed, member)
 				} else {
+					// Matrix I/O above may have taken long enough for a newer
+					// private voice event to supersede this snapshot.
+					user.voiceSnapshotLock.Lock()
+					current := make(map[voiceMembership]struct{})
+					currentKnown := make(map[string]bool)
+					user.privateCalls.snapshot(current, currentKnown)
+					user.voiceSnapshotLock.Unlock()
+					if currentKnown[member.channelID] {
+						if _, returned := current[member]; returned {
+							delete(user.voiceMirrorPending, member)
+							delete(user.voiceMirrorConfirmed, member)
+							continue
+						}
+					} else if portal := user.GetExistingPortalByID(member.channelID); portal != nil && (portal.Type == discordgo.ChannelTypeDM || portal.Type == discordgo.ChannelTypeGroupDM) {
+						continue
+					}
 					user.clearPublishedVoiceMembership(member, discordID)
 				}
 			}
@@ -328,8 +361,7 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 				// Discord permission check only establishes this account's access.
 				allowed, checked := audienceByChannel[member.channelID]
 				if !checked {
-					viewers, err := portal.getMatrixUsers()
-					allowed = err == nil && len(viewers) == 1 && viewers[0] == user.MXID
+					allowed = portal.discordVoiceAudienceIsPrivate(user.MXID)
 					audienceByChannel[member.channelID] = allowed
 				}
 				if !allowed {
@@ -346,6 +378,20 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 					continue
 				}
 				intent := puppet.DefaultIntent()
+				if err := portal.ensureDiscordVoiceGhostJoined(intent); err != nil {
+					user.log.Warn().Err(err).Msg("Failed to join Discord voice ghost")
+					continue
+				}
+				if portal.Type == discordgo.ChannelTypeDM || portal.Type == discordgo.ChannelTypeGroupDM {
+					user.voiceSnapshotLock.Lock()
+					current := make(map[voiceMembership]struct{})
+					user.privateCalls.snapshot(current, make(map[string]bool))
+					_, present := current[member]
+					user.voiceSnapshotLock.Unlock()
+					if !present {
+						continue
+					}
+				}
 				stateKey := discordVoiceMembershipStateKey(string(puppet.MXID), discordID)
 				eventType := event.Type{Type: "org.matrix.msc3401.call.member", Class: event.StateEventType}
 				if _, err := intent.SendStateEvent(portal.MXID, eventType, stateKey, discordVoiceMembershipContent(time.Now(), discordID)); err != nil {
@@ -379,7 +425,13 @@ func (user *User) restoreDiscordVoiceState(generation, epoch uint64, discordID s
 	if user.bridge.DB == nil {
 		return true
 	}
-	return user.restoreDiscordVoicePortals(generation, epoch, discordID, observed, knownChannels, user.bridge.GetAllPortals())
+	var guildPortals []*Portal
+	for _, portal := range user.bridge.GetAllPortals() {
+		if portal != nil && (portal.Type == discordgo.ChannelTypeGuildVoice || portal.Type == discordgo.ChannelTypeGuildStageVoice) {
+			guildPortals = append(guildPortals, portal)
+		}
+	}
+	return user.restoreDiscordVoicePortals(generation, epoch, discordID, observed, knownChannels, guildPortals)
 }
 
 func (user *User) restoreDiscordVoicePortals(generation, epoch uint64, discordID string, observed map[voiceMembership]struct{}, knownChannels map[string]bool, portals []*Portal) bool {
@@ -388,7 +440,7 @@ func (user *User) restoreDiscordVoicePortals(generation, epoch uint64, discordID
 		if !user.isCurrentConnection(generation, epoch) {
 			return false
 		}
-		if portal == nil || portal.MXID == "" || (portal.Type != discordgo.ChannelTypeGuildVoice && portal.Type != discordgo.ChannelTypeGuildStageVoice) {
+		if portal == nil || portal.MXID == "" || (portal.Type != discordgo.ChannelTypeGuildVoice && portal.Type != discordgo.ChannelTypeGuildStageVoice && portal.Type != discordgo.ChannelTypeDM && portal.Type != discordgo.ChannelTypeGroupDM) {
 			continue
 		}
 		state, err := portal.MainIntent().State(portal.MXID)
@@ -478,4 +530,41 @@ func (user *User) clearPublishedVoiceMembership(member voiceMembership, discordI
 		delete(user.voiceMirrorPending, member)
 		delete(user.voiceMirrorConfirmed, member)
 	}
+}
+
+// discordVoiceAudienceIsPrivate includes pending invitations: an invitee can
+// join without another action by the bridge after the audience check.
+func (portal *Portal) discordVoiceAudienceIsPrivate(owner id.UserID) bool {
+	members, err := portal.MainIntent().Members(portal.MXID)
+	if err != nil {
+		return false
+	}
+	ownerJoined := false
+	for _, member := range members.Chunk {
+		if member == nil || member.StateKey == nil {
+			return false
+		}
+		membership, ok := member.Content.Raw["membership"].(string)
+		if !ok {
+			return false
+		}
+		if membership != "join" && membership != "invite" {
+			continue
+		}
+		mxid := id.UserID(*member.StateKey)
+		if mxid == owner {
+			if membership == "join" {
+				ownerJoined = true
+			}
+			continue
+		}
+		if _, puppet := portal.bridge.ParsePuppetMXID(mxid); !puppet && mxid != portal.bridge.Bot.UserID {
+			return false
+		}
+	}
+	return ownerJoined
+}
+
+func (portal *Portal) ensureDiscordVoiceGhostJoined(intent *appservice.IntentAPI) error {
+	return intent.EnsureJoined(portal.MXID, appservice.EnsureJoinedParams{BotOverride: portal.MainIntent().Client})
 }

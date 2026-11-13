@@ -45,6 +45,7 @@ type User struct {
 	voiceMirrorLock       sync.Mutex
 	voiceSnapshotLock     sync.Mutex
 	voiceSnapshotGuilds   map[string]bool
+	privateCalls          privateCalls
 	voiceMirrorPublished  map[voiceMembership]time.Time
 	voiceMirrorPending    map[voiceMembership]struct{}
 	voiceMirrorConfirmed  map[voiceMembership]voiceConnection
@@ -960,7 +961,37 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 	}
 	user.voiceSnapshotLock.Lock()
 	user.voiceSnapshotGuilds = make(map[string]bool)
+	user.privateCalls.reset()
 	user.voiceSnapshotLock.Unlock()
+	// Protected by voiceSnapshotLock. Entries exist only for tracked calls.
+	privateCallRefresh := make(map[string]int)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for user.isCurrentConnection(generation, epoch) {
+			<-ticker.C
+			if !user.isCurrentConnection(generation, epoch) {
+				return
+			}
+			user.voiceSnapshotLock.Lock()
+			var channel string
+			for id, attempts := range privateCallRefresh {
+				channel = id
+				if attempts >= 2 {
+					delete(privateCallRefresh, id)
+				} else {
+					privateCallRefresh[id] = attempts + 1
+				}
+				break
+			}
+			user.voiceSnapshotLock.Unlock()
+			if channel != "" {
+				if err := session.MarkViewing(channel); err != nil {
+					user.log.Warn().Err(err).Msg("Failed to request private call snapshot")
+				}
+			}
+		}
+	}()
 	session.EventHandler = func(evt any) {
 		if user.bridge.Config.Bridge.DiscordVoiceActivity {
 			switch guildEvent := evt.(type) {
@@ -992,6 +1023,40 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 				}
 			}
 			user.voiceSnapshotLock.Unlock()
+		}
+		if session.IsUser && user.bridge.Config.Bridge.DiscordVoiceActivity && user.isCurrentConnection(generation, epoch) {
+			user.voiceSnapshotLock.Lock()
+			if !user.isCurrentConnection(generation, epoch) {
+				user.voiceSnapshotLock.Unlock()
+				return
+			}
+			switch e := evt.(type) {
+			case *discordgo.Event:
+				if e.Type == "CALL_CREATE" || e.Type == "CALL_DELETE" {
+					user.privateCalls.event(e.Type, e.RawData)
+					for channel := range privateCallRefresh {
+						if user.privateCalls.complete[channel] && len(user.privateCalls.uncertain[channel]) == 0 {
+							delete(privateCallRefresh, channel)
+						}
+					}
+				}
+			case *discordgo.VoiceStateUpdate:
+				for _, channel := range user.privateCalls.voice(e.VoiceState) {
+					if _, pending := privateCallRefresh[channel]; !pending {
+						privateCallRefresh[channel] = 0
+					}
+				}
+			}
+			user.voiceSnapshotLock.Unlock()
+			switch e := evt.(type) {
+			case *discordgo.Event:
+				if e.Type == "CALL_CREATE" || e.Type == "CALL_DELETE" {
+					select {
+					case user.voiceMirrorWake <- struct{}{}:
+					default:
+					}
+				}
+			}
 		}
 		user.eventHandlerSync(generation, epoch, evt)
 	}

@@ -32,6 +32,17 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 		t.Logf("mock homeserver request: %s %s", r.Method, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/members"):
+			viewersMu.Lock()
+			members := []map[string]any{}
+			for _, mxid := range []string{"@owner:example.com", "@bridge:example.com", "@discord_2:example.com", "@discord_3:example.com"} {
+				members = append(members, map[string]any{"type": "m.room.member", "state_key": mxid, "sender": mxid, "content": map[string]any{"membership": "join"}})
+			}
+			if otherViewer {
+				members = append(members, map[string]any{"type": "m.room.member", "state_key": "@other:example.com", "sender": "@owner:example.com", "content": map[string]any{"membership": "invite"}})
+			}
+			viewersMu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"chunk": members})
 		case strings.HasSuffix(r.URL.Path, "/joined_members"):
 			viewersMu.Lock()
 			joined := map[string]any{"@owner:example.com": map[string]any{}, "@bridge:example.com": map[string]any{}, "@discord_2:example.com": map[string]any{}, "@discord_3:example.com": map[string]any{}}
@@ -171,7 +182,7 @@ func TestVoiceMirrorPublishesAndClears(t *testing.T) {
 	otherViewer = true
 	viewersMu.Unlock()
 	user.voiceMirrorWake <- struct{}{}
-	require.Empty(t, next(), "a new Matrix viewer causes the published membership to clear")
+	require.Empty(t, next(), "an invited Matrix viewer causes the published membership to clear")
 	viewersMu.Lock()
 	otherViewer = false
 	viewersMu.Unlock()
@@ -224,4 +235,136 @@ func TestVoiceStateSendRegistersAndJoinsNewGhost(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, []string{"register", "join", "state"}, requests)
+}
+
+func TestDiscordVoiceGhostUsesPrivateRoomInviter(t *testing.T) {
+	var requests []string
+	joined := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/join"):
+			requests = append(requests, "join")
+			if !joined {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"errcode":"M_FORBIDDEN"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"room_id":"!test:example.com"}`))
+		case strings.HasSuffix(r.URL.Path, "/invite"):
+			requests = append(requests, "invite:"+r.URL.Query().Get("user_id"))
+			joined = true
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	as := appservice.Create()
+	as.HomeserverDomain = "example.com"
+	as.Registration = &appservice.Registration{SenderLocalpart: "bridge", AppToken: "test"}
+	require.NoError(t, as.SetHomeserverURL(server.URL))
+	ghost := as.Intent("@discord_1:example.com")
+	inviter := as.Intent("@discord_2:example.com")
+	as.StateStore.MarkRegistered(ghost.UserID)
+	br := &DiscordBridge{puppets: map[string]*Puppet{"2": {Puppet: &database.Puppet{ID: "2"}, MXID: inviter.UserID}}}
+	br.AS = as
+	br.Bot = as.BotIntent()
+	br.puppets["2"].bridge = br
+	portal := &Portal{Portal: &database.Portal{MXID: "!test:example.com", Type: discordgo.ChannelTypeDM, OtherUserID: "2"}, bridge: br}
+	require.NoError(t, portal.ensureDiscordVoiceGhostJoined(ghost))
+	require.Equal(t, []string{"join", "invite:@discord_2:example.com", "join"}, requests)
+}
+
+func TestPrivateVoiceMirrorRevalidatesDuringMatrixIO(t *testing.T) {
+	for _, scenario := range []string{"delete_before_publish", "rejoin_before_clear"} {
+		t.Run(scenario, func(t *testing.T) {
+			blocked := make(chan struct{})
+			release := make(chan struct{})
+			updates := make(chan map[string]any, 2)
+			var once sync.Once
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/members"):
+					_, _ = w.Write([]byte(`{"chunk":[{"type":"m.room.member","state_key":"@owner:example.com","content":{"membership":"join"}}]}`))
+				case strings.HasSuffix(r.URL.Path, "/state"):
+					if scenario == "rejoin_before_clear" {
+						once.Do(func() { close(blocked); <-release })
+					}
+					_, _ = w.Write([]byte(`[]`))
+				case strings.Contains(r.URL.Path, "/state/m.room.power_levels"):
+					if scenario == "delete_before_publish" {
+						once.Do(func() { close(blocked); <-release })
+					}
+					_, _ = w.Write([]byte(`{"users":{"@bridge:example.com":100,"@discord_2:example.com":1},"events":{"org.matrix.msc3401.call.member":1}}`))
+				case strings.Contains(r.URL.Path, "/state/org.matrix.msc3401.call.member/"):
+					var body map[string]any
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					updates <- body
+					_, _ = w.Write([]byte(`{"event_id":"$event"}`))
+				default:
+					http.Error(w, "unexpected", http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			as := appservice.Create()
+			as.HomeserverDomain = "example.com"
+			as.Registration = &appservice.Registration{SenderLocalpart: "bridge", AppToken: "test"}
+			require.NoError(t, as.SetHomeserverURL(server.URL))
+			cfg := &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}}
+			cfg.Homeserver.Domain = "example.com"
+			require.NoError(t, yaml.Unmarshal([]byte("username_template: discord_{{.}}\n"), &cfg.Bridge))
+			cfg.Bridge.DiscordVoiceActivity = true
+			br := &DiscordBridge{Config: cfg, puppets: map[string]*Puppet{}, portalsByID: map[database.PortalKey]*Portal{}}
+			br.AS = as
+			br.Bot = as.BotIntent()
+			room := id.RoomID("!test:example.com")
+			ghost := id.UserID("@discord_2:example.com")
+			as.StateStore.MarkRegistered(ghost)
+			as.StateStore.SetMembership(room, ghost, event.MembershipJoin)
+			as.StateStore.MarkRegistered(br.Bot.UserID)
+			as.StateStore.SetMembership(room, br.Bot.UserID, event.MembershipJoin)
+			key := database.NewPortalKey("20", "")
+			br.portalsByID[key] = &Portal{Portal: &database.Portal{Key: key, MXID: room, Type: discordgo.ChannelTypeGroupDM}, bridge: br}
+			br.puppets["2"] = &Puppet{Puppet: &database.Puppet{ID: "2"}, MXID: ghost, bridge: br}
+			session, err := discordgo.New("test-token")
+			require.NoError(t, err)
+			member := voiceMembership{channelID: "20", userID: "2"}
+			user := &User{User: &database.User{MXID: "@owner:example.com", DiscordID: "1"}, bridge: br, Session: session, voiceMirrorWake: make(chan struct{}, 1), voiceMirrorPublished: map[voiceMembership]time.Time{}, voiceMirrorPending: map[voiceMembership]struct{}{}, voiceSnapshotGuilds: map[string]bool{}}
+			user.privateCalls.event("CALL_CREATE", []byte(`{"channel_id":"20","voice_states":[{"user_id":"2","session_id":"a"}]}`))
+			if scenario == "rejoin_before_clear" {
+				user.privateCalls.event("CALL_DELETE", []byte(`{"channel_id":"20"}`))
+				user.voiceMirrorPublished[member] = time.Now()
+			}
+			done := make(chan struct{})
+			go func() { defer close(done); user.runDiscordVoiceMirror(0, 0) }()
+			select {
+			case <-blocked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Matrix request was not reached")
+			}
+			user.voiceSnapshotLock.Lock()
+			if scenario == "delete_before_publish" {
+				user.privateCalls.event("CALL_DELETE", []byte(`{"channel_id":"20"}`))
+			} else {
+				user.privateCalls.event("CALL_CREATE", []byte(`{"channel_id":"20","voice_states":[{"user_id":"2","session_id":"a"}]}`))
+			}
+			user.voiceSnapshotLock.Unlock()
+			close(release)
+			select {
+			case body := <-updates:
+				t.Fatalf("stale state sent: %v", body)
+			case <-time.After(400 * time.Millisecond):
+			}
+			user.reconnectLock.Lock()
+			user.manualDisconnect = true
+			user.reconnectLock.Unlock()
+			select {
+			case user.voiceMirrorWake <- struct{}{}:
+			default:
+			}
+			<-done
+		})
+	}
 }
