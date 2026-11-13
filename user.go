@@ -1041,10 +1041,11 @@ func (user *User) connect(intentional bool, generation, epoch uint64) error {
 					}
 				}
 			case *discordgo.VoiceStateUpdate:
-				for _, channel := range user.privateCalls.voice(e.VoiceState) {
+				for _, channel := range user.privateCalls.voice(e.VoiceState, time.Now()) {
 					if _, pending := privateCallRefresh[channel]; !pending {
 						privateCallRefresh[channel] = 0
 					}
+					user.schedulePrivateVoiceDepartureWake(generation, epoch, privateVoiceDepartureGrace+time.Second)
 				}
 			}
 			user.voiceSnapshotLock.Unlock()
