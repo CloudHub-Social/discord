@@ -287,7 +287,7 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 			}
 			user.voiceSnapshotLock.Lock()
 			observed, knownChannels := snapshotDiscordVoiceMirror(session.State, discordID, user.voiceSnapshotGuilds, !session.IsUser)
-			user.privateCalls.snapshot(observed, knownChannels)
+			user.privateCalls.snapshot(observed, knownChannels, time.Now())
 			user.voiceSnapshotLock.Unlock()
 			if !bootstrapped && discordID != "" && !time.Now().Before(nextBootstrapAttempt) {
 				bootstrapped = user.restoreDiscordVoiceState(generation, epoch, discordID, observed, knownChannels)
@@ -333,7 +333,7 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 					user.voiceSnapshotLock.Lock()
 					current := make(map[voiceMembership]struct{})
 					currentKnown := make(map[string]bool)
-					user.privateCalls.snapshot(current, currentKnown)
+					user.privateCalls.snapshot(current, currentKnown, time.Now())
 					user.voiceSnapshotLock.Unlock()
 					if currentKnown[member.channelID] {
 						if _, returned := current[member]; returned {
@@ -385,7 +385,7 @@ func (user *User) runDiscordVoiceMirror(generation, epoch uint64) {
 				if portal.Type == discordgo.ChannelTypeDM || portal.Type == discordgo.ChannelTypeGroupDM {
 					user.voiceSnapshotLock.Lock()
 					current := make(map[voiceMembership]struct{})
-					user.privateCalls.snapshot(current, make(map[string]bool))
+					user.privateCalls.snapshot(current, make(map[string]bool), time.Now())
 					_, present := current[member]
 					user.voiceSnapshotLock.Unlock()
 					if !present {
@@ -567,4 +567,15 @@ func (portal *Portal) discordVoiceAudienceIsPrivate(owner id.UserID) bool {
 
 func (portal *Portal) ensureDiscordVoiceGhostJoined(intent *appservice.IntentAPI) error {
 	return intent.EnsureJoined(portal.MXID, appservice.EnsureJoinedParams{BotOverride: portal.MainIntent().Client})
+}
+
+func (user *User) schedulePrivateVoiceDepartureWake(generation, epoch uint64, delay time.Duration) {
+	time.AfterFunc(delay, func() {
+		if user.isCurrentConnection(generation, epoch) {
+			select {
+			case user.voiceMirrorWake <- struct{}{}:
+			default:
+			}
+		}
+	})
 }

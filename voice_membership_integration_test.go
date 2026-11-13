@@ -277,7 +277,7 @@ func TestDiscordVoiceGhostUsesPrivateRoomInviter(t *testing.T) {
 }
 
 func TestPrivateVoiceMirrorRevalidatesDuringMatrixIO(t *testing.T) {
-	for _, scenario := range []string{"delete_before_publish", "rejoin_before_clear"} {
+	for _, scenario := range []string{"delete_before_publish", "rejoin_before_clear", "departure_fallback"} {
 		t.Run(scenario, func(t *testing.T) {
 			blocked := make(chan struct{})
 			release := make(chan struct{})
@@ -337,25 +337,40 @@ func TestPrivateVoiceMirrorRevalidatesDuringMatrixIO(t *testing.T) {
 				user.privateCalls.event("CALL_DELETE", []byte(`{"channel_id":"20"}`))
 				user.voiceMirrorPublished[member] = time.Now()
 			}
+			if scenario == "departure_fallback" {
+				user.privateCalls.voice(&discordgo.VoiceState{UserID: "2", SessionID: "a"}, time.Now())
+				user.privateCalls.uncertain["20"]["2/a"] = time.Now().Add(300 * time.Millisecond)
+				user.voiceMirrorPublished[member] = time.Now()
+			}
 			done := make(chan struct{})
 			go func() { defer close(done); user.runDiscordVoiceMirror(0, 0) }()
-			select {
-			case <-blocked:
-			case <-time.After(5 * time.Second):
-				t.Fatal("Matrix request was not reached")
-			}
-			user.voiceSnapshotLock.Lock()
-			if scenario == "delete_before_publish" {
-				user.privateCalls.event("CALL_DELETE", []byte(`{"channel_id":"20"}`))
+			if scenario == "departure_fallback" {
+				user.schedulePrivateVoiceDepartureWake(0, 0, 350*time.Millisecond)
+				select {
+				case body := <-updates:
+					require.Empty(t, body, "fallback must clear departed participant")
+				case <-time.After(5 * time.Second):
+					t.Fatal("fallback did not clear the participant")
+				}
 			} else {
-				user.privateCalls.event("CALL_CREATE", []byte(`{"channel_id":"20","voice_states":[{"user_id":"2","session_id":"a"}]}`))
-			}
-			user.voiceSnapshotLock.Unlock()
-			close(release)
-			select {
-			case body := <-updates:
-				t.Fatalf("stale state sent: %v", body)
-			case <-time.After(400 * time.Millisecond):
+				select {
+				case <-blocked:
+				case <-time.After(5 * time.Second):
+					t.Fatal("Matrix request was not reached")
+				}
+				user.voiceSnapshotLock.Lock()
+				if scenario == "delete_before_publish" {
+					user.privateCalls.event("CALL_DELETE", []byte(`{"channel_id":"20"}`))
+				} else {
+					user.privateCalls.event("CALL_CREATE", []byte(`{"channel_id":"20","voice_states":[{"user_id":"2","session_id":"a"}]}`))
+				}
+				user.voiceSnapshotLock.Unlock()
+				close(release)
+				select {
+				case body := <-updates:
+					t.Fatalf("stale state sent: %v", body)
+				case <-time.After(400 * time.Millisecond):
+				}
 			}
 			user.reconnectLock.Lock()
 			user.manualDisconnect = true

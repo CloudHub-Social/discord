@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -12,13 +13,13 @@ import (
 type privateCalls struct {
 	calls     map[string]map[string]discordgo.VoiceState
 	complete  map[string]bool
-	uncertain map[string]map[string]bool
+	uncertain map[string]map[string]time.Time
 }
 
 func (p *privateCalls) reset() {
 	p.calls = make(map[string]map[string]discordgo.VoiceState)
 	p.complete = make(map[string]bool)
-	p.uncertain = make(map[string]map[string]bool)
+	p.uncertain = make(map[string]map[string]time.Time)
 }
 func (p *privateCalls) event(kind string, raw []byte) {
 	var call struct {
@@ -66,9 +67,11 @@ func (p *privateCalls) event(kind string, raw []byte) {
 }
 
 // A voice departure may be transient. Ask Discord for a fresh call snapshot
-// before changing the participant list. The caller sends opcode 13 for each
-// returned channel; a missing response is not evidence of departure.
-func (p *privateCalls) voice(v *discordgo.VoiceState) []string {
+// and retain the participant during the handoff grace. If no snapshot arrives,
+// the explicit departure takes effect after that grace on the same connection.
+const privateVoiceDepartureGrace = 20 * time.Second
+
+func (p *privateCalls) voice(v *discordgo.VoiceState, now time.Time) []string {
 	if v == nil || v.GuildID != "" || v.UserID == "" || v.SessionID == "" {
 		return nil
 	}
@@ -77,31 +80,50 @@ func (p *privateCalls) voice(v *discordgo.VoiceState) []string {
 	for channel, voices := range p.calls {
 		if _, present := voices[key]; present && channel != v.ChannelID {
 			if p.uncertain[channel] == nil {
-				p.uncertain[channel] = make(map[string]bool)
+				p.uncertain[channel] = make(map[string]time.Time)
 			}
-			p.uncertain[channel][key] = true
-			refresh = append(refresh, channel)
+			if _, pending := p.uncertain[channel][key]; !pending {
+				p.uncertain[channel][key] = now.Add(privateVoiceDepartureGrace)
+				refresh = append(refresh, channel)
+			}
 		}
 	}
 	if v.ChannelID != "" {
 		if voices, ok := p.calls[v.ChannelID]; ok {
+			// A replacement voice session for the same person cancels the
+			// pending departure and supersedes its old session.
+			for oldKey := range p.uncertain[v.ChannelID] {
+				if voices[oldKey].UserID == v.UserID {
+					delete(voices, oldKey)
+					delete(p.uncertain[v.ChannelID], oldKey)
+				}
+			}
 			voices[key] = *v
-			delete(p.uncertain[v.ChannelID], key)
 		}
 	}
 	return refresh
 }
-func (p *privateCalls) snapshot(observed map[voiceMembership]struct{}, known map[string]bool) {
+
+// Snapshot requests are not always answered by Discord for an already
+// connected call. A concrete departure on the same stable gateway connection
+// becomes effective after a short handoff grace, unless a replacement session
+// or authoritative call snapshot arrived in the meantime.
+func (p *privateCalls) snapshot(observed map[voiceMembership]struct{}, known map[string]bool, now time.Time) {
+	for channel, pending := range p.uncertain {
+		for key, deadline := range pending {
+			if !now.Before(deadline) {
+				delete(p.calls[channel], key)
+				delete(pending, key)
+			}
+		}
+	}
 	for channel := range p.complete {
 		if len(p.uncertain[channel]) == 0 {
 			known[channel] = true
 		}
 	}
 	for channel, voices := range p.calls {
-		for key, v := range voices {
-			if p.uncertain[channel][key] {
-				continue
-			}
+		for _, v := range voices {
 			observed[voiceMembership{channelID: channel, userID: v.UserID}] = struct{}{}
 		}
 	}
