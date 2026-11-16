@@ -37,9 +37,8 @@ type BridgeConfig struct {
 
 	PortalMessageBuffer int `yaml:"portal_message_buffer"`
 
-	PublicAddress       string `yaml:"public_address"`
-	AvatarProxyKey      string `yaml:"avatar_proxy_key"`
-	DiscordRedirectBase string `yaml:"discord_redirect_base"`
+	PublicAddress  string `yaml:"public_address"`
+	AvatarProxyKey string `yaml:"avatar_proxy_key"`
 
 	DeliveryReceipts            bool  `yaml:"delivery_receipts"`
 	MessageStatusEvents         bool  `yaml:"message_status_events"`

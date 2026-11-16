@@ -20,7 +20,7 @@ import (
 func TestDiscordPollHTML(t *testing.T) {
 	msg := &discordgo.Message{ID: "456", ChannelID: "123", Poll: &discordgo.Poll{Question: discordgo.PollMedia{Text: "Lunch <today>?"}, Answers: []discordgo.PollAnswer{{Media: &discordgo.PollMedia{Text: "Pizza"}}}}}
 	got := discordPollHTML(msg, "")
-	for _, want := range []string{"Lunch &lt;today&gt;?", "Pizza", "Vote in Discord", "https://discord.com/channels/@me/123/456"} {
+	for _, want := range []string{"Lunch &lt;today&gt;?", "Pizza", "Vote in Discord", "discord:///channels/@me/123/456"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q: %s", want, got)
 		}

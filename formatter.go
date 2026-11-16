@@ -137,7 +137,7 @@ func (br *DiscordBridge) pillConverter(displayname, mxid, eventID string, ctx fo
 				if guildID == "" {
 					guildID = "@me"
 				}
-				return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", guildID, msg.DiscordProtoChannelID(), msg.DiscordID)
+				return discordMessageURL(guildID, msg.DiscordProtoChannelID(), msg.DiscordID)
 			}
 		}
 	} else if mxid[0] == '@' {
