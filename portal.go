@@ -351,7 +351,7 @@ func (portal *Portal) getBridgeInfo() (string, CustomBridgeInfoContent) {
 	var bridgeInfoStateKey string
 	if portal.GuildID == "" {
 		bridgeInfoStateKey = fmt.Sprintf("fi.mau.discord://discord/dm/%s", portal.Key.ChannelID)
-		bridgeInfo.Channel.ExternalURL = fmt.Sprintf("https://discord.com/channels/@me/%s", portal.Key.ChannelID)
+		bridgeInfo.Channel.ExternalURL = fmt.Sprintf("discord:///channels/@me/%s", portal.Key.ChannelID)
 	} else {
 		bridgeInfo.Network = &event.BridgeInfoSection{
 			ID: portal.GuildID,
@@ -362,7 +362,7 @@ func (portal *Portal) getBridgeInfo() (string, CustomBridgeInfoContent) {
 			// TODO is it possible to find the URL?
 		}
 		bridgeInfoStateKey = fmt.Sprintf("fi.mau.discord://discord/%s/%s", portal.GuildID, portal.Key.ChannelID)
-		bridgeInfo.Channel.ExternalURL = fmt.Sprintf("https://discord.com/channels/%s/%s", portal.GuildID, portal.Key.ChannelID)
+		bridgeInfo.Channel.ExternalURL = fmt.Sprintf("discord:///channels/%s/%s", portal.GuildID, portal.Key.ChannelID)
 	}
 	var roomType string
 	if portal.Type == discordgo.ChannelTypeDM || portal.Type == discordgo.ChannelTypeGroupDM {
@@ -757,7 +757,7 @@ func (portal *Portal) handleDiscordMessageCreate(user *User, msg *discordgo.Mess
 	}
 }
 
-var hackyReplyPattern = regexp.MustCompile(`^\*\*\[Replying to]\(https://discord.com/channels/(\d+)/(\d+)/(\d+)\)`)
+var hackyReplyPattern = regexp.MustCompile(`^\*\*\[Replying to]\((https://discord\.com/channels/|discord:///channels/)(\d+)/(\d+)/(\d+)\)`)
 
 func isReplyEmbed(embed *discordgo.MessageEmbed) bool {
 	return hackyReplyPattern.MatchString(embed.Description)
@@ -766,11 +766,11 @@ func isReplyEmbed(embed *discordgo.MessageEmbed) bool {
 func (portal *Portal) getReplyTarget(source *User, threadID string, ref *discordgo.MessageReference, embeds []*discordgo.MessageEmbed, allowNonExistent bool) *event.InReplyTo {
 	if ref == nil && len(embeds) > 0 {
 		match := hackyReplyPattern.FindStringSubmatch(embeds[0].Description)
-		if match != nil && match[1] == portal.GuildID && (match[2] == portal.Key.ChannelID || match[2] == threadID) {
+		if match != nil && match[2] == portal.GuildID && (match[3] == portal.Key.ChannelID || match[3] == threadID) {
 			ref = &discordgo.MessageReference{
-				MessageID: match[3],
-				ChannelID: match[2],
-				GuildID:   match[1],
+				MessageID: match[4],
+				ChannelID: match[3],
+				GuildID:   match[2],
 			}
 		}
 	}
@@ -2030,7 +2030,7 @@ func (portal *Portal) handleMatrixMessage(sender *User, evt *event.Event) {
 		if replyTo != nil && replyTo.ThreadID == threadID {
 			replyToUser = replyTo.SenderMXID
 			if isWebhookSend {
-				messageURL := fmt.Sprintf("https://discord.com/channels/%s/%s/%s", portal.GuildID, channelID, replyTo.DiscordID)
+				messageURL := discordMessageURL(portal.GuildID, channelID, replyTo.DiscordID)
 				embed, err := portal.convertReplyMessageToEmbed(replyTo.MXID, messageURL)
 				if err != nil {
 					portal.log.Warn().Err(err).Msg("Failed to convert reply message to embed for webhook send")

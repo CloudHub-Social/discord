@@ -85,8 +85,8 @@ func TestAdjacentTextDisplaysPreserveBlocks(t *testing.T) {
 
 func TestDiscordMessageURL(t *testing.T) {
 	tests := []struct{ guild, channel, message, want string }{
-		{"", "123", "456", "https://discord.com/channels/@me/123/456"},
-		{"789", "123", "456", "https://discord.com/channels/789/123/456"},
+		{"", "123", "456", "discord:///channels/@me/123/456"},
+		{"789", "123", "456", "discord:///channels/789/123/456"},
 		{"789", "", "456", ""}, {"789", "123", "", ""},
 		{"bad/host", "123", "456", ""}, {"", "123/evil", "456", ""},
 	}
@@ -105,8 +105,8 @@ func TestComponentDiscordLinks(t *testing.T) {
 		components   []discordgo.MessageComponent
 		want, absent string
 	}{
-		{"interactive", []discordgo.MessageComponent{&discordgo.Button{Label: "Play", Style: discordgo.PrimaryButton}}, `href="https://discord.com/channels/@me/123/456"`, ""},
-		{"spoiler", []discordgo.MessageComponent{&discordgo.Container{Spoiler: true}}, `href="https://discord.com/channels/@me/123/456"`, ""},
+		{"interactive", []discordgo.MessageComponent{&discordgo.Button{Label: "Play", Style: discordgo.PrimaryButton}}, `href="discord:///channels/@me/123/456"`, ""},
+		{"spoiler", []discordgo.MessageComponent{&discordgo.Container{Spoiler: true}}, `href="discord:///channels/@me/123/456"`, ""},
 		{"link", []discordgo.MessageComponent{&discordgo.Button{Label: "Visit", Style: discordgo.LinkButton, URL: "https://example.org/path?a=1&b=2"}}, `href="https://example.org/path?a=1&amp;b=2"`, "Open message in Discord"},
 		{"disabled", []discordgo.MessageComponent{&discordgo.Button{Label: "Visit", Style: discordgo.LinkButton, URL: "https://example.org", Disabled: true}}, "Visit (disabled)", "https://example.org"},
 	}
@@ -127,7 +127,7 @@ func TestComponentDiscordLinkInMatrixMessage(t *testing.T) {
 	portal := &Portal{Portal: &database.Portal{}}
 	msg := &discordgo.Message{ID: "456", ChannelID: "123", Components: []discordgo.MessageComponent{&discordgo.Button{Label: "Play", Style: discordgo.PrimaryButton}}}
 	converted := portal.convertDiscordTextMessage(context.Background(), nil, msg)
-	if converted == nil || !strings.Contains(converted.Content.FormattedBody, `href="https://discord.com/channels/@me/123/456"`) {
+	if converted == nil || !strings.Contains(converted.Content.FormattedBody, `href="discord:///channels/@me/123/456"`) {
 		t.Fatalf("missing Discord link in converted Matrix message: %#v", converted)
 	}
 }

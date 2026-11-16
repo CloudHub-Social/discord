@@ -114,9 +114,6 @@ bridge:
     # If not set, avatars will not be bridged. Only the /mautrix-discord/avatar/{server}/{id}/{hash} endpoint is used on this address.
     # This should not have a trailing slash, the endpoint above will be appended to the provided address.
     public_address: null
-    # HTTPS base URL with /mautrix-discord/open/ publicly routed to the bridge.
-    # Leave empty until the redirect is reachable and verified.
-    discord_redirect_base: null
     # A random key used to sign the avatar URLs. The bridge will only accept requests with a valid signature.
     avatar_proxy_key: generate
 

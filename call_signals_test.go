@@ -87,7 +87,7 @@ func TestCallAlertDroppedAfterPortalRemovalCanRetry(t *testing.T) {
 func TestDiscordCallAlertContent(t *testing.T) {
 	content := discordCallAlertContent("10", "20", "@evie:example.org")
 	require.NotNil(t, content)
-	require.Contains(t, content.Body, "https://discord.com/channels/@me/10/20")
+	require.Contains(t, content.Body, "discord:///channels/@me/10/20")
 	require.Equal(t, []id.UserID{"@evie:example.org"}, content.Mentions.UserIDs)
 	require.Nil(t, discordCallAlertContent("not-a-channel", "20", "@evie:example.org"))
 }
