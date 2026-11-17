@@ -228,6 +228,7 @@ func TestMatrixPresenceDisabled(t *testing.T) {
 	for _, pending := range []bool{false, true} {
 		t.Run(fmt.Sprintf("pending_%v", pending), func(t *testing.T) {
 			br, user, capture := newPresenceTestBridge(t, true, false, false)
+			br.Config.Bridge.MatrixPresenceOnlineAsIdle = true
 			if pending {
 				user.pendingDiscordStatus = string(discordgo.StatusOnline)
 				user.pendingDiscordStatusText = "queued before disabling"
@@ -298,6 +299,61 @@ func TestMatrixPresenceStateWire(t *testing.T) {
 				t.Errorf("bridge session activities = %s, want explicit empty array", data.Activities)
 			}
 		})
+	}
+}
+
+func TestMatrixPresenceOnlineAsIdleWire(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		presence   event.Presence
+		text, want string
+		afk        bool
+	}{
+		{"online", event.PresenceOnline, "", "idle", true},
+		{"away", event.PresenceUnavailable, "", "idle", true},
+		{"offline", event.PresenceOffline, "", "invisible", false},
+		{"dnd", event.PresenceOnline, "[dnd]", "dnd", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			br, user, capture := newPresenceTestBridge(t, true, true, false)
+			br.Config.Bridge.MatrixPresenceOnlineAsIdle = true
+			sendTestMatrixPresence(br, user, tc.presence, tc.text)
+			frames, patches := capture.snapshot(t, user.Session)
+			if len(frames) != 1 || frames[0].Op != 3 || len(patches) != 0 {
+				t.Fatalf("unexpected presence output: frames=%d patches=%d", len(frames), len(patches))
+			}
+			var payload struct {
+				Status string `json:"status"`
+				AFK    bool   `json:"afk"`
+				Since  *int64 `json:"since"`
+			}
+			if err := json.Unmarshal(frames[0].D, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Status != tc.want || payload.AFK != tc.afk || (payload.Since != nil) != tc.afk {
+				t.Errorf("got status=%q afk=%v since=%v", payload.Status, payload.AFK, payload.Since)
+			}
+		})
+	}
+}
+
+func TestOnlineAsIdleDoesNotChangeBotPresence(t *testing.T) {
+	br, user, capture := newPresenceTestBridge(t, false, true, false)
+	br.Config.Bridge.MatrixPresenceOnlineAsIdle = true
+	sendTestMatrixPresence(br, user, event.PresenceOnline, "")
+	frames, patches := capture.snapshot(t, user.Session)
+	if len(frames) != 1 || frames[0].Op != 3 || len(patches) != 0 {
+		t.Fatalf("unexpected presence output: frames=%d patches=%d", len(frames), len(patches))
+	}
+	var payload struct {
+		Status string `json:"status"`
+		AFK    bool   `json:"afk"`
+	}
+	if err := json.Unmarshal(frames[0].D, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Status != "online" || payload.AFK {
+		t.Errorf("bot presence changed: %+v", payload)
 	}
 }
 

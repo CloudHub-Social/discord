@@ -179,6 +179,12 @@ func (br *DiscordBridge) HandleMatrixPresence(evt *event.Event) {
 			discordStatus = string(discordgo.StatusDoNotDisturb)
 		}
 	}
+	// The user session identifies as a desktop-class client. This opt-in mode
+	// avoids asserting an active session for ordinary Matrix online presence;
+	// explicit DND and offline remain distinct. It cannot promise push delivery.
+	if sess.IsUser && br.Config.Bridge.MatrixPresenceOnlineAsIdle && discordStatus == string(discordgo.StatusOnline) {
+		discordStatus = string(discordgo.StatusIdle)
+	}
 
 	// Suppress m.presence echoes that Synapse delivers via push_ephemeral when
 	// the bridge itself writes own-user presence via applyPresence (Discord→Matrix
